@@ -1,0 +1,12 @@
+[package]
+name = "punkfs"
+description = ""
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+fuser = "0.18.0"
+grpc = "0.9.0"
+
+[lib]
+path = "src/punkfs.rs"
