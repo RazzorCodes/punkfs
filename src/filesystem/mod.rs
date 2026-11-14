@@ -25,28 +25,29 @@ mod misc;
 use std::path::Path;
 use std::time::SystemTime;
 
-use fuser::FileHandle;
 use fuser::FileAttr;
-use fuser::Filesystem;
+use fuser::FileHandle;
 use fuser::FileType;
+use fuser::Filesystem;
 use fuser::INodeNo;
 use fuser::MountOption;
 use fuser::ReplyAttr;
 use fuser::Request;
 
-use crate::cache::Cache;
-
+use crate::db::fstree::FsEntryKind;
+use crate::db::fstree::FsNode;
+use crate::store::Store;
 
 /// The `fs` itself: implements the fuser `Filesystem` trait below.
 ///
-/// All state lives in `cache` — the client-side view of the server's
+/// All state lives in `store` — the client-side view of the server's
 /// directory tree (inodes, paths, which dirs have been listed). See
-/// `crate::cache`.
+/// `crate::store`.
 pub struct Fs {
     /// In-memory snapshot of the server's tree, plus the grpc client used
     /// to fetch listings on demand. `pub(crate)` so the op modules can
     /// reach it without accessors.
-    pub(crate) cache: Cache,
+    pub(crate) store: Store,
 }
 
 impl Fs {
@@ -56,12 +57,17 @@ impl Fs {
     /// - `server_url`: grpc endpoint of the server, e.g.
     ///   `"http://127.0.0.1:10000"`. Not contacted yet — the channel is
     ///   lazy, so an unreachable server only fails on the first RPC.
+    /// - `node`: this machine's identity (`FsNode`); the store tags
+    ///   everything this machine is authoritative for with it.
     ///
     /// Returns: the new `Fs`, or any error from building the tokio
-    /// runtime / grpc endpoint. The root inode is seeded by `Cache::new`.
-    pub fn new(server_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let cache = Cache::new(server_url)?; // root is seeded inside Cache::new
-        Ok(Fs { cache })
+    /// runtime / grpc endpoint. The root inode is seeded by `Store::new`.
+    pub fn new(
+        server_url: &str,
+        node: FsNode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let store = Store::new(server_url, node)?; // root is seeded inside Store::new
+        Ok(Fs { store })
     }
 
     /// Mount this fs at `mountpoint` and return immediately: the fs runs
@@ -71,13 +77,15 @@ impl Fs {
     /// Params:
     /// - `server_url`: passed to `new`.
     /// - `mountpoint`: directory the fs appears under; must exist.
+    /// - `node`: this machine's identity, passed to `new`.
     ///
     /// Errors if fuser cannot mount (e.g. missing fusermount3, busy path).
     pub fn mount(
         server_url: &str,
         mountpoint: &Path,
+        node: FsNode,
     ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
-        let fs = Fs::new(server_url)?;
+        let fs = Fs::new(server_url, node)?;
 
         let mut cfg = fuser::Config::default();
         cfg.mount_options = vec![MountOption::FSName("punkfs".into())];
@@ -88,33 +96,42 @@ impl Fs {
     /// Build the attr we serve for `inode`. Every op that must answer with
     /// metadata goes through here so the answer stays consistent.
     ///
-    /// All metadata is currently synthesized: size 0, times = now,
-    /// perm 0777. Only `/` is a directory; every other path is reported
-    /// as a regular file — a known simplification.
+    /// Serves real values stored from the last listing: kind, size, mtime.
+    /// Whatever the store doesn't know stays synthesized: perm 0777, times
+    /// other than mtime = now. Dirs get nlink 2 (self + `..`), everything
+    /// else 1.
     ///
     /// Params:
-    /// - `inode`: which entry to describe (resolved via `cache`).
+    /// - `inode`: which entry to describe (resolved via `store`).
     /// - `uid`/`gid`: the *caller's* ids, stamped into the attr so the
     ///   kernel sees the file as owned by whoever is accessing it.
     ///
     /// Returns `Some(FileAttr)` if the inode is known, else `None`
     /// (callers turn that into `ENOENT`).
     pub(crate) fn attr_for(&self, inode: u64, uid: u32, gid: u32) -> Option<FileAttr> {
-        let path = self.cache.get_path(inode)?;
+        let entry = self.store.get_entry(inode)?;
 
-        let (kind, nlink) = if path == "/" {
-            (FileType::Directory, 2)
-        } else {
-            (FileType::RegularFile, 1)
+        let kind = match entry.kind {
+            FsEntryKind::Directory => FileType::Directory,
+            FsEntryKind::Link => FileType::Symlink,
+            // Unknown (not yet listed) and File both present as files.
+            FsEntryKind::Unknown | FsEntryKind::File => FileType::RegularFile,
         };
+        let nlink = if kind == FileType::Directory { 2 } else { 1 };
 
+        let meta = &entry.metadata;
+        let mtime = if meta.mtime == 0 {
+            SystemTime::now()
+        } else {
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(meta.mtime)
+        };
         let now = SystemTime::now();
         Some(FileAttr {
             ino: INodeNo(inode),
-            size: 0,
-            blocks: 0,
+            size: meta.size,
+            blocks: meta.blocks as u64,
             atime: now,
-            mtime: now,
+            mtime,
             ctime: now,
             crtime: now,
             kind,
@@ -136,7 +153,13 @@ impl Filesystem for Fs {
     /// Resolve `name` (a child of directory `parent`) to an inode and its
     /// attrs. Triggered by every stat-like call and as the first half of
     /// any path-based access. Delegates to `lookup::lookup`.
-    fn lookup(&self, req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
+    fn lookup(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
         lookup::lookup(self, req, parent, name, reply);
     }
 
@@ -149,7 +172,13 @@ impl Filesystem for Fs {
     // dir.rs
     /// Begin a directory read session; `fh` returned is passed to later
     /// `readdir` calls. Delegates to `dir::opendir`.
-    fn opendir(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+    fn opendir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        flags: fuser::OpenFlags,
+        reply: fuser::ReplyOpen,
+    ) {
         dir::opendir(self, req, ino, flags, reply);
     }
 
@@ -205,12 +234,30 @@ impl Filesystem for Fs {
         lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
-        file::write(self, req, ino, fh, offset, data, write_flags, flags, lock_owner, reply);
+        file::write(
+            self,
+            req,
+            ino,
+            fh,
+            offset,
+            data,
+            write_flags,
+            flags,
+            lock_owner,
+            reply,
+        );
     }
 
     /// Called on every `close()` of an open file (may be several times
     /// per `open` due to `dup`/fork). Delegates to `file::flush`.
-    fn flush(&self, req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: fuser::LockOwner, reply: fuser::ReplyEmpty) {
+    fn flush(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: fuser::LockOwner,
+        reply: fuser::ReplyEmpty,
+    ) {
         file::flush(self, req, ino, fh, lock_owner, reply);
     }
 
@@ -231,7 +278,14 @@ impl Filesystem for Fs {
 
     /// Flush file contents to stable storage (`fsync`/`fdatasync`):
     /// `datasync` true means skip metadata. Delegates to `file::fsync`.
-    fn fsync(&self, req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: fuser::ReplyEmpty) {
+    fn fsync(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
         file::fsync(self, req, ino, fh, datasync, reply);
     }
 
@@ -279,13 +333,25 @@ impl Filesystem for Fs {
 
     /// Remove the file `name` inside `parent`. Delegates to
     /// `meta::unlink`.
-    fn unlink(&self, req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn unlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         meta::unlink(self, req, parent, name, reply);
     }
 
     /// Remove the empty directory `name` inside `parent`. Delegates to
     /// `meta::rmdir`.
-    fn rmdir(&self, req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn rmdir(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         meta::rmdir(self, req, parent, name, reply);
     }
 

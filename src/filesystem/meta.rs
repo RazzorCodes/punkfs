@@ -90,7 +90,7 @@ pub(crate) fn unlink(_fs: &Fs, _req: &Request, _parent: INodeNo, _name: &OsStr, 
 
 /// Remove directory `parent/name` — only valid if empty (`rmdir`).
 ///
-/// Output: ENOSYS. Real implementation: check no cached children, then
+/// Output: ENOSYS. Real implementation: check no stored children, then
 /// rmdir RPC.
 pub(crate) fn rmdir(_fs: &Fs, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
     reply.error(Errno::ENOSYS);

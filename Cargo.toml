@@ -17,7 +17,7 @@ tonic-prost = "0.14.9"
 
 [[bin]]
 name = "punkfs-server"
-path = "src/client/grpc/punkfs-server.rs"
+path = "src/api/grpc/punkfs-server.rs"
 
 [lib]
 path = "src/punkfs.rs"

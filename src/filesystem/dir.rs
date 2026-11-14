@@ -35,7 +35,7 @@ pub(crate) fn opendir(_fs: &Fs, _req: &Request, _ino: INodeNo, _flags: OpenFlags
 /// Emit one batch of a directory's entries.
 ///
 /// Params:
-/// - `fs`: to reach the cache (path of `ino`, cached children).
+/// - `fs`: to reach the store (path of `ino`, stored children).
 /// - `ino`: inode of the directory being listed.
 /// - `_fh`: handle from `opendir`; unused (stateless).
 /// - `offset`: how many entries the kernel already consumed; we skip
@@ -44,8 +44,8 @@ pub(crate) fn opendir(_fs: &Fs, _req: &Request, _ino: INodeNo, _flags: OpenFlags
 ///   return means the kernel buffer is full — stop and let it re-call.
 ///
 /// Output: `reply.ok()` when all remaining entries were added. On an
-/// unknown inode: ENOENT. Children come from the cache; a failed server
-/// fetch yields whatever is cached (possibly an empty listing), never
+/// unknown inode: ENOENT. Children come from the store; a failed server
+/// fetch yields whatever is stored (possibly an empty listing), never
 /// an error — browsing offline is a spec requirement.
 pub(crate) fn readdir(
     fs: &Fs,
@@ -55,7 +55,7 @@ pub(crate) fn readdir(
     offset: u64,
     mut reply: ReplyDirectory,
 ) {
-    let Some(dir_path) = fs.cache.get_path(ino.0) else {
+    let Some(dir_path) = fs.store.get_path(ino.0) else {
         reply.error(Errno::ENOENT);
         return;
     };
@@ -64,7 +64,7 @@ pub(crate) fn readdir(
         (ino.0, FileType::Directory, "..".into()),
     ];
     entries.extend(
-        fs.cache
+        fs.store
             .get_children(&dir_path)
             .unwrap_or_default()
             .into_iter()

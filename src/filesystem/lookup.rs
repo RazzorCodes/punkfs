@@ -18,15 +18,15 @@ use super::Fs;
 use crate::TIMEOUT;
 
 pub(crate) fn lookup(fs: &Fs, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-    // 1. Resolve the parent's inode to its path in the cache.
-    let Some(parent_path) = fs.cache.get_path(parent.0) else {
+    // 1. Resolve the parent's inode to its path in the store.
+    let Some(parent_path) = fs.store.get_path(parent.0) else {
         reply.error(Errno::ENOENT); // unknown parent => the dir doesn't exist
         return;
     };
 
-    // 2. Make sure the server's listing of this dir is cached (no-op if
+    // 2. Make sure the server's listing of this dir is stored (no-op if
     //    it is; swallows errors so lookups on offline dirs keep working).
-    let _ = fs.cache.ensure_listed(&parent_path);
+    let _ = fs.store.ensure_listed(&parent_path);
 
     // 3. Join parent + child name and look up that path's inode.
     let full_path = Path::new(&parent_path).join(name);
@@ -35,7 +35,7 @@ pub(crate) fn lookup(fs: &Fs, req: &Request, parent: INodeNo, name: &OsStr, repl
         reply.error(Errno::EINVAL);
         return;
     };
-    let Some(inode) = fs.cache.get_inode(full_path) else {
+    let Some(inode) = fs.store.get_inode(full_path) else {
         reply.error(Errno::ENOENT); // name not in the (freshly fetched) listing
         return;
     };

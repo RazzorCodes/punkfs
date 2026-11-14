@@ -4,19 +4,20 @@ use std::sync::Mutex;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::db::fstree::FsTree;
-use crate::punk_fs::ListDirectoryRequest;
+use crate::db::fstree::{FsEntry, FsEntryKind, FsMetadata, FsNode, FsTree};
+use crate::punk_fs::{FileKind, ListDirectoryRequest};
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 
-pub struct Cache {
+pub struct Store {
     fstree: Mutex<FsTree>,
     listed: Mutex<HashSet<String>>, // directories already fetched from the server
     rt: Runtime,
     client: PunkFsClient<Channel>,
+    node: FsNode, // where am i running right now
 }
 
-impl Cache {
-    pub fn new(server_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+impl Store {
+    pub fn new(server_url: &str, node: FsNode) -> Result<Self, Box<dyn std::error::Error>> {
         let rt = Runtime::new()?;
         // connect_lazy doesn't fail if the server is down; the first RPC connects.
         // It needs a runtime context, hence enter().
@@ -26,14 +27,15 @@ impl Cache {
         };
 
         let fstree = FsTree { entries: vec![] };
-        let cache = Cache {
+        let store = Store {
             fstree: Mutex::new(fstree),
             listed: Mutex::new(HashSet::new()),
             rt,
             client: PunkFsClient::new(channel),
+            node: node,
         };
-        cache.upsert_entry("/", 1); // root
-        Ok(cache)
+        store.upsert_entry("/", 1, FsEntryKind::Directory, None); // root
+        Ok(store)
     }
 
     pub fn get_inode(&self, path: &str) -> Option<u64> {
@@ -48,8 +50,28 @@ impl Cache {
             .map(str::to_owned)
     }
 
-    pub fn upsert_entry(&self, path: &str, inode: u64) -> Option<(String, u64)> {
-        let old = self.fstree.lock().unwrap().upsert_entry(path, inode)?;
+    /// The whole entry for an inode (kind, metadata, path), for callers
+    /// that need more than the path.
+    pub fn get_entry(&self, inode: u64) -> Option<FsEntry> {
+        let tree = self.fstree.lock().unwrap();
+        tree.entries
+            .iter()
+            .find(|e| e.inode == inode)
+            .cloned()
+    }
+
+    pub fn upsert_entry(
+        &self,
+        path: &str,
+        inode: u64,
+        kind: FsEntryKind,
+        metadata: Option<FsMetadata>,
+    ) -> Option<(String, u64)> {
+        let old = self
+            .fstree
+            .lock()
+            .unwrap()
+            .upsert_entry(path, inode, kind, metadata)?;
         Some((old.path, old.inode))
     }
 
@@ -73,7 +95,19 @@ impl Cache {
             } else {
                 format!("{}/{}", dir.trim_end_matches('/'), e.name)
             };
-            tree.upsert_entry(&full, 0); // 0 = allocate, or reuse if the path exists
+            // The DirEntry carries (kind, size, mtime); fold all of it into
+            // the stored entry so getattr can serve real values.
+            let kind = match FileKind::try_from(e.kind) {
+                Ok(FileKind::Directory) => FsEntryKind::Directory,
+                Ok(FileKind::Symlink) => FsEntryKind::Link,
+                _ => FsEntryKind::File, // File and Unspecified
+            };
+            let metadata = FsMetadata {
+                size: e.size,
+                mtime: e.mtime_unix.max(0) as u64,
+                ..FsMetadata::default()
+            };
+            tree.upsert_entry(&full, 0, kind, Some(metadata)); // 0 = allocate, or reuse if the path exists
         }
         drop(tree);
 

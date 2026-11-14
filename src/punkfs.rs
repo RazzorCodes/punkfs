@@ -1,11 +1,12 @@
-//! punkfs: the amalgamation — fs (fuse), grpc, db, cache.
-mod cache;
-mod db;
+//! punkfs: the amalgamation — fs (fuse), grpc, db, store.
+pub mod db;
 mod filesystem;
+mod store;
 
+pub use db::fstree::FsNode;
 pub use filesystem::Fs as PunkFs;
 
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(0);
 
-#[path = "client/grpc/gen/punk_fs.rs"]
+#[path = "api/grpc/gen/punk_fs.rs"]
 pub mod punk_fs;

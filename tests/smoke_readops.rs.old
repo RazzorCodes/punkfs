@@ -1,7 +1,7 @@
 mod common;
 use common::SERVER;
 
-#[path = "../src/client/grpc/gen/punk_fs.rs"]
+#[path = "../src/api/grpc/gen/punk_fs.rs"]
 mod punk_fs;
 
 use punk_fs::ListDirectoryRequest;
