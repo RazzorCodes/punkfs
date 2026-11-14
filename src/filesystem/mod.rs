@@ -16,6 +16,7 @@
 //! - `helpers.rs` — helpers that fit none of the above
 
 mod dir;
+mod error;
 mod file;
 mod helpers;
 mod lookup;
@@ -25,29 +26,31 @@ mod misc;
 use std::path::Path;
 use std::time::SystemTime;
 
-use fuser::FileAttr;
 use fuser::FileHandle;
-use fuser::FileType;
 use fuser::Filesystem;
 use fuser::INodeNo;
 use fuser::MountOption;
 use fuser::ReplyAttr;
 use fuser::Request;
 
-use crate::db::fstree::FsEntryKind;
 use crate::db::fstree::FsNode;
 use crate::store::Store;
+use crate::store::StoreApi;
 
 /// The `fs` itself: implements the fuser `Filesystem` trait below.
 ///
 /// All state lives in `store` — the client-side view of the server's
 /// directory tree (inodes, paths, which dirs have been listed). See
 /// `crate::store`.
+///
+/// The store is held as a trait object so tests can substitute a fake
+/// (see `crate::store::mock`) and exercise the op modules without a
+/// server or a FUSE session. Production always gets a real [`Store`].
 pub struct Fs {
     /// In-memory snapshot of the server's tree, plus the grpc client used
     /// to fetch listings on demand. `pub(crate)` so the op modules can
     /// reach it without accessors.
-    pub(crate) store: Store,
+    pub(crate) store: Box<dyn StoreApi>,
 }
 
 impl Fs {
@@ -67,7 +70,24 @@ impl Fs {
         node: FsNode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let store = Store::new(server_url, node)?; // root is seeded inside Store::new
-        Ok(Fs { store })
+        Ok(Fs {
+            store: Box::new(store),
+        })
+    }
+
+    /// Build an `Fs` over an arbitrary store implementation.
+    ///
+    /// Used by the unit tests (with `crate::store::mock::MockStore`) to
+    /// drive the op modules against a catalog with no server behind it.
+    #[cfg(test)]
+    pub(crate) fn with_store(store: Box<dyn StoreApi>) -> Self {
+        Fs { store }
+    }
+
+    /// Attributes of `inode`, as served to the kernel (see [`helpers::attr_for`]).
+    #[cfg(test)]
+    pub(crate) fn attr_for(&self, inode: u64, uid: u32, gid: u32) -> Option<fuser::FileAttr> {
+        helpers::attr_for(self.store.as_ref(), inode, uid, gid)
     }
 
     /// Mount this fs at `mountpoint` and return immediately: the fs runs
@@ -91,58 +111,6 @@ impl Fs {
         cfg.mount_options = vec![MountOption::FSName("punkfs".into())];
 
         Ok(fuser::spawn_mount(fs, mountpoint, &cfg)?)
-    }
-
-    /// Build the attr we serve for `inode`. Every op that must answer with
-    /// metadata goes through here so the answer stays consistent.
-    ///
-    /// Serves real values stored from the last listing: kind, size, mtime.
-    /// Whatever the store doesn't know stays synthesized: perm 0777, times
-    /// other than mtime = now. Dirs get nlink 2 (self + `..`), everything
-    /// else 1.
-    ///
-    /// Params:
-    /// - `inode`: which entry to describe (resolved via `store`).
-    /// - `uid`/`gid`: the *caller's* ids, stamped into the attr so the
-    ///   kernel sees the file as owned by whoever is accessing it.
-    ///
-    /// Returns `Some(FileAttr)` if the inode is known, else `None`
-    /// (callers turn that into `ENOENT`).
-    pub(crate) fn attr_for(&self, inode: u64, uid: u32, gid: u32) -> Option<FileAttr> {
-        let entry = self.store.get_entry(inode)?;
-
-        let kind = match entry.kind {
-            FsEntryKind::Directory => FileType::Directory,
-            FsEntryKind::Link => FileType::Symlink,
-            // Unknown (not yet listed) and File both present as files.
-            FsEntryKind::Unknown | FsEntryKind::File => FileType::RegularFile,
-        };
-        let nlink = if kind == FileType::Directory { 2 } else { 1 };
-
-        let meta = &entry.metadata;
-        let mtime = if meta.mtime == 0 {
-            SystemTime::now()
-        } else {
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(meta.mtime)
-        };
-        let now = SystemTime::now();
-        Some(FileAttr {
-            ino: INodeNo(inode),
-            size: meta.size,
-            blocks: meta.blocks as u64,
-            atime: now,
-            mtime,
-            ctime: now,
-            crtime: now,
-            kind,
-            perm: 0o777,
-            nlink,
-            uid,
-            gid,
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        })
     }
 }
 
@@ -422,5 +390,27 @@ impl Filesystem for Fs {
         reply: fuser::ReplyEntry,
     ) {
         misc::link(self, req, ino, newparent, newname, reply);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::fstree::FsEntryKind;
+    use crate::store::mock::MockStore;
+
+    /// The DI seam works end-to-end: an `Fs` over a fake store serves
+    /// attrs without a runtime, a server, or a FUSE session.
+    #[test]
+    fn attr_for_reads_through_the_injected_store() {
+        let store = MockStore::new();
+        store.insert("/", 1, FsEntryKind::Directory);
+        let fs = Fs::with_store(Box::new(store));
+
+        let attr = fs.attr_for(1, 1000, 1000).expect("root is known");
+        assert_eq!(attr.ino, INodeNo(1));
+        assert_eq!(attr.kind, fuser::FileType::Directory);
+        assert_eq!(attr.nlink, 2);
+        assert!(fs.attr_for(2, 1000, 1000).is_none());
     }
 }

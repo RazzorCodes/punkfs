@@ -2,9 +2,9 @@
 //!
 //! Lifecycle of an open file, as driven by e.g. `cat file`:
 //! `lookup` (resolve path) -> `open` -> `read` (maybe repeatedly) ->
-//! `flush` (on close) -> `release`. All currently unimplemented:
-//! content RPCs don't exist yet in the proto.
-use fuser::Errno;
+//! `flush` (on close) -> `release`. Each op resolves its inode to a path
+//! and hands off to the store; the content rpcs don't exist yet, so the
+//! store answers `Unimplemented` and callers see `ENOSYS`.
 use fuser::FileHandle;
 use fuser::FopenFlags;
 use fuser::INodeNo;
@@ -18,129 +18,250 @@ use fuser::Request;
 use fuser::WriteFlags;
 
 use super::Fs;
+use super::error::OpResult;
+use super::helpers;
+use crate::store::StoreApi;
 
-/// Open file `ino`.
-///
-/// Params:
-/// - `_ino`: the file being opened (already resolved via `lookup`).
-/// - `_flags`: open flags minus `O_CREAT`/`O_TRUNC` etc.; would carry
-///   read/write intent once we act on it.
-///
-/// Output: `reply.opened` with dummy handle 0 and no `FopenFlags` —
-/// stateless, like `opendir`. Read path relies on this succeeding.
-/// Delegates nothing; this IS the implementation for now.
-pub(crate) fn open(_fs: &Fs, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-    // Stateless open: read/write resolve the inode themselves, so no handle
-    // is needed yet.
-    reply.opened(FileHandle(0), FopenFlags::empty());
+/// Open file `ino`; returns the handle later ops must present.
+pub(crate) fn open_decision(
+    store: &dyn StoreApi,
+    ino: u64,
+    flags: OpenFlags,
+) -> OpResult<u64> {
+    let path = helpers::path_of(store, ino)?;
+    Ok(store.open(&path, flags)?)
 }
 
-/// Read `size` bytes at `offset` from file `ino`.
-///
-/// Params:
-/// - `_offset`: byte position in the file (may be past EOF).
-/// - `_size`: max bytes the kernel wants; must be answered with exactly
-///   that many unless EOF/error.
-/// - `_lock_owner`: for `flock`/POSIX locks; unused.
-///
-/// Output: ENOSYS — no content RPC exists yet. A real implementation
-/// would fetch from the server and `reply.data(&bytes)`.
+/// Read up to `size` bytes of `ino` at `offset`. A short result means EOF.
+pub(crate) fn read_decision(
+    store: &dyn StoreApi,
+    ino: u64,
+    fh: u64,
+    offset: u64,
+    size: u32,
+) -> OpResult<Vec<u8>> {
+    let path = helpers::path_of(store, ino)?;
+    Ok(store.read(&path, fh, offset, size)?)
+}
+
+/// Write `data` at `offset`; returns the number of bytes accepted.
+pub(crate) fn write_decision(
+    store: &dyn StoreApi,
+    ino: u64,
+    fh: u64,
+    offset: u64,
+    data: &[u8],
+) -> OpResult<u32> {
+    let path = helpers::path_of(store, ino)?;
+    Ok(store.write(&path, fh, offset, data)?)
+}
+
+/// Push this handle's buffered state to the owning node.
+pub(crate) fn flush_decision(store: &dyn StoreApi, ino: u64, fh: u64) -> OpResult<()> {
+    let path = helpers::path_of(store, ino)?;
+    Ok(store.flush(&path, fh)?)
+}
+
+/// Drop the handle (once per `open`).
+pub(crate) fn release_decision(store: &dyn StoreApi, ino: u64, fh: u64) -> OpResult<()> {
+    let path = helpers::path_of(store, ino)?;
+    Ok(store.release(&path, fh)?)
+}
+
+/// Durability barrier; `datasync` skips metadata.
+pub(crate) fn fsync_decision(
+    store: &dyn StoreApi,
+    ino: u64,
+    fh: u64,
+    datasync: bool,
+) -> OpResult<()> {
+    let path = helpers::path_of(store, ino)?;
+    Ok(store.fsync(&path, fh, datasync)?)
+}
+
+pub(crate) fn open(fs: &Fs, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    match open_decision(fs.store.as_ref(), ino.0, flags) {
+        Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+        Err(e) => reply.error(e.errno()),
+    }
+}
+
 pub(crate) fn read(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _ino: INodeNo,
-    _fh: FileHandle,
-    _offset: u64,
-    _size: u32,
+    ino: INodeNo,
+    fh: FileHandle,
+    offset: u64,
+    size: u32,
     _flags: OpenFlags,
     _lock_owner: Option<LockOwner>,
     reply: ReplyData,
 ) {
-    reply.error(Errno::ENOSYS);
+    match read_decision(fs.store.as_ref(), ino.0, fh.0, offset, size) {
+        Ok(data) => reply.data(&data),
+        Err(e) => reply.error(e.errno()),
+    }
 }
 
-/// Write `data` at `offset` into file `ino`.
-///
-/// Params:
-/// - `_offset`: byte position to write at.
-/// - `_data`: bytes to store; must consume all of them on success.
-/// - `_write_flags`: page-cache hints (e.g. `FUSE_WRITE_CACHE`).
-/// - `_lock_owner`: locking identity; unused.
-///
-/// Output: ENOSYS. Real implementation: push to server, reply
-/// `reply.written(len)` with the full length on success.
 pub(crate) fn write(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _ino: INodeNo,
-    _fh: FileHandle,
-    _offset: u64,
-    _data: &[u8],
+    ino: INodeNo,
+    fh: FileHandle,
+    offset: u64,
+    data: &[u8],
     _write_flags: WriteFlags,
     _flags: OpenFlags,
     _lock_owner: Option<LockOwner>,
     reply: ReplyWrite,
 ) {
-    reply.error(Errno::ENOSYS);
+    match write_decision(fs.store.as_ref(), ino.0, fh.0, offset, data) {
+        Ok(written) => reply.written(written),
+        Err(e) => reply.error(e.errno()),
+    }
 }
 
-/// Called on each `close()` of the file (possibly several per `open`).
-///
-/// Params:
-/// - `_lock_owner`: identifies the locking owner for the close.
-///
-/// Output: ENOSYS. NOTE: fuser's docs warn errors here can confuse
-/// callers (close may already have returned), so a real implementation
-/// usually replies ok() unless it must report a write error.
 pub(crate) fn flush(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _ino: INodeNo,
-    _fh: FileHandle,
+    ino: INodeNo,
+    fh: FileHandle,
     _lock_owner: LockOwner,
     reply: ReplyEmpty,
 ) {
-    reply.error(Errno::ENOSYS);
+    match flush_decision(fs.store.as_ref(), ino.0, fh.0) {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(e.errno()),
+    }
 }
 
-/// Tear down the open file — exactly one call per `open`.
-///
-/// Params:
-/// - `_flush`: whether a `flush` should be performed as part of it.
-///
-/// Output: `reply.ok()`. Errors here are NOT delivered to the
-/// application (close/munmap already returned), so success is the only
-/// useful answer until state tracking exists.
+/// Errors from `release` are never delivered to the application (the
+/// close/munmap already returned), so an unusable store still replies ok.
 pub(crate) fn release(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _ino: INodeNo,
-    _fh: FileHandle,
+    ino: INodeNo,
+    fh: FileHandle,
     _flags: OpenFlags,
     _lock_owner: Option<LockOwner>,
     _flush: bool,
     reply: ReplyEmpty,
 ) {
-    // fuser's own default: release succeeds even if unimplemented, since its
-    // error is never surfaced to the caller anyway.
+    let _ = release_decision(fs.store.as_ref(), ino.0, fh.0);
     reply.ok();
 }
 
-/// Durability barrier (`fsync`/`fdatasync` syscall on the mount).
-///
-/// Params:
-/// - `_datasync`: true = only user data must reach storage, metadata
-///   can be skipped (fdatasync semantics).
-///
-/// Output: ENOSYS. Will matter a lot for the durability contract in the
-/// spec (§9): today it is the op that would confirm our writes landed.
 pub(crate) fn fsync(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _ino: INodeNo,
-    _fh: FileHandle,
-    _datasync: bool,
+    ino: INodeNo,
+    fh: FileHandle,
+    datasync: bool,
     reply: ReplyEmpty,
 ) {
-    reply.error(Errno::ENOSYS);
+    match fsync_decision(fs.store.as_ref(), ino.0, fh.0, datasync) {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(e.errno()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::fstree::FsEntryKind;
+    use crate::store::StoreError;
+    use crate::store::mock::MockStore;
+
+    fn seeded() -> MockStore {
+        let store = MockStore::new();
+        store.insert("/", 1, FsEntryKind::Directory);
+        store.insert("/f", 2, FsEntryKind::File);
+        store
+    }
+
+    #[test]
+    fn open_forwards_resolved_path_and_flags() {
+        let store = seeded();
+        store.expect_open(Ok(41));
+        let fh = open_decision(&store, 2, OpenFlags(0)).unwrap();
+        assert_eq!(fh, 41);
+        assert_eq!(store.calls().open, vec![("/f".to_string(), OpenFlags(0))]);
+    }
+
+    #[test]
+    fn content_ops_are_unimplemented_today() {
+        let store = seeded();
+        assert_eq!(
+            read_decision(&store, 2, 0, 0, 16).unwrap_err(),
+            super::super::error::OpError::Unimplemented
+        );
+        assert_eq!(
+            write_decision(&store, 2, 0, 0, b"x").unwrap_err(),
+            super::super::error::OpError::Unimplemented
+        );
+        assert_eq!(
+            fsync_decision(&store, 2, 0, false).unwrap_err(),
+            super::super::error::OpError::Unimplemented
+        );
+    }
+
+    #[test]
+    fn read_returns_store_bytes() {
+        let store = seeded();
+        store.expect_read(Ok(b"hello".to_vec()));
+        assert_eq!(read_decision(&store, 2, 41, 5, 5).unwrap(), b"hello");
+        assert_eq!(store.calls().read, vec![("/f".to_string(), 41, 5, 5)]);
+    }
+
+    #[test]
+    fn unknown_inode_never_reaches_the_store() {
+        let store = seeded();
+        let err = read_decision(&store, 99, 0, 0, 1).unwrap_err();
+        assert_eq!(err, super::super::error::OpError::NotFound);
+        assert!(store.calls().read.is_empty());
+    }
+
+    #[test]
+    fn store_io_error_becomes_io() {
+        let store = seeded();
+        store.expect_flush(Err(StoreError::Io("boom".into())));
+        let err = flush_decision(&store, 2, 0).unwrap_err();
+        assert_eq!(err.errno(), fuser::Errno::EIO);
+    }
+
+    #[test]
+    fn write_returns_short_count_from_store() {
+        let store = seeded();
+        store.expect_write(Ok(3));
+        assert_eq!(write_decision(&store, 2, 41, 0, b"abc").unwrap(), 3);
+        assert_eq!(
+            store.calls().write,
+            vec![("/f".to_string(), 41, 0, b"abc".to_vec())]
+        );
+    }
+
+    #[test]
+    fn flush_release_and_fsync_reach_the_store() {
+        let store = seeded();
+        store.expect_flush(Ok(()));
+        store.expect_release(Ok(()));
+        store.expect_fsync(Ok(()));
+
+        flush_decision(&store, 2, 7).unwrap();
+        release_decision(&store, 2, 7).unwrap();
+        fsync_decision(&store, 2, 7, true).unwrap();
+
+        let calls = store.calls();
+        assert_eq!(calls.flush, vec![("/f".to_string(), 7)]);
+        assert_eq!(calls.release, vec![("/f".to_string(), 7)]);
+        assert_eq!(calls.fsync, vec![("/f".to_string(), 7, true)]);
+    }
+
+    #[test]
+    fn open_error_from_store_is_propagated() {
+        let store = seeded();
+        store.expect_open(Err(StoreError::NotPermitted));
+        let err = open_decision(&store, 2, OpenFlags(0)).unwrap_err();
+        assert_eq!(err.errno(), fuser::Errno::EPERM);
+    }
 }

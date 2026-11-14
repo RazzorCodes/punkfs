@@ -1,67 +1,182 @@
 //! Filesystem ops that fit none of the other categories: readlink,
 //! mknod, symlink, link.
 //!
-//! punkfs rejects special files and links outright: EPERM ("operation
+//! punkfs rejects special files and links outright: `EPERM` ("operation
 //! not permitted" — the caller sees an explicit refusal) rather than
-//! ENOSYS, matching fuser's own defaults for symlink/link. Spec §8
+//! `ENOSYS`, matching fuser's own defaults for symlink/link. Spec §8
 //! proposes "resolve symlinks under an explicit security policy" — that
 //! policy doesn't exist yet, so refusal is the safe answer.
+//!
+//! Each decision still resolves its inodes through the store first, so an
+//! op on a nonexistent parent reports `ENOENT` rather than a misleading
+//! policy error.
 use std::ffi::OsStr;
 use std::path::Path;
 
-use fuser::Errno;
 use fuser::INodeNo;
 use fuser::ReplyData;
 use fuser::ReplyEntry;
 use fuser::Request;
 
 use super::Fs;
+use super::error::{OpError, OpResult};
+use super::helpers;
+use crate::store::StoreApi;
 
-/// Read symlink target (`readlink`); punkfs stores no symlinks.
-/// Params: `ino` — the symlink inode. Output: EPERM.
-pub(crate) fn readlink(_fs: &Fs, _req: &Request, _ino: INodeNo, reply: ReplyData) {
-    reply.error(Errno::EPERM);
+/// Read a symlink target; punkfs stores no symlinks, so always `EPERM`
+/// after confirming the inode exists.
+pub(crate) fn readlink_decision(store: &dyn StoreApi, ino: u64) -> OpResult<Vec<u8>> {
+    let _ = helpers::path_of(store, ino)?;
+    Err(OpError::NotPermitted)
 }
 
-/// Create a special file (device node, fifo, socket) via `mknod`.
-/// Params: `parent`/`name` location, `mode` type+perms, `umask`,
-/// `rdev` device number. Output: EPERM.
+/// Create a device node / fifo / socket: always refused.
+pub(crate) fn mknod_decision(
+    store: &dyn StoreApi,
+    parent: u64,
+    name: &OsStr,
+) -> OpResult<(u64, fuser::FileAttr)> {
+    let parent_path = helpers::path_of(store, parent)?;
+    let _ = helpers::child_path(&parent_path, name)?;
+    Err(OpError::NotPermitted)
+}
+
+/// Create a symlink: always refused (no symlink policy yet).
+pub(crate) fn symlink_decision(
+    store: &dyn StoreApi,
+    parent: u64,
+    link_name: &OsStr,
+    _target: &Path,
+) -> OpResult<(u64, fuser::FileAttr)> {
+    let parent_path = helpers::path_of(store, parent)?;
+    let _ = helpers::child_path(&parent_path, link_name)?;
+    Err(OpError::NotPermitted)
+}
+
+/// Create a hard link: always refused (spec §8: reject cross-owner hard
+/// links rather than silently copying).
+pub(crate) fn link_decision(
+    store: &dyn StoreApi,
+    ino: u64,
+    newparent: u64,
+    newname: &OsStr,
+) -> OpResult<(u64, fuser::FileAttr)> {
+    let _ = helpers::path_of(store, ino)?;
+    let parent_path = helpers::path_of(store, newparent)?;
+    let _ = helpers::child_path(&parent_path, newname)?;
+    Err(OpError::NotPermitted)
+}
+
+pub(crate) fn readlink(fs: &Fs, _req: &Request, ino: INodeNo, reply: ReplyData) {
+    match readlink_decision(fs.store.as_ref(), ino.0) {
+        Ok(target) => reply.data(&target),
+        Err(e) => reply.error(e.errno()),
+    }
+}
+
 pub(crate) fn mknod(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _parent: INodeNo,
-    _name: &OsStr,
+    parent: INodeNo,
+    name: &OsStr,
     _mode: u32,
     _umask: u32,
     _rdev: u32,
     reply: ReplyEntry,
 ) {
-    reply.error(Errno::EPERM);
+    match mknod_decision(fs.store.as_ref(), parent.0, name) {
+        Ok((_, attr)) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
+        Err(e) => reply.error(e.errno()),
+    }
 }
 
-/// Create symlink `parent/link_name` -> `target`.
-/// Output: EPERM (no symlink policy yet).
 pub(crate) fn symlink(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _parent: INodeNo,
-    _link_name: &OsStr,
-    _target: &Path,
+    parent: INodeNo,
+    link_name: &OsStr,
+    target: &Path,
     reply: ReplyEntry,
 ) {
-    reply.error(Errno::EPERM);
+    match symlink_decision(fs.store.as_ref(), parent.0, link_name, target) {
+        Ok((_, attr)) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
+        Err(e) => reply.error(e.errno()),
+    }
 }
 
-/// Create hard link `newparent/newname` -> `ino`.
-/// Output: EPERM (spec §8: reject cross-owner hard links rather than
-/// silently copying).
 pub(crate) fn link(
-    _fs: &Fs,
+    fs: &Fs,
     _req: &Request,
-    _ino: INodeNo,
-    _newparent: INodeNo,
-    _newname: &OsStr,
+    ino: INodeNo,
+    newparent: INodeNo,
+    newname: &OsStr,
     reply: ReplyEntry,
 ) {
-    reply.error(Errno::EPERM);
+    match link_decision(fs.store.as_ref(), ino.0, newparent.0, newname) {
+        Ok((_, attr)) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
+        Err(e) => reply.error(e.errno()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::fstree::FsEntryKind;
+    use crate::store::mock::MockStore;
+
+    fn seeded() -> MockStore {
+        let store = MockStore::new();
+        store.insert("/", 1, FsEntryKind::Directory);
+        store.insert("/dir", 2, FsEntryKind::Directory);
+        store.insert("/dir/f", 3, FsEntryKind::File);
+        store
+    }
+
+    #[test]
+    fn readlink_existing_inode_is_refused() {
+        let store = seeded();
+        assert_eq!(readlink_decision(&store, 3).unwrap_err(), OpError::NotPermitted);
+    }
+
+    #[test]
+    fn readlink_unknown_inode_is_not_found() {
+        let store = seeded();
+        assert_eq!(readlink_decision(&store, 99).unwrap_err(), OpError::NotFound);
+    }
+
+    #[test]
+    fn mknod_refuses_after_resolving_parent() {
+        let store = seeded();
+        assert_eq!(
+            mknod_decision(&store, 2, OsStr::new("dev")).unwrap_err(),
+            OpError::NotPermitted
+        );
+        // A missing parent is reported as such, not as a policy refusal.
+        assert_eq!(
+            mknod_decision(&store, 99, OsStr::new("dev")).unwrap_err(),
+            OpError::NotFound
+        );
+    }
+
+    #[test]
+    fn symlink_and_link_are_refused() {
+        let store = seeded();
+        assert_eq!(
+            symlink_decision(&store, 2, OsStr::new("l"), Path::new("/x")).unwrap_err(),
+            OpError::NotPermitted
+        );
+        assert_eq!(
+            link_decision(&store, 3, 2, OsStr::new("hard")).unwrap_err(),
+            OpError::NotPermitted
+        );
+    }
+
+    #[test]
+    fn link_unknown_source_is_not_found() {
+        let store = seeded();
+        assert_eq!(
+            link_decision(&store, 99, 2, OsStr::new("hard")).unwrap_err(),
+            OpError::NotFound
+        );
+    }
 }
