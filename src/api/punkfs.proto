@@ -1,1 +1,28 @@
-message lookup
+syntax = "proto3";
+package punk_fs;
+
+service PunkFs {
+  rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+}
+
+message ListDirectoryRequest {
+  string path = 1;
+}
+
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_FILE = 1;
+  FILE_KIND_DIRECTORY = 2;
+  FILE_KIND_SYMLINK = 3;
+}
+
+message DirEntry {
+  string name = 1;
+  FileKind kind = 2;
+  uint64 size = 3;
+  int64 mtime_unix = 4;
+}
+
+message ListDirectoryResponse {
+  repeated DirEntry entries = 1;
+}

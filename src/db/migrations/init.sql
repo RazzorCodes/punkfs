@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS PunkFsTree (
+  inode SERIAL PRIMARY KEY,
+  path TEXT
+);

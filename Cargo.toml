@@ -7,6 +7,21 @@ edition = "2024"
 [dependencies]
 fuser = "0.18.0"
 grpc = "0.9.0"
+prost = "0.14.6"
+sqlx = "0.9.0"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "fs"] }
+tokyo = "1.0.0"
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
+
+[[bin]]
+name = "punkfs-server"
+path = "src/client/grpc/punkfs-server.rs"
 
 [lib]
 path = "src/punkfs.rs"
+
+[build-dependencies]
+tonic-build = "0.14.9"
+tonic-prost-build = "0.14.9"

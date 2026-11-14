@@ -1,0 +1,35 @@
+mod common;
+use common::SERVER;
+
+#[path = "../src/client/grpc/gen/punk_fs.rs"]
+mod punk_fs;
+
+use punk_fs::ListDirectoryRequest;
+use punk_fs::punk_fs_client::PunkFsClient;
+
+#[tokio::test]
+async fn lists_testdir() {
+    let mut client = PunkFsClient::connect(SERVER.url.clone()).await.unwrap();
+    let resp = client
+        .list_directory(ListDirectoryRequest { path: "/".into() })
+        .await
+        .unwrap()
+        .into_inner();
+
+    for e in &resp.entries {
+        println!("{:?}\t{}\t{}", e.kind(), e.size, e.name);
+    }
+    assert!(!resp.entries.is_empty());
+}
+
+#[tokio::test]
+async fn rejects_path_traversal() {
+    let mut client = PunkFsClient::connect(SERVER.url.clone()).await.unwrap();
+    let err = client
+        .list_directory(ListDirectoryRequest {
+            path: "../..".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
