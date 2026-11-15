@@ -4,3 +4,6 @@ src/client/grpc/gen
 # Added by cargo
 
 /target
+
+# local playground (scripts/playground.sh)
+/.playground

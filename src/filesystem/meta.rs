@@ -1,12 +1,20 @@
-//! Metadata and namespace-mutating operations: setattr, mkdir, unlink,
-//! rmdir, rename, statfs.
+//! Metadata and namespace-mutating operations: setattr, unlink, rmdir,
+//! rename, statfs.
 //!
-//! These change the tree rather than read it. The op layer resolves
-//! inodes to catalog paths and hands the request to the store; the store
-//! methods are stubs returning `Unimplemented` until the write-side rpcs
-//! exist, so these currently surface as `ENOSYS`. Cross-owner semantics
-//! (managed copy+delete, refusing deletion via an offline owner) are the
-//! store's problem per spec §9, not the op layer's.
+//! Deliberately absent this iteration:
+//!
+//! - **Creation** (`mkdir`, and by extension file creation) — entries are
+//!   created by the machine that owns the storage, not through the merged
+//!   mount. `mkdir` is not in the `Filesystem` impl at all, so the kernel
+//!   reports `ENOSYS`.
+//! - **Ownership changes** — refused by the backend rather than silently
+//!   ignored.
+//!
+//! `setattr` is *refused* for now: it is not that punkfs will never apply
+//! metadata changes, but until write-through metadata semantics are
+//! settled, answering with a recoverable `ENOSYS` is better than
+//! pretending a truncate or chmod took effect. The backend rpc exists and
+//! is tested; only this layer declines to use it.
 use std::ffi::OsStr;
 use std::time::SystemTime;
 
@@ -16,7 +24,6 @@ use fuser::FileAttr;
 use fuser::INodeNo;
 use fuser::ReplyAttr;
 use fuser::ReplyEmpty;
-use fuser::ReplyEntry;
 use fuser::ReplyStatfs;
 use fuser::Request;
 use fuser::RenameFlags;
@@ -25,21 +32,12 @@ use fuser::TimeOrNow;
 use super::Fs;
 use super::error::{OpError, OpResult};
 use super::helpers;
-use crate::TIMEOUT;
-use crate::store::{SetattrChanges, StatFs, StoreApi};
-
-/// `TimeOrNow` -> the concrete instant it means.
-fn resolve_time(time: TimeOrNow, now: SystemTime) -> SystemTime {
-    match time {
-        TimeOrNow::SpecificTime(t) => t,
-        TimeOrNow::Now => now,
-    }
-}
+use crate::store::{StatFs, StoreApi};
 
 /// Apply the requested attribute changes to `ino`; returns the new attrs.
 ///
-/// `fh` is present for `ftruncate`; the op layer currently ignores it
-/// because the store keys everything by path.
+/// `fh` is present for `ftruncate`; it is ignored because content rpcs are
+/// positional and the server keys by path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn setattr_decision(
     store: &dyn StoreApi,
@@ -58,41 +56,16 @@ pub(crate) fn setattr_decision(
     bkuptime: Option<SystemTime>,
     flags: Option<BsdFileFlags>,
 ) -> OpResult<FileAttr> {
-    let path = helpers::path_of(store, ino)?;
-    let now = SystemTime::now();
-    let changes = SetattrChanges {
-        mode,
-        uid: uid_change,
-        gid: gid_change,
-        size,
-        atime: atime.map(|t| resolve_time(t, now)),
-        mtime: mtime.map(|t| resolve_time(t, now)),
-        ctime,
-        crtime,
-        chgtime,
-        bkuptime,
-        flags: flags.map(|f| f.bits()),
-    };
+    let _path = helpers::path_of(store, ino)?;
 
-    store.setattr(&path, changes)?;
-    helpers::attr_or_not_found(store, ino, uid, gid)
-}
-
-/// Create `parent`/`name` and return its inode + attrs (like `lookup`).
-pub(crate) fn mkdir_decision(
-    store: &dyn StoreApi,
-    uid: u32,
-    gid: u32,
-    parent: u64,
-    name: &OsStr,
-    mode: u32,
-) -> OpResult<(u64, FileAttr)> {
-    let parent_path = helpers::path_of(store, parent)?;
-    let path = helpers::child_path(&parent_path, name)?;
-
-    let ino = store.mkdir(&path, mode)?;
-    let attr = helpers::attr_or_not_found(store, ino, uid, gid)?;
-    Ok((ino, attr))
+    // Refused wholesale for now, so every field is unused on purpose. A
+    // caller sees ENOSYS and knows the change did not happen, which beats a
+    // silent no-op that looks like success.
+    let _ = (
+        mode, uid_change, gid_change, size, atime, mtime, ctime, crtime, chgtime, bkuptime, flags,
+        store, uid, gid,
+    );
+    Err(OpError::Unsupported)
 }
 
 /// Remove the file `parent`/`name`.
@@ -104,8 +77,8 @@ pub(crate) fn unlink_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) -
 
 /// Remove the empty directory `parent`/`name`.
 ///
-/// The emptiness check is a fast local rejection; the store must still
-/// enforce it (its view may be newer than ours).
+/// The emptiness check is a fast local rejection; the backend enforces it
+/// authoritatively.
 pub(crate) fn rmdir_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) -> OpResult<()> {
     let parent_path = helpers::path_of(store, parent)?;
     let path = helpers::child_path(&parent_path, name)?;
@@ -117,6 +90,9 @@ pub(crate) fn rmdir_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) ->
 }
 
 /// Move `parent`/`name` to `newparent`/`newname`.
+///
+/// Flags are passed through: `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are the
+/// backend's call to make or refuse.
 pub(crate) fn rename_decision(
     store: &dyn StoreApi,
     parent: u64,
@@ -173,23 +149,7 @@ pub(crate) fn setattr(
         flags,
     );
     match result {
-        Ok(attr) => reply.attr(&TIMEOUT, &attr),
-        Err(e) => reply.error(e.errno()),
-    }
-}
-
-pub(crate) fn mkdir(
-    fs: &Fs,
-    req: &Request,
-    parent: INodeNo,
-    name: &OsStr,
-    mode: u32,
-    umask: u32,
-    reply: ReplyEntry,
-) {
-    let effective = mode & !umask;
-    match mkdir_decision(fs.store.as_ref(), req.uid(), req.gid(), parent.0, name, effective) {
-        Ok((_ino, attr)) => reply.entry(&TIMEOUT, &attr, fuser::Generation(0)),
+        Ok(attr) => reply.attr(&crate::TIMEOUT, &attr),
         Err(e) => reply.error(e.errno()),
     }
 }
@@ -227,7 +187,14 @@ pub(crate) fn rename(
 pub(crate) fn statfs(fs: &Fs, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
     match statfs_decision(fs.store.as_ref()) {
         Ok(s) => reply.statfs(
-            s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.frsize,
+            s.blocks,
+            s.bfree,
+            s.bavail,
+            s.files,
+            s.ffree,
+            s.block_size,
+            s.name_length,
+            s.fragment_size,
         ),
         Err(e) => reply.error(e.errno()),
     }
@@ -245,6 +212,7 @@ mod tests {
         store.insert("/", 1, FsEntryKind::Directory);
         store.insert("/docs", 2, FsEntryKind::Directory);
         store.insert("/docs/a.txt", 3, FsEntryKind::File);
+        store.insert("/docs/empty", 4, FsEntryKind::Directory);
         store
     }
 
@@ -259,82 +227,67 @@ mod tests {
     }
 
     #[test]
-    fn setattr_translates_times_and_forwards_changes() {
+    fn every_setattr_is_refused_for_now() {
+        // Even a plain chmod: the op layer declines until write-through
+        // metadata semantics exist, and says so with a recoverable errno.
         let store = seeded();
-        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234);
         let err = setattr_decision(
-            &store,
-            0,
-            0,
-            3,
-            Some(0o640),
-            None,
-            None,
-            Some(10),
-            Some(TimeOrNow::SpecificTime(when)),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            &store, 5, 6, 3, Some(0o600), None, None, None, None, None, None, None, None, None, None,
         )
         .unwrap_err();
-        // The store stub answers Unimplemented, but the request still made
-        // it through with the changes resolved.
-        assert_eq!(err, OpError::Unimplemented);
-        let changes = store.calls().setattr;
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0, "/docs/a.txt");
-        assert_eq!(changes[0].1.mode, Some(0o640));
-        assert_eq!(changes[0].1.size, Some(10));
-        assert_eq!(changes[0].1.atime, Some(when));
-    }
-
-    #[test]
-    fn setattr_returns_new_attrs_on_success() {
-        let store = seeded();
-        store.expect_setattr(Ok(crate::db::fstree::FsMetadata {
-            size: 99,
-            perm: 0o600,
-            ..Default::default()
-        }));
-        // The fresh attrs are read back from the store, so seed them too.
-        store.insert_with(
-            "/docs/a.txt",
-            3,
-            FsEntryKind::File,
-            crate::db::fstree::FsMetadata {
-                size: 99,
-                perm: 0o600,
-                ..Default::default()
-            },
+        assert_eq!(err, OpError::Unsupported);
+        assert_eq!(err.errno(), fuser::Errno::ENOSYS);
+        assert!(
+            store.calls().setattr.is_empty(),
+            "a refused request must not reach the backend"
         );
-        let attr = setattr_decision(
-            &store, 5, 6, 3, Some(0o600), None, None, Some(99), None, None, None, None, None, None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(attr.size, 99);
-        assert_eq!(attr.perm, 0o600);
     }
 
     #[test]
-    fn mkdir_returns_attrs_for_the_new_inode() {
+    fn truncation_and_ownership_changes_are_also_refused() {
         let store = seeded();
-        store.expect_mkdir(Ok(10));
-        store.insert("/docs/new", 10, FsEntryKind::Directory);
-        let (ino, attr) = mkdir_decision(&store, 5, 6, 2, OsStr::new("new"), 0o755).unwrap();
-        assert_eq!(ino, 10);
-        assert_eq!(attr.kind, fuser::FileType::Directory);
+        for call in [
+            (None, None, Some(10u64)),
+            (None, Some(1000u32), None),
+        ] {
+            let (mode, uid_change, size) = call;
+            let err = setattr_decision(
+                &store,
+                0,
+                0,
+                3,
+                mode,
+                uid_change,
+                None,
+                size,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err, OpError::Unsupported);
+        }
+        assert!(store.calls().setattr.is_empty());
     }
 
     #[test]
-    fn mkdir_forwards_joined_path() {
+    fn unlink_joins_the_parent_path() {
         let store = seeded();
-        let err = mkdir_decision(&store, 0, 0, 2, OsStr::new("new"), 0o755).unwrap_err();
-        assert_eq!(err, OpError::Unimplemented);
-        assert_eq!(store.calls().mkdir, vec![("/docs/new".to_string(), 0o755)]);
+        unlink_decision(&store, 2, OsStr::new("a.txt")).unwrap();
+        assert_eq!(store.calls().unlink, vec!["/docs/a.txt".to_string()]);
+        assert_eq!(store.get_inode("/docs/a.txt"), None);
+    }
+
+    #[test]
+    fn unlink_unknown_parent_is_not_found() {
+        let store = seeded();
+        let err = unlink_decision(&store, 99, OsStr::new("x")).unwrap_err();
+        assert_eq!(err, OpError::NotFound);
+        assert!(store.calls().unlink.is_empty());
     }
 
     #[test]
@@ -348,16 +301,14 @@ mod tests {
     #[test]
     fn rmdir_allows_empty_directory_through() {
         let store = seeded();
-        store.insert("/docs/empty", 4, FsEntryKind::Directory);
-        let err = rmdir_decision(&store, 2, OsStr::new("empty")).unwrap_err();
-        assert_eq!(err, OpError::Unimplemented); // reached the store stub
+        rmdir_decision(&store, 2, OsStr::new("empty")).unwrap();
         assert_eq!(store.calls().rmdir, vec!["/docs/empty".to_string()]);
     }
 
     #[test]
     fn rename_joins_both_sides() {
         let store = seeded();
-        let err = rename_decision(
+        rename_decision(
             &store,
             2,
             OsStr::new("a.txt"),
@@ -365,8 +316,7 @@ mod tests {
             OsStr::new("b.txt"),
             RenameFlags::empty(),
         )
-        .unwrap_err();
-        assert_eq!(err, OpError::Unimplemented);
+        .unwrap();
         assert_eq!(
             store.calls().rename,
             vec![(
@@ -375,14 +325,30 @@ mod tests {
                 RenameFlags::empty()
             )]
         );
+        assert!(store.get_inode("/b.txt").is_some());
     }
 
     #[test]
-    fn unlink_unknown_parent_is_not_found() {
+    fn rename_passes_flags_through() {
         let store = seeded();
-        let err = unlink_decision(&store, 99, OsStr::new("x")).unwrap_err();
+        let flags = RenameFlags::RENAME_NOREPLACE;
+        rename_decision(&store, 2, OsStr::new("a.txt"), 2, OsStr::new("b"), flags).unwrap();
+        assert_eq!(store.calls().rename[0].2, flags);
+    }
+
+    #[test]
+    fn rename_unknown_source_is_not_found() {
+        let store = seeded();
+        let err = rename_decision(
+            &store,
+            2,
+            OsStr::new("ghost"),
+            1,
+            OsStr::new("x"),
+            RenameFlags::empty(),
+        )
+        .unwrap_err();
         assert_eq!(err, OpError::NotFound);
-        assert!(store.calls().unlink.is_empty());
     }
 
     #[test]
@@ -390,19 +356,23 @@ mod tests {
         let store = seeded();
         store.expect_statfs(Ok(StatFs {
             blocks: 10,
-            bsize: 4096,
-            namelen: 255,
+            block_size: 4096,
+            name_length: 255,
+            fragment_size: 4096,
             ..StatFs::default()
         }));
         let stats = statfs_decision(&store).unwrap();
         assert_eq!(stats.blocks, 10);
-        assert_eq!(stats.bsize, 4096);
+        assert_eq!(stats.block_size, 4096);
     }
 
     #[test]
     fn statfs_io_error_maps_to_eio() {
         let store = seeded();
         store.expect_statfs(Err(StoreError::Io("down".into())));
-        assert_eq!(statfs_decision(&store).unwrap_err().errno(), fuser::Errno::EIO);
+        assert_eq!(
+            statfs_decision(&store).unwrap_err().errno(),
+            fuser::Errno::EIO
+        );
     }
 }

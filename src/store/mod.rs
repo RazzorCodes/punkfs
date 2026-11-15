@@ -1,15 +1,27 @@
+//! The client-side store: the only way the filesystem layer reaches the
+//! catalog.
+//!
+//! It owns the local snapshot of the server's tree ([`FsTree`]), the grpc
+//! client, and the tokio runtime used to drive async calls from the
+//! synchronous FUSE callbacks.
+//!
+//! Identity note: entries are identified by `uuid` (the punkfs identity,
+//! assigned by the server) and addressed locally by `inode` (allocated
+//! here). The store is the layer that maps between the two.
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::time::SystemTime;
 
-use fuser::OpenFlags;
+
 use fuser::RenameFlags;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::db::fstree::{FsEntry, FsEntryKind, FsMetadata, FsNode, FsTree};
-use crate::punk_fs::{FileKind, ListDirectoryRequest};
+use crate::db::fstree::{Access, FsEntry, FsEntryKind, FsNode, FsTree, FileAttrData, FileTimes, Stat};
 use crate::punk_fs::punk_fs_client::PunkFsClient;
+use crate::punk_fs::{
+    self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, SetAttrRequest,
+    StatFsRequest, WriteFileRequest,
+};
 
 #[cfg(test)]
 pub(crate) mod mock;
@@ -22,10 +34,10 @@ pub(crate) mod mock;
 pub enum StoreError {
     /// The path/inode is not known to the catalog.
     NotFound,
-    /// The catalog refuses the operation (policy, offline owner, ...).
+    /// The backend refuses the operation (policy, permissions, ...).
     NotPermitted,
-    /// No rpc / no implementation exists yet.
-    Unimplemented,
+    /// The operation is not supported by this backend at all.
+    Unsupported(String),
     /// Anything from the transport or the server.
     Io(String),
 }
@@ -35,7 +47,8 @@ impl From<tonic::Status> for StoreError {
         match status.code() {
             tonic::Code::NotFound => StoreError::NotFound,
             tonic::Code::PermissionDenied => StoreError::NotPermitted,
-            tonic::Code::Unimplemented => StoreError::Unimplemented,
+            tonic::Code::Unimplemented => StoreError::Unsupported(status.message().to_owned()),
+            tonic::Code::InvalidArgument => StoreError::Unsupported(status.message().to_owned()),
             _ => StoreError::Io(status.to_string()),
         }
     }
@@ -50,32 +63,20 @@ pub struct StoreChild {
     pub kind: FsEntryKind,
 }
 
-/// Requested attribute changes from one `setattr` call. `None` = leave
-/// the field alone. This is the FUSE op collapsed into plain values, so
-/// the op layer does not have to pass `TimeOrNow`/`BsdFileFlags` down.
+/// Requested attribute changes from one `setattr` call.
 ///
-/// The fields are the contract the write path will consume; the store
-/// stub does not read them yet.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default)]
+/// `None` means "leave this alone". The fields mirror the proto
+/// `SetAttrRequest`; times are already resolved to concrete seconds by the
+/// op layer, so the store never sees `TimeOrNow`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SetattrChanges {
     pub mode: Option<u32>,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
     pub size: Option<u64>,
-    pub atime: Option<SystemTime>,
-    pub mtime: Option<SystemTime>,
-    pub ctime: Option<SystemTime>,
-    pub crtime: Option<SystemTime>,
-    pub chgtime: Option<SystemTime>,
-    pub bkuptime: Option<SystemTime>,
-    pub flags: Option<u32>,
+    pub accessed_unix: Option<i64>,
+    pub modified_unix: Option<i64>,
 }
 
 /// Filesystem-wide capacity counters backing `statfs` / `df`.
-///
-/// Per spec §5 an offline node contributes last-known, not zero values;
-/// that decision lives in the store implementation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StatFs {
     pub blocks: u64,
@@ -83,9 +84,9 @@ pub struct StatFs {
     pub bavail: u64,
     pub files: u64,
     pub ffree: u64,
-    pub bsize: u32,
-    pub namelen: u32,
-    pub frsize: u32,
+    pub block_size: u32,
+    pub name_length: u32,
+    pub fragment_size: u32,
 }
 
 /// The filesystem's only view of the catalog.
@@ -93,56 +94,47 @@ pub struct StatFs {
 /// The op modules (`crate::filesystem::*`) take this as a trait object so
 /// every method can be unit tested against [`mock::MockStore`] without a
 /// server, a runtime, or a FUSE session.
-///
-/// Read methods are implemented by [`Store`]; everything that mutates
-/// state (or moves bytes) is a stub returning
-/// [`StoreError::Unimplemented`] until the corresponding rpc exists.
 pub trait StoreApi: Send + Sync {
-    /// This machine's identity, as registered with the server. Needed
-    /// once mutations must state which node is authoritative.
-    #[allow(dead_code)]
+    /// This machine's identity, as registered with the server.
     fn node_id(&self) -> &str;
 
-    // --- read side -----------------------------------------------------
+    // --- catalog -------------------------------------------------------
     /// Inode for `path`, if the catalog knows it.
     fn get_inode(&self, path: &str) -> Option<u64>;
     /// Path for `inode`, if the catalog knows it.
     fn get_path(&self, inode: u64) -> Option<String>;
-    /// The whole entry (kind, metadata, path, owner) for an inode.
+    /// The whole entry (kind, metadata, path, uuid) for an inode.
     fn get_entry(&self, inode: u64) -> Option<FsEntry>;
-    /// Fetch `dir` from the server unless already fetched. Safe to call
-    /// repeatedly; the first failure is reported, later calls retry.
+    /// Fetch and reconcile `dir` from the server.
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError>;
     /// Children of `path`, using whatever listing is cached.
     fn get_children(&self, path: &str) -> Vec<StoreChild>;
 
-    // --- open-file lifecycle -------------------------------------------
-    /// Open `path` and return a handle for the later `read`/`write`.
-    fn open(&self, path: &str, flags: OpenFlags) -> Result<u64, StoreError>;
-    /// Read at most `size` bytes at `offset`; short reads mean EOF.
-    fn read(&self, path: &str, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, StoreError>;
+    // --- content -------------------------------------------------------
+    /// Read at most `size` bytes at `offset`; a short read means EOF.
+    fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError>;
     /// Write `data` at `offset`; returns how many bytes were taken.
-    fn write(&self, path: &str, fh: u64, offset: u64, data: &[u8]) -> Result<u32, StoreError>;
-    /// Push buffered state for `fh` out to the owning node.
-    fn flush(&self, path: &str, fh: u64) -> Result<(), StoreError>;
-    /// Drop the handle; called exactly once per `open`.
-    fn release(&self, path: &str, fh: u64) -> Result<(), StoreError>;
-    /// Durability barrier for `fh`; `datasync` skips metadata.
-    fn fsync(&self, path: &str, fh: u64, datasync: bool) -> Result<(), StoreError>;
+    fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError>;
+    /// Durability barrier for `path`; `datasync` skips metadata.
+    fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError>;
 
-    // --- namespace / metadata mutation ---------------------------------
-    /// Apply the requested attribute changes, returning the new metadata.
-    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FsMetadata, StoreError>;
-    /// Create a directory at `path`; returns its inode.
-    fn mkdir(&self, path: &str, mode: u32) -> Result<u64, StoreError>;
+    // --- metadata ------------------------------------------------------
+    /// Apply the requested attribute changes, returning the new attributes.
+    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError>;
+    /// Re-read one entry's attributes, bypassing the cache.
+    fn refresh(&self, path: &str) -> Result<FileAttrData, StoreError>;
+    /// Aggregate capacity for `statfs`.
+    fn statfs(&self) -> Result<StatFs, StoreError>;
+
+    // --- namespace mutation --------------------------------------------
+    // Creation is deliberately absent: entries are created by the machine
+    // that owns the storage, never through the merged mount.
     /// Remove the file at `path`.
     fn unlink(&self, path: &str) -> Result<(), StoreError>;
     /// Remove the *empty* directory at `path`.
     fn rmdir(&self, path: &str) -> Result<(), StoreError>;
-    /// Move `old` to `new`, honouring `flags` (noreplace/exchange).
+    /// Move `old` to `new`, honouring `flags`.
     fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError>;
-    /// Aggregate capacity for `statfs`.
-    fn statfs(&self) -> Result<StatFs, StoreError>;
 }
 
 pub struct Store {
@@ -156,46 +148,34 @@ pub struct Store {
 impl Store {
     pub fn new(server_url: &str, node: FsNode) -> Result<Self, Box<dyn std::error::Error>> {
         let rt = Runtime::new()?;
-        // connect_lazy doesn't fail if the server is down; the first RPC connects.
-        // It needs a runtime context, hence enter().
+        // connect_lazy doesn't fail if the server is down; the first RPC
+        // connects. It needs a runtime context, hence enter().
         let channel = {
             let _guard = rt.enter();
             Endpoint::from_shared(server_url.to_owned())?.connect_lazy()
         };
 
-        let fstree = FsTree { entries: vec![] };
-        let store = Store {
+        let mut fstree = FsTree::new();
+        // The root's uuid is the server's answer for "/"; it is refreshed by
+        // the first listing, so any placeholder would do. A fixed string
+        // keeps it stable across restarts.
+        fstree.insert_root("/", "/", FsEntryKind::Directory);
+
+        Ok(Store {
             fstree: Mutex::new(fstree),
             listed: Mutex::new(HashSet::new()),
             rt,
             client: PunkFsClient::new(channel),
             node,
-        };
-        store.upsert_entry("/", 1, FsEntryKind::Directory, None); // root
-        Ok(store)
+        })
     }
 
-    pub fn upsert_entry(
-        &self,
-        path: &str,
-        inode: u64,
-        kind: FsEntryKind,
-        metadata: Option<FsMetadata>,
-    ) -> Option<(String, u64)> {
-        let old = self
-            .fstree
-            .lock()
-            .unwrap()
-            .upsert_entry(path, inode, kind, metadata)?;
-        Some((old.path, old.inode))
-    }
-
-    /// Fetch `dir` from the server unless we already have. Safe to call repeatedly.
+    /// Fetch `dir` from the server unless we already have.
     ///
-    /// This is the only method here that talks to the server today; every
-    /// other implemented method answers from the local snapshot.
-    fn fetch_listing(&self, dir: &str) -> Result<(), StoreError> {
-        if self.listed.lock().unwrap().contains(dir) {
+    /// On success the cached children are reconciled against the answer,
+    /// which is what makes a missing child a genuine deletion.
+    fn fetch_listing(&self, dir: &str, force: bool) -> Result<(), StoreError> {
+        if !force && self.listed.lock().unwrap().contains(dir) {
             return Ok(());
         }
 
@@ -205,32 +185,114 @@ impl Store {
             .block_on(client.list_directory(ListDirectoryRequest { path: dir.into() }))?
             .into_inner();
 
-        // lock only after the network call is done
-        let mut tree = self.fstree.lock().unwrap();
-        for e in resp.entries {
-            let full = if dir == "/" {
-                format!("/{}", e.name)
-            } else {
-                format!("{}/{}", dir.trim_end_matches('/'), e.name)
-            };
-            // The DirEntry carries (kind, size, mtime); fold all of it into
-            // the stored entry so getattr can serve real values.
-            let kind = match FileKind::try_from(e.kind) {
-                Ok(FileKind::Directory) => FsEntryKind::Directory,
-                Ok(FileKind::Symlink) => FsEntryKind::Link,
-                _ => FsEntryKind::File, // File and Unspecified
-            };
-            let metadata = FsMetadata {
-                size: e.size,
-                mtime: e.mtime_unix.max(0) as u64,
-                ..FsMetadata::default()
-            };
-            tree.upsert_entry(&full, 0, kind, Some(metadata)); // 0 = allocate, or reuse if the path exists
-        }
-        drop(tree);
+        let children = resp
+            .entries
+            .into_iter()
+            .map(|e| {
+                let full = join(dir, &e.name);
+                entry_from_attr(0, &full, e.attr.unwrap_or_default(), &self.node.node_id)
+            })
+            .collect::<Vec<_>>();
 
+        // Lock only after the network call is done.
+        self.fstree.lock().unwrap().reconcile(dir, children);
         self.listed.lock().unwrap().insert(dir.to_owned());
         Ok(())
+    }
+
+    /// Forget a cached directory so the next access refetches it.
+    fn invalidate(&self, dir: &str) {
+        self.listed.lock().unwrap().remove(dir);
+    }
+
+    fn client(&self) -> PunkFsClient<Channel> {
+        self.client.clone()
+    }
+
+    fn getattr(&self, path: &str) -> Result<FileAttrData, StoreError> {
+        let mut client = self.client();
+        let resp = self
+            .rt
+            .block_on(client.get_attr(GetAttrRequest {
+                path: path.to_owned(),
+            }))?
+            .into_inner();
+        Ok(attr_from_proto(resp.attr.unwrap_or_default()))
+    }
+
+    /// Store the attributes the server just reported for `path`.
+    fn store_attr(&self, path: &str, attr: FileAttrData) {
+        let mut tree = self.fstree.lock().unwrap();
+        let inode = tree.get_inode(path).unwrap_or(0);
+        tree.upsert_entry(FsEntry {
+            inode,
+            path: path.to_owned(),
+            uuid: attr.uuid.clone(),
+            kind: attr.kind,
+            node_id: self.node.node_id.clone(),
+            attr,
+        });
+    }
+}
+
+/// Join a directory and a child name into a catalog path.
+fn join(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", dir.trim_end_matches('/'))
+    }
+}
+
+fn kind_from_proto(kind: i32) -> FsEntryKind {
+    match punk_fs::FileKind::try_from(kind) {
+        Ok(punk_fs::FileKind::Directory) => FsEntryKind::Directory,
+        Ok(punk_fs::FileKind::Symlink) => FsEntryKind::Link,
+        Ok(punk_fs::FileKind::File) => FsEntryKind::File,
+        _ => FsEntryKind::Unknown,
+    }
+}
+
+fn attr_from_proto(attr: punk_fs::FileAttr) -> FileAttrData {
+    let times = attr.times.unwrap_or_default();
+    let access = attr.access.unwrap_or_default();
+    let stat = attr.stat.unwrap_or_default();
+
+    FileAttrData {
+        uuid: attr.uuid,
+        kind: kind_from_proto(attr.kind),
+        times: FileTimes::from_secs(
+            times.accessed_unix.max(0) as u64,
+            times.modified_unix.max(0) as u64,
+            times.changed_unix.max(0) as u64,
+            times.created_unix.max(0) as u64,
+        ),
+        access: Access {
+            mode: access.mode as u16,
+            uid: access.uid,
+            gid: access.gid,
+        },
+        stat: Stat {
+            size: stat.size,
+            blocks: stat.blocks as u32,
+            block_size: stat.block_size as u16,
+            rdev: stat.rdev as u16,
+            nlink: stat.nlink,
+            flags: stat.flags,
+        },
+    }
+}
+
+/// Build a catalog entry from a server-reported attribute message.
+fn entry_from_attr(inode: u64, path: &str, attr: punk_fs::FileAttr, node_id: &str) -> FsEntry {
+    let attr = attr_from_proto(attr);
+    FsEntry {
+        inode,
+        path: path.to_owned(),
+        uuid: attr.uuid.clone(),
+        kind: attr.kind,
+        node_id: node_id.to_owned(),
+        attr,
     }
 }
 
@@ -252,24 +314,29 @@ impl StoreApi for Store {
     }
 
     fn get_entry(&self, inode: u64) -> Option<FsEntry> {
-        let tree = self.fstree.lock().unwrap();
-        tree.entries
-            .iter()
-            .find(|e| e.inode == inode)
-            .cloned()
+        self.fstree.lock().unwrap().get_entry(inode).cloned()
     }
 
+    /// Fetch and reconcile `dir`.
+    ///
+    /// Always refetches rather than trusting a "we have listed this once"
+    /// flag: the backing storage can change without us, and a stale
+    /// listing would report entries that no longer exist (or hide new
+    /// ones). Correctness first; caching belongs behind a validity check
+    /// we do not have yet.
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError> {
-        self.fetch_listing(dir)
+        self.fetch_listing(dir, true)
     }
 
-    /// Children as (inode, name, kind). On a server error we serve whatever
-    /// is cached: browsing offline is a spec requirement, not an error.
+    /// Children as (inode, name, kind). A server error is reported to the
+    /// caller, which decides whether browsing may fall back to the cache.
     fn get_children(&self, path: &str) -> Vec<StoreChild> {
-        let _ = self.fetch_listing(path);
+        let _ = self.fetch_listing(path, true);
 
-        let tree = self.fstree.lock().unwrap();
-        tree.get_children_of(path)
+        self.fstree
+            .lock()
+            .unwrap()
+            .get_children_of(path)
             .into_iter()
             .map(|e| StoreChild {
                 inode: e.inode,
@@ -279,56 +346,130 @@ impl StoreApi for Store {
             .collect()
     }
 
-    // --- stubs: no rpc exists yet --------------------------------------
-    // Each of these becomes a real client call once the corresponding
-    // list_directory-style rpc lands; the trait shape above is the contract
-    // the filesystem layer already codes against.
-
-    fn open(&self, _path: &str, _flags: OpenFlags) -> Result<u64, StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Open/GetFile rpc
+    fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
+        let mut client = self.client();
+        let resp = self
+            .rt
+            .block_on(client.read_file(ReadFileRequest {
+                path: path.to_owned(),
+                offset,
+                length: size,
+            }))?
+            .into_inner();
+        Ok(resp.data)
     }
 
-    fn read(&self, _path: &str, _fh: u64, _offset: u64, _size: u32) -> Result<Vec<u8>, StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Read rpc
+    fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
+        let mut client = self.client();
+        let resp = self
+            .rt
+            .block_on(client.write_file(WriteFileRequest {
+                path: path.to_owned(),
+                offset,
+                data: data.to_vec(),
+            }))?
+            .into_inner();
+        Ok(resp.written)
     }
 
-    fn write(&self, _path: &str, _fh: u64, _offset: u64, _data: &[u8]) -> Result<u32, StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Write rpc
+    fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
+        let mut client = self.client();
+        self.rt.block_on(client.fsync_file(FsyncFileRequest {
+            path: path.to_owned(),
+            datasync,
+        }))?;
+        Ok(())
     }
 
-    fn flush(&self, _path: &str, _fh: u64) -> Result<(), StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Flush rpc
+    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
+        let mut client = self.client();
+        let resp = self
+            .rt
+            .block_on(client.set_attr(SetAttrRequest {
+                path: path.to_owned(),
+                mode: changes.mode,
+                size: changes.size,
+                accessed_unix: changes.accessed_unix,
+                modified_unix: changes.modified_unix,
+                uid: None,
+                gid: None,
+            }))?
+            .into_inner();
+
+        let attr = attr_from_proto(resp.attr.unwrap_or_default());
+        self.store_attr(path, attr.clone());
+        Ok(attr)
     }
 
-    fn release(&self, _path: &str, _fh: u64) -> Result<(), StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Release rpc
-    }
-
-    fn fsync(&self, _path: &str, _fh: u64, _datasync: bool) -> Result<(), StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Fsync rpc
-    }
-
-    fn setattr(&self, _path: &str, _changes: SetattrChanges) -> Result<FsMetadata, StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Setattr rpc
-    }
-
-    fn mkdir(&self, _path: &str, _mode: u32) -> Result<u64, StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Mkdir rpc
-    }
-
-    fn unlink(&self, _path: &str) -> Result<(), StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Unlink rpc (must refuse offline owner, spec §9)
-    }
-
-    fn rmdir(&self, _path: &str) -> Result<(), StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Rmdir rpc
-    }
-
-    fn rename(&self, _old: &str, _new: &str, _flags: RenameFlags) -> Result<(), StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Rename rpc (cross-owner = managed copy+delete, spec §9)
+    fn refresh(&self, path: &str) -> Result<FileAttrData, StoreError> {
+        let attr = self.getattr(path)?;
+        self.store_attr(path, attr.clone());
+        Ok(attr)
     }
 
     fn statfs(&self) -> Result<StatFs, StoreError> {
-        Err(StoreError::Unimplemented) // TODO: Statfs rpc / aggregate catalog observations
+        let mut client = self.client();
+        let resp = self
+            .rt
+            .block_on(client.stat_fs(StatFsRequest {}))?
+            .into_inner();
+        Ok(StatFs {
+            blocks: resp.blocks,
+            bfree: resp.bfree,
+            bavail: resp.bavail,
+            files: resp.files,
+            ffree: resp.ffree,
+            block_size: resp.block_size,
+            name_length: resp.name_length,
+            fragment_size: resp.fragment_size,
+        })
+    }
+
+    fn unlink(&self, path: &str) -> Result<(), StoreError> {
+        let mut client = self.client();
+        self.rt
+            .block_on(client.remove_file(punk_fs::RemoveFileRequest {
+                path: path.to_owned(),
+            }))?;
+        self.after_mutation(path);
+        Ok(())
+    }
+
+    fn rmdir(&self, path: &str) -> Result<(), StoreError> {
+        let mut client = self.client();
+        self.rt.block_on(client.remove_dir(punk_fs::RemoveDirRequest {
+            path: path.to_owned(),
+        }))?;
+        self.after_mutation(path);
+        Ok(())
+    }
+
+    fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError> {
+        let mut client = self.client();
+        self.rt.block_on(client.rename(punk_fs::RenameRequest {
+            old_path: old.to_owned(),
+            new_path: new.to_owned(),
+            flags: flags.bits(),
+        }))?;
+
+        self.after_mutation(old);
+        self.after_mutation(new);
+        self.fstree.lock().unwrap().rename_entry(old, new);
+        Ok(())
+    }
+}
+
+impl Store {
+    /// Update the local snapshot after a successful mutation of `path`.
+    ///
+    /// The entry is dropped (or, for a directory, its children are) and the
+    /// containing directory is invalidated so the next listing refetches.
+    fn after_mutation(&self, path: &str) {
+        let parent = match path.rsplit_once('/') {
+            Some((head, _)) if !head.is_empty() => head.to_owned(),
+            _ => "/".to_owned(),
+        };
+        self.invalidate(&parent);
+        self.fstree.lock().unwrap().remove_entry(path);
     }
 }

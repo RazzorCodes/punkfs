@@ -3,9 +3,9 @@
 //!
 //! punkfs rejects special files and links outright: `EPERM` ("operation
 //! not permitted" — the caller sees an explicit refusal) rather than
-//! `ENOSYS`, matching fuser's own defaults for symlink/link. Spec §8
-//! proposes "resolve symlinks under an explicit security policy" — that
-//! policy doesn't exist yet, so refusal is the safe answer.
+//! `ENOSYS`, matching fuser's own defaults for symlink/link. Creating any
+//! new entry through the merged mount is out of scope for now, and
+//! symlinks additionally need a resolution policy that does not exist yet.
 //!
 //! Each decision still resolves its inodes through the store first, so an
 //! op on a nonexistent parent reports `ENOENT` rather than a misleading

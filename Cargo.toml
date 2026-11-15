@@ -6,14 +6,18 @@ edition = "2024"
 
 [dependencies]
 fuser = "0.18.0"
-grpc = "0.9.0"
+libc = "0.2"
 prost = "0.14.6"
-sqlx = "0.9.0"
-tempfile = "3.27.0"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "fs"] }
-tokyo = "1.0.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "time"] }
 tonic = "0.14.9"
 tonic-prost = "0.14.9"
+uuid = { version = "1", features = ["v5"] }
+
+[features]
+default = []
+# Exposes the `Shutdown` rpc so a test can ask a spawned server to exit.
+# Never enable this for a server that untrusted clients can reach.
+dev-shutdown = []
 
 [[bin]]
 name = "punkfs-server"
@@ -21,6 +25,9 @@ path = "src/api/grpc/punkfs-server.rs"
 
 [lib]
 path = "src/punkfs.rs"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [build-dependencies]
 tonic-build = "0.14.9"

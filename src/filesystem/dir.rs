@@ -17,7 +17,6 @@ use fuser::Request;
 use super::Fs;
 use super::error::OpResult;
 use super::helpers;
-use crate::db::fstree::FsEntryKind;
 use crate::store::StoreApi;
 
 /// One row of a directory listing, in the shape `reply.add` wants.
@@ -38,8 +37,8 @@ pub(crate) struct DirItem {
 /// Behaviour:
 /// - Unknown inode is `ENOENT`.
 /// - A failed server fetch yields whatever the store has cached — possibly
-///   an empty listing — never an error: browsing offline is a spec
-///   requirement.
+///   an empty listing — never an error: browsing must not fail because the
+///   server is momentarily unreachable.
 /// - Children carry their real kind, so `ls -F`/`find` don't see every
 ///   entry as a regular file.
 pub(crate) fn readdir_decision(
@@ -63,21 +62,11 @@ pub(crate) fn readdir_decision(
     ];
     entries.extend(store.get_children(&dir_path).into_iter().map(|child| DirItem {
         inode: child.inode,
-        kind: kind_of(child.kind),
+        kind: helpers::file_type(child.kind),
         name: OsString::from(child.name),
     }));
 
     Ok(entries.into_iter().skip(offset as usize).collect())
-}
-
-/// Catalog kind -> the `FileType` the kernel is told. Unknown entries are
-/// presented as files (same rule as `attr_for`).
-fn kind_of(kind: FsEntryKind) -> FileType {
-    match kind {
-        FsEntryKind::Directory => FileType::Directory,
-        FsEntryKind::Link => FileType::Symlink,
-        FsEntryKind::Unknown | FsEntryKind::File => FileType::RegularFile,
-    }
 }
 
 /// Start a directory session.
@@ -127,6 +116,7 @@ pub(crate) fn readdir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::fstree::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {
@@ -174,7 +164,6 @@ mod tests {
         let store = seeded();
         let all = readdir_decision(&store, 2, 0).unwrap();
 
-        // Skipping two entries drops exactly `.` and `..`.
         let rest = readdir_decision(&store, 2, 2).unwrap();
         assert_eq!(rest, all[2..].to_vec());
         assert!(names(&rest).iter().all(|n| n != "." && n != ".."));
@@ -201,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn readdir_lists_directories_without_children() {
+    fn readdir_lists_empty_directories() {
         let store = MockStore::new();
         store.insert("/", 1, FsEntryKind::Directory);
         let items = readdir_decision(&store, 1, 0).unwrap();

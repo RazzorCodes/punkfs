@@ -1,13 +1,58 @@
 syntax = "proto3";
 package punk_fs;
 
+// punkfs wire protocol.
+//
+// Identity: every entry carries a `uuid` which is the punkfs identity of
+// that entry. Inodes are never sent — they are a purely local FUSE
+// detail, allocated by each client. Requests are addressed by logical
+// path for now; addressing by uuid is the intended direction once the
+// catalog owns assignment, which is also why `uuid` is already carried in
+// every `FileAttr`.
+//
+// This iteration serves the read/write path against a single backing
+// folder on one machine. Namespace creation (new files, new directories,
+// symlinks) is deliberately absent: entries are created by the machine
+// that owns the storage, not through the merged mount.
 service PunkFs {
+  // Directory contents, including the uuid/attrs of each child.
   rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+
+  // Attributes of one path.
+  rpc GetAttr(GetAttrRequest) returns (GetAttrResponse);
+
+  // Positional read. A response shorter than `length` means end of file;
+  // an empty response means the offset is at or past EOF.
+  rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
+
+  // Positional write. Returns how many bytes were written, which may be
+  // short only on a non-blocking partial write.
+  rpc WriteFile(WriteFileRequest) returns (WriteFileResponse);
+
+  // Durability barrier for a path.
+  rpc FsyncFile(FsyncFileRequest) returns (FsyncFileResponse);
+
+  // Apply attribute changes. Fields left unset are not modified.
+  rpc SetAttr(SetAttrRequest) returns (SetAttrResponse);
+
+  // Aggregate capacity of the backing storage.
+  rpc StatFs(StatFsRequest) returns (StatFsResponse);
+
+  // Remove an existing file.
+  rpc RemoveFile(RemoveFileRequest) returns (RemoveFileResponse);
+
+  // Remove an existing empty directory.
+  rpc RemoveDir(RemoveDirRequest) returns (RemoveDirResponse);
+
+  // Move/rename an existing entry (same owner, atomic where supported).
+  rpc Rename(RenameRequest) returns (RenameResponse);
+
+  // Ask the server to shut down. Only served when the server was built
+  // with the `dev-shutdown` feature; otherwise UNIMPLEMENTED.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
 
-message ListDirectoryRequest {
-  string path = 1;
-}
+// --- shared payloads -------------------------------------------------------
 
 enum FileKind {
   FILE_KIND_UNSPECIFIED = 0;
@@ -16,13 +61,166 @@ enum FileKind {
   FILE_KIND_SYMLINK = 3;
 }
 
+// Seconds-resolution timestamps. Nanoseconds are reserved for a later
+// revision rather than guessed at now.
+message FileTimes {
+  int64 accessed_unix = 1;
+  int64 modified_unix = 2;
+  int64 changed_unix = 3;
+  int64 created_unix = 4;
+}
+
+// Ownership and permission bits.
+message Access {
+  uint32 mode = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+}
+
+// Size and layout counters.
+message Stat {
+  uint64 size = 1;
+  uint64 blocks = 2;
+  uint32 block_size = 3;
+  uint32 rdev = 4;
+  uint32 nlink = 5;
+  uint32 flags = 6;
+}
+
+message FileAttr {
+  // punkfs identity of this entry.
+  string uuid = 1;
+  FileKind kind = 2;
+  FileTimes times = 3;
+  Access access = 4;
+  Stat stat = 5;
+}
+
 message DirEntry {
   string name = 1;
-  FileKind kind = 2;
-  uint64 size = 3;
-  int64 mtime_unix = 4;
+  FileAttr attr = 2;
+}
+
+// --- ListDirectory ---------------------------------------------------------
+
+message ListDirectoryRequest {
+  string path = 1;
 }
 
 message ListDirectoryResponse {
   repeated DirEntry entries = 1;
 }
+
+// --- GetAttr ---------------------------------------------------------------
+
+message GetAttrRequest {
+  string path = 1;
+}
+
+message GetAttrResponse {
+  FileAttr attr = 1;
+}
+
+// --- ReadFile --------------------------------------------------------------
+
+message ReadFileRequest {
+  string path = 1;
+  uint64 offset = 2;
+  // Upper bound on the bytes returned. The server may answer with fewer.
+  uint32 length = 3;
+}
+
+message ReadFileResponse {
+  bytes data = 1;
+}
+
+// --- WriteFile -------------------------------------------------------------
+
+message WriteFileRequest {
+  string path = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+
+message WriteFileResponse {
+  uint32 written = 1;
+}
+
+// --- FsyncFile -------------------------------------------------------------
+
+message FsyncFileRequest {
+  string path = 1;
+  // Skip metadata where the platform can.
+  bool datasync = 2;
+}
+
+message FsyncFileResponse {}
+
+// --- SetAttr ---------------------------------------------------------------
+
+// Every field is `optional` so "leave alone" and "set to zero" stay
+// distinguishable.
+message SetAttrRequest {
+  string path = 1;
+  optional uint32 mode = 2;
+  optional uint64 size = 3;
+  optional int64 accessed_unix = 4;
+  optional int64 modified_unix = 5;
+  // Ownership changes are refused by the local backend for now; the
+  // fields exist so the refusal is explicit rather than a silent drop.
+  optional uint32 uid = 6;
+  optional uint32 gid = 7;
+}
+
+message SetAttrResponse {
+  FileAttr attr = 1;
+}
+
+// --- StatFs ----------------------------------------------------------------
+
+message StatFsRequest {}
+
+message StatFsResponse {
+  uint64 blocks = 1;
+  uint64 bfree = 2;
+  uint64 bavail = 3;
+  uint64 files = 4;
+  uint64 ffree = 5;
+  uint32 block_size = 6;
+  uint32 name_length = 7;
+  uint32 fragment_size = 8;
+}
+
+// --- Shutdown --------------------------------------------------------------
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}
+
+// --- RemoveFile ------------------------------------------------------------
+
+message RemoveFileRequest {
+  string path = 1;
+}
+
+message RemoveFileResponse {}
+
+// --- RemoveDir -------------------------------------------------------------
+
+message RemoveDirRequest {
+  string path = 1;
+}
+
+message RemoveDirResponse {}
+
+// --- Rename ----------------------------------------------------------------
+
+message RenameRequest {
+  string old_path = 1;
+  string new_path = 2;
+  // Reserved for RENAME_NOREPLACE / RENAME_EXCHANGE; the backend rejects
+  // anything non-zero until those are implemented.
+  uint32 flags = 3;
+}
+
+message RenameResponse {}

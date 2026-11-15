@@ -4,19 +4,16 @@
 //! - **Fake catalog**: an in-memory set of entries with the same lookup
 //!   semantics as the real `FsTree`, seeded by `insert`/`insert_with`.
 //! - **Spy + scripted stubs**: every trait method appends to a [`Calls`]
-//!   log so a test can assert what reached the store, and the mutating
+//!   log so a test can assert what reached the store, and the fallible
 //!   methods can be told what to answer via `expect_*`. Left unscripted
-//!   they return `Unimplemented`, matching the real stubs.
+//!   they return `Unsupported`, matching a backend that cannot do it.
 //!
-//! Not behind a feature flag: `#[cfg(test)]`-only, so it costs nothing in
-//! release builds and cannot be used from the integration suite (which
-//! goes through a real mount).
+//! `#[cfg(test)]`-only: it costs nothing in release builds.
 use std::sync::Mutex;
 
-use fuser::OpenFlags;
 use fuser::RenameFlags;
 
-use crate::db::fstree::{FsEntry, FsEntryKind, FsMetadata};
+use crate::db::fstree::{FileAttrData, FsEntry, FsEntryKind};
 use crate::store::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
 
 /// One recorded call per trait method, in order.
@@ -26,31 +23,24 @@ pub(crate) struct Calls {
     pub get_path: Vec<u64>,
     pub ensure_listed: Vec<String>,
     pub get_children: Vec<String>,
-    pub open: Vec<(String, OpenFlags)>,
-    pub read: Vec<(String, u64, u64, u32)>,
-    pub write: Vec<(String, u64, u64, Vec<u8>)>,
-    pub flush: Vec<(String, u64)>,
-    pub release: Vec<(String, u64)>,
-    pub fsync: Vec<(String, u64, bool)>,
+    pub read: Vec<(String, u64, u32)>,
+    pub write: Vec<(String, u64, Vec<u8>)>,
+    pub fsync: Vec<(String, bool)>,
     pub setattr: Vec<(String, SetattrChanges)>,
-    pub mkdir: Vec<(String, u32)>,
+    pub refresh: Vec<String>,
+    pub statfs: usize,
     pub unlink: Vec<String>,
     pub rmdir: Vec<String>,
     pub rename: Vec<(String, String, RenameFlags)>,
-    pub statfs: usize,
 }
 
 #[derive(Default)]
 struct Expectations {
-    open: Option<Result<u64, StoreError>>,
     read: Option<Result<Vec<u8>, StoreError>>,
     write: Option<Result<u32, StoreError>>,
-    flush: Option<Result<(), StoreError>>,
-    release: Option<Result<(), StoreError>>,
     fsync: Option<Result<(), StoreError>>,
-    setattr: Option<Result<FsMetadata, StoreError>>,
-    mkdir: Option<Result<u64, StoreError>>,
     statfs: Option<Result<StatFs, StoreError>>,
+    fail_refresh: bool,
 }
 
 #[derive(Default)]
@@ -61,15 +51,21 @@ struct State {
     expects: Expectations,
     fail_ensure_listed: Option<StoreError>,
     fail_get_children: bool,
+    next_inode: u64,
 }
 
 impl State {
-    fn find_path(&self, inode: u64) -> Option<&FsEntry> {
+    fn find_inode(&self, inode: u64) -> Option<&FsEntry> {
         self.entries.iter().find(|e| e.inode == inode)
     }
 
-    fn find_inode(&self, path: &str) -> Option<&FsEntry> {
+    fn find_path(&self, path: &str) -> Option<&FsEntry> {
         self.entries.iter().find(|e| e.path == path)
+    }
+
+    fn alloc(&mut self) -> u64 {
+        self.next_inode = self.next_inode.max(2) + 1;
+        self.next_inode - 1
     }
 }
 
@@ -90,27 +86,28 @@ impl MockStore {
 
     // --- seeding -------------------------------------------------------
 
-    /// Add an entry with empty metadata.
+    /// Add an entry with default attributes but the given kind.
     pub(crate) fn insert(&self, path: &str, inode: u64, kind: FsEntryKind) {
-        self.insert_with(path, inode, kind, FsMetadata::default());
+        let uuid = format!("uuid-{path}");
+        let attr = FileAttrData {
+            uuid: uuid.clone(),
+            kind,
+            ..FileAttrData::default()
+        };
+        self.insert_with(path, inode, kind, attr);
     }
 
-    /// Add or replace an entry (matched by inode or path, like
-    /// `FsTree::upsert_entry`).
-    pub(crate) fn insert_with(
-        &self,
-        path: &str,
-        inode: u64,
-        kind: FsEntryKind,
-        metadata: FsMetadata,
-    ) {
+    /// Add or replace an entry (matched by inode or path).
+    pub(crate) fn insert_with(&self, path: &str, inode: u64, kind: FsEntryKind, attr: FileAttrData) {
         let mut state = self.lock();
+        let inode = if inode == 0 { state.alloc() } else { inode };
         let entry = FsEntry {
             inode,
             path: path.to_owned(),
+            uuid: attr.uuid.clone(),
             kind,
-            metadata,
-            node_id: "mock-node".into(),
+            node_id: "mock-node".to_owned(),
+            attr,
         };
         match state
             .entries
@@ -146,11 +143,12 @@ impl MockStore {
         self.lock().fail_get_children = true;
     }
 
-    // --- scripted stubs ------------------------------------------------
-
-    pub(crate) fn expect_open(&self, result: Result<u64, StoreError>) {
-        self.lock().expects.open = Some(result);
+    /// Make `refresh` fail, so a test can check the cached fallback.
+    pub(crate) fn fail_refresh(&self) {
+        self.lock().expects.fail_refresh = true;
     }
+
+    // --- scripted stubs ------------------------------------------------
 
     pub(crate) fn expect_read(&self, result: Result<Vec<u8>, StoreError>) {
         self.lock().expects.read = Some(result);
@@ -160,24 +158,8 @@ impl MockStore {
         self.lock().expects.write = Some(result);
     }
 
-    pub(crate) fn expect_flush(&self, result: Result<(), StoreError>) {
-        self.lock().expects.flush = Some(result);
-    }
-
-    pub(crate) fn expect_release(&self, result: Result<(), StoreError>) {
-        self.lock().expects.release = Some(result);
-    }
-
     pub(crate) fn expect_fsync(&self, result: Result<(), StoreError>) {
         self.lock().expects.fsync = Some(result);
-    }
-
-    pub(crate) fn expect_setattr(&self, result: Result<FsMetadata, StoreError>) {
-        self.lock().expects.setattr = Some(result);
-    }
-
-    pub(crate) fn expect_mkdir(&self, result: Result<u64, StoreError>) {
-        self.lock().expects.mkdir = Some(result);
     }
 
     pub(crate) fn expect_statfs(&self, result: Result<StatFs, StoreError>) {
@@ -187,25 +169,23 @@ impl MockStore {
 
 impl StoreApi for MockStore {
     fn node_id(&self) -> &str {
-        // The trait has no place to borrow the guard from, and the id is
-        // fixed for the lifetime of the mock.
         "mock-node"
     }
 
     fn get_inode(&self, path: &str) -> Option<u64> {
         let mut state = self.lock();
         state.calls.get_inode.push(path.to_owned());
-        state.find_inode(path).map(|e| e.inode)
+        state.find_path(path).map(|e| e.inode)
     }
 
     fn get_path(&self, inode: u64) -> Option<String> {
         let mut state = self.lock();
         state.calls.get_path.push(inode);
-        state.find_path(inode).map(|e| e.path.clone())
+        state.find_inode(inode).map(|e| e.path.clone())
     }
 
     fn get_entry(&self, inode: u64) -> Option<FsEntry> {
-        self.lock().find_path(inode).cloned()
+        self.lock().find_inode(inode).cloned()
     }
 
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError> {
@@ -246,105 +226,52 @@ impl StoreApi for MockStore {
             .collect()
     }
 
-    fn open(&self, path: &str, flags: OpenFlags) -> Result<u64, StoreError> {
+    fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
         let mut state = self.lock();
-        state.calls.open.push((path.to_owned(), flags));
-        state
-            .expects
-            .open
-            .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
-    }
-
-    fn read(&self, path: &str, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
-        let mut state = self.lock();
-        state.calls.read.push((path.to_owned(), fh, offset, size));
+        state.calls.read.push((path.to_owned(), offset, size));
         state
             .expects
             .read
             .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
+            .unwrap_or(Err(StoreError::Unsupported("read".into())))
     }
 
-    fn write(&self, path: &str, fh: u64, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
+    fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
         let mut state = self.lock();
-        state
-            .calls
-            .write
-            .push((path.to_owned(), fh, offset, data.to_vec()));
+        state.calls.write.push((path.to_owned(), offset, data.to_vec()));
         state
             .expects
             .write
             .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
+            .unwrap_or(Err(StoreError::Unsupported("write".into())))
     }
 
-    fn flush(&self, path: &str, fh: u64) -> Result<(), StoreError> {
+    fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
         let mut state = self.lock();
-        state.calls.flush.push((path.to_owned(), fh));
-        state
-            .expects
-            .flush
-            .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
-    }
-
-    fn release(&self, path: &str, fh: u64) -> Result<(), StoreError> {
-        let mut state = self.lock();
-        state.calls.release.push((path.to_owned(), fh));
-        state
-            .expects
-            .release
-            .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
-    }
-
-    fn fsync(&self, path: &str, fh: u64, datasync: bool) -> Result<(), StoreError> {
-        let mut state = self.lock();
-        state.calls.fsync.push((path.to_owned(), fh, datasync));
+        state.calls.fsync.push((path.to_owned(), datasync));
         state
             .expects
             .fsync
             .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
+            .unwrap_or(Err(StoreError::Unsupported("fsync".into())))
     }
 
-    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FsMetadata, StoreError> {
+    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
         let mut state = self.lock();
         state.calls.setattr.push((path.to_owned(), changes));
+        Err(StoreError::Unsupported("setattr".into()))
+    }
+
+    fn refresh(&self, path: &str) -> Result<FileAttrData, StoreError> {
+        let mut state = self.lock();
+        state.calls.refresh.push(path.to_owned());
+        if state.expects.fail_refresh {
+            return Err(StoreError::Io("refresh failed".into()));
+        }
         state
-            .expects
-            .setattr
-            .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
-    }
-
-    fn mkdir(&self, path: &str, mode: u32) -> Result<u64, StoreError> {
-        let mut state = self.lock();
-        state.calls.mkdir.push((path.to_owned(), mode));
-        state
-            .expects
-            .mkdir
-            .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
-    }
-
-    fn unlink(&self, path: &str) -> Result<(), StoreError> {
-        let mut state = self.lock();
-        state.calls.unlink.push(path.to_owned());
-        Err(StoreError::Unimplemented)
-    }
-
-    fn rmdir(&self, path: &str) -> Result<(), StoreError> {
-        let mut state = self.lock();
-        state.calls.rmdir.push(path.to_owned());
-        Err(StoreError::Unimplemented)
-    }
-
-    fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError> {
-        let mut state = self.lock();
-        state.calls.rename.push((old.to_owned(), new.to_owned(), flags));
-        Err(StoreError::Unimplemented)
+            .find_path(path)
+            .map(|e| e.attr.clone())
+            .ok_or(StoreError::NotFound)
     }
 
     fn statfs(&self) -> Result<StatFs, StoreError> {
@@ -354,6 +281,55 @@ impl StoreApi for MockStore {
             .expects
             .statfs
             .clone()
-            .unwrap_or(Err(StoreError::Unimplemented))
+            .unwrap_or(Err(StoreError::Unsupported("statfs".into())))
+    }
+
+    fn unlink(&self, path: &str) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        state.calls.unlink.push(path.to_owned());
+        let pos = state
+            .entries
+            .iter()
+            .position(|e| e.path == path)
+            .ok_or(StoreError::NotFound)?;
+        state.entries.remove(pos);
+        Ok(())
+    }
+
+    fn rmdir(&self, path: &str) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        state.calls.rmdir.push(path.to_owned());
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let pos = state
+            .entries
+            .iter()
+            .position(|e| e.path == path)
+            .ok_or(StoreError::NotFound)?;
+        if state.entries.iter().any(|e| e.path.starts_with(&prefix)) {
+            return Err(StoreError::Io("directory not empty".into()));
+        }
+        state.entries.remove(pos);
+        Ok(())
+    }
+
+    fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        state
+            .calls
+            .rename
+            .push((old.to_owned(), new.to_owned(), flags));
+
+        let prefix = format!("{}/", old.trim_end_matches('/'));
+        if !state.entries.iter().any(|e| e.path == old) {
+            return Err(StoreError::NotFound);
+        }
+        for entry in &mut state.entries {
+            if entry.path == old {
+                entry.path = new.to_owned();
+            } else if let Some(rest) = entry.path.strip_prefix(&prefix) {
+                entry.path = format!("{}/{rest}", new.trim_end_matches('/'));
+            }
+        }
+        Ok(())
     }
 }

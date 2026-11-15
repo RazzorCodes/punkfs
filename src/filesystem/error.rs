@@ -15,12 +15,12 @@ pub(crate) enum OpError {
     NotFound,
     /// Directory still has children (ENOTEMPTY).
     NotEmpty,
-    /// Operation refused by policy (EPERM).
+    /// Operation refused (EPERM).
     NotPermitted,
     /// Bad argument, e.g. a non-UTF8 name (EINVAL).
     InvalidInput,
-    /// The op exists but its backing rpc does not yet (ENOSYS).
-    Unimplemented,
+    /// The operation is not supported by this build/backend (ENOSYS).
+    Unsupported,
     /// Anything else from the store/transport (EIO).
     Io(String),
 }
@@ -32,7 +32,7 @@ impl OpError {
             OpError::NotEmpty => Errno::ENOTEMPTY,
             OpError::NotPermitted => Errno::EPERM,
             OpError::InvalidInput => Errno::EINVAL,
-            OpError::Unimplemented => Errno::ENOSYS,
+            OpError::Unsupported => Errno::ENOSYS,
             OpError::Io(_) => Errno::EIO,
         }
     }
@@ -43,10 +43,42 @@ impl From<StoreError> for OpError {
         match err {
             StoreError::NotFound => OpError::NotFound,
             StoreError::NotPermitted => OpError::NotPermitted,
-            StoreError::Unimplemented => OpError::Unimplemented,
+            StoreError::Unsupported(_) => OpError::Unsupported,
             StoreError::Io(msg) => OpError::Io(msg),
         }
     }
 }
 
 pub(crate) type OpResult<T> = Result<T, OpError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_errors_map_to_syscall_errors() {
+        assert_eq!(OpError::from(StoreError::NotFound), OpError::NotFound);
+        assert_eq!(
+            OpError::from(StoreError::NotPermitted),
+            OpError::NotPermitted
+        );
+        assert_eq!(
+            OpError::from(StoreError::Unsupported("nope".into())),
+            OpError::Unsupported
+        );
+        assert_eq!(
+            OpError::from(StoreError::Io("down".into())),
+            OpError::Io("down".into())
+        );
+    }
+
+    #[test]
+    fn errnos_cover_every_variant() {
+        assert_eq!(OpError::NotFound.errno(), Errno::ENOENT);
+        assert_eq!(OpError::NotEmpty.errno(), Errno::ENOTEMPTY);
+        assert_eq!(OpError::NotPermitted.errno(), Errno::EPERM);
+        assert_eq!(OpError::InvalidInput.errno(), Errno::EINVAL);
+        assert_eq!(OpError::Unsupported.errno(), Errno::ENOSYS);
+        assert_eq!(OpError::Io("x".into()).errno(), Errno::EIO);
+    }
+}

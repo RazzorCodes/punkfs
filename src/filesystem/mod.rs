@@ -9,8 +9,8 @@
 //! - `dir.rs`    — directories: `opendir`, `readdir`
 //! - `file.rs`   — file content: `open`, `read`, `write`, `flush`,
 //!   `release`, `fsync`
-//! - `meta.rs`   — metadata/namespace mutation: `setattr`, `mkdir`,
-//!   `unlink`, `rmdir`, `rename`, `statfs`
+//! - `meta.rs`   — metadata/namespace mutation: `setattr`, `unlink`,
+//!   `rmdir`, `rename`, `statfs`
 //! - `misc.rs`   — uncategorisable ops: `readlink`, `mknod`, `symlink`,
 //!   `link`
 //! - `helpers.rs` — helpers that fit none of the above
@@ -283,20 +283,6 @@ impl Filesystem for Fs {
             self, req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime,
             bkuptime, flags, reply,
         );
-    }
-
-    /// Create a directory named `name` inside `parent` with permission
-    /// `mode & !umask`. Delegates to `meta::mkdir`.
-    fn mkdir(
-        &self,
-        req: &Request,
-        parent: INodeNo,
-        name: &std::ffi::OsStr,
-        mode: u32,
-        umask: u32,
-        reply: fuser::ReplyEntry,
-    ) {
-        meta::mkdir(self, req, parent, name, mode, umask, reply);
     }
 
     /// Remove the file `name` inside `parent`. Delegates to

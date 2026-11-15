@@ -19,8 +19,8 @@ use fuser::ReplyAttr;
 use fuser::ReplyEntry;
 use fuser::Request;
 
-pub(crate) use super::error::{OpError, OpResult};
 use super::Fs;
+use super::error::{OpError, OpResult};
 use super::helpers;
 use crate::TIMEOUT;
 use crate::store::StoreApi;
@@ -36,9 +36,9 @@ use crate::store::StoreApi;
 /// Behaviour:
 /// - An unknown `parent` is `ENOENT`.
 /// - For a normal name the parent's listing is refreshed from the server
-///   first; a failed fetch is swallowed so lookups on offline directories
-///   keep working from the cached listing (spec §3/§5).
-/// - A name not present in the (freshly fetched) listing is `ENOENT`.
+///   first; a failed fetch is swallowed so lookups keep working from the
+///   cached listing.
+/// - A name not present in the listing is `ENOENT`.
 /// - A non-UTF8 name is `EINVAL`.
 pub(crate) fn lookup_decision(
     store: &dyn StoreApi,
@@ -61,20 +61,30 @@ pub(crate) fn lookup_decision(
     Ok((inode, attr))
 }
 
-/// Attributes of an inode: no path resolution, no server round trip.
+/// Attributes of an inode.
+///
+/// The server is asked first so `stat` reflects reality (a remote write
+/// changes size/mtime); if that fails we fall back to the cached entry,
+/// which is what keeps an offline directory usable.
 pub(crate) fn getattr_decision(
     store: &dyn StoreApi,
     uid: u32,
     gid: u32,
     ino: u64,
 ) -> OpResult<FileAttr> {
+    if let Some(path) = store.get_path(ino)
+        && store.refresh(&path).is_ok()
+    {
+        // The refresh stored the fresh attributes; serve from there.
+        return helpers::attr_or_not_found(store, ino, uid, gid);
+    }
+
     helpers::attr_or_not_found(store, ino, uid, gid)
 }
 
 pub(crate) fn lookup(fs: &Fs, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
     match lookup_decision(fs.store.as_ref(), req.uid(), req.gid(), parent.0, name) {
-        // Zero TTL so the kernel re-asks us instead of caching (valid
-        // while some attrs are still synthesized).
+        // Zero TTL so the kernel re-asks us instead of caching.
         Ok((_inode, attr)) => reply.entry(&TIMEOUT, &attr, Generation(0)),
         Err(e) => reply.error(e.errno()),
     }
@@ -97,6 +107,7 @@ pub(crate) fn getattr(
 mod tests {
     use super::*;
     use crate::db::fstree::FsEntryKind;
+    use crate::store::StoreError;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {
@@ -137,16 +148,14 @@ mod tests {
         assert_eq!(ino, 2);
         let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new("..")).unwrap();
         assert_eq!(ino, 1);
-        // `..` outside the (unchanged) tree: still resolves to the parent
-        // path without asking the server for a listing.
+        // No server round trip for dot names.
         assert!(store.listed().is_empty());
     }
 
     #[test]
     fn lookup_offline_failure_is_swallowed() {
         let store = seeded();
-        store.fail_ensure_listed(crate::store::StoreError::Io("down".into()));
-        // The child is already cached, so the lookup still succeeds.
+        store.fail_ensure_listed(StoreError::Io("down".into()));
         let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new("readme")).unwrap();
         assert_eq!(ino, 3);
     }
@@ -161,19 +170,34 @@ mod tests {
     }
 
     #[test]
-    fn getattr_reports_stored_metadata() {
-        use crate::db::fstree::FsMetadata;
+    fn getattr_serves_cached_data_when_refresh_fails() {
+        let store = seeded();
+        store.fail_refresh();
+        let attr = getattr_decision(&store, 7, 8, 3).unwrap();
+        assert_eq!(attr.ino, INodeNo(3));
+    }
+
+    #[test]
+    fn getattr_reports_refreshed_metadata() {
+        use crate::db::fstree::{Access, FileAttrData, Stat};
         let store = MockStore::new();
         store.insert_with(
             "/f",
             5,
             FsEntryKind::File,
-            FsMetadata {
-                size: 1234,
-                perm: 0o640,
-                uid: 33,
-                gid: 44,
-                ..FsMetadata::default()
+            FileAttrData {
+                uuid: "uuid-f".into(),
+                kind: FsEntryKind::File,
+                access: Access {
+                    mode: 0o640,
+                    uid: 33,
+                    gid: 44,
+                },
+                stat: Stat {
+                    size: 1234,
+                    ..Stat::default()
+                },
+                ..FileAttrData::default()
             },
         );
         let attr = getattr_decision(&store, 7, 8, 5).unwrap();
