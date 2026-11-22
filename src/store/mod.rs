@@ -5,18 +5,22 @@
 //! client, and the tokio runtime used to drive async calls from the
 //! synchronous FUSE callbacks.
 //!
-//! Identity note: entries are identified by `uuid` (the punkfs identity,
+//! Identity note: entries are identified by `guid` (the punkfs identity,
 //! assigned by the server) and addressed locally by `inode` (allocated
 //! here). The store is the layer that maps between the two.
 use std::collections::HashSet;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 
 use fuser::RenameFlags;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::db::fstree::{Access, FsEntry, FsEntryKind, FsNode, FsTree, FileAttrData, FileTimes, Stat};
+use crate::db::fstree::{
+    Access, Availability, FsEntry, FsEntryKind, FsNode, FsTree, FileAttrData, FileTimes, ListingOutcome,
+    Stat,
+};
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
     self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, SetAttrRequest,
@@ -38,6 +42,9 @@ pub enum StoreError {
     NotPermitted,
     /// The operation is not supported by this backend at all.
     Unsupported(String),
+    /// The node owning this entry did not answer (its identity is carried
+    /// so a caller can name the culprit).
+    Inaccessible(String),
     /// Anything from the transport or the server.
     Io(String),
 }
@@ -46,6 +53,7 @@ impl From<tonic::Status> for StoreError {
     fn from(status: tonic::Status) -> Self {
         match status.code() {
             tonic::Code::NotFound => StoreError::NotFound,
+            tonic::Code::Unavailable => StoreError::Inaccessible("unavailable".into()),
             tonic::Code::PermissionDenied => StoreError::NotPermitted,
             tonic::Code::Unimplemented => StoreError::Unsupported(status.message().to_owned()),
             tonic::Code::InvalidArgument => StoreError::Unsupported(status.message().to_owned()),
@@ -103,8 +111,10 @@ pub trait StoreApi: Send + Sync {
     fn get_inode(&self, path: &str) -> Option<u64>;
     /// Path for `inode`, if the catalog knows it.
     fn get_path(&self, inode: u64) -> Option<String>;
-    /// The whole entry (kind, metadata, path, uuid) for an inode.
+    /// The whole entry (kind, metadata, path, guid) for an inode.
     fn get_entry(&self, inode: u64) -> Option<FsEntry>;
+    /// Which backing node holds `path`, if the catalog knows it.
+    fn owner_of(&self, path: &str) -> Option<String>;
     /// Fetch and reconcile `dir` from the server.
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError>;
     /// Children of `path`, using whatever listing is cached.
@@ -141,97 +151,240 @@ pub struct Store {
     fstree: Mutex<FsTree>,
     listed: Mutex<HashSet<String>>, // directories already fetched from the server
     rt: Runtime,
-    client: PunkFsClient<Channel>,
+    /// One connection per backing node, in stable merge order.
+    nodes: Vec<NodeConn>,
     node: FsNode, // where am i running right now
+    /// Paths contributed by more than one node in the last listing.
+    conflicts: Mutex<HashSet<String>>,
+}
+
+/// A reachable backing node: its identity, its live connection, and when
+/// it last answered.
+struct NodeConn {
+    node_id: String,
+    client: PunkFsClient<Channel>,
+    last_seen: Mutex<Option<SystemTime>>,
+}
+
+impl NodeConn {
+    fn touch(&self) {
+        *self.last_seen.lock().unwrap() = Some(SystemTime::now());
+    }
+
+    fn reachable(&self, max_age: Duration) -> bool {
+        self.last_seen
+            .lock()
+            .unwrap()
+            .and_then(|seen| SystemTime::now().duration_since(seen).ok())
+            .is_some_and(|age| age <= max_age)
+    }
 }
 
 impl Store {
+    /// Build a store over a single backing server.
     pub fn new(server_url: &str, node: FsNode) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_nodes(&[(node.node_id.clone(), server_url.to_owned())], node)
+    }
+
+    /// Build a store over several backing servers merged into one namespace.
+    ///
+    /// Params:
+    /// - `nodes`: `(node_id, url)` pairs. **Order is significant**: it is
+    ///   the stable precedence used when two nodes claim the same name.
+    /// - `local`: this machine's identity, recorded on locally-tagged
+    ///   entries.
+    pub fn new_nodes(
+        nodes: &[(String, String)],
+        local: FsNode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let rt = Runtime::new()?;
+
         // connect_lazy doesn't fail if the server is down; the first RPC
         // connects. It needs a runtime context, hence enter().
-        let channel = {
+        let conns = {
             let _guard = rt.enter();
-            Endpoint::from_shared(server_url.to_owned())?.connect_lazy()
+            nodes
+                .iter()
+                .map(|(node_id, url)| {
+                    let channel = Endpoint::from_shared(url.to_owned())?.connect_lazy();
+                    Ok(NodeConn {
+                        node_id: node_id.clone(),
+                        client: PunkFsClient::new(channel),
+                        last_seen: Mutex::new(None),
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
         };
 
         let mut fstree = FsTree::new();
-        // The root's uuid is the server's answer for "/"; it is refreshed by
-        // the first listing, so any placeholder would do. A fixed string
-        // keeps it stable across restarts.
+        // The root is synthetic: every node answers "/" with a different
+        // guid, but a mount has exactly one root. Its children resolve per
+        // node normally.
         fstree.insert_root("/", "/", FsEntryKind::Directory);
 
         Ok(Store {
             fstree: Mutex::new(fstree),
             listed: Mutex::new(HashSet::new()),
             rt,
-            client: PunkFsClient::new(channel),
-            node,
+            nodes: conns,
+            node: local,
+            conflicts: Mutex::new(HashSet::new()),
         })
     }
 
-    /// Fetch `dir` from the server unless we already have.
+    /// How long a node may stay silent before its entries are treated as
+    /// inaccessible. Overridable through the environment for tests.
+    fn reachability_window() -> Duration {
+        std::env::var("PUNKFS_NODE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(5))
+    }
+
+    /// The connection owning `node_id`.
+    fn conn_for(&self, node_id: &str) -> Result<&NodeConn, StoreError> {
+        self.nodes
+            .iter()
+            .find(|n| n.node_id == node_id)
+            .ok_or_else(|| StoreError::Io(format!("unknown node {node_id}")))
+    }
+
+    /// Paths the last listing found claimed by more than one node.
     ///
-    /// On success the cached children are reconciled against the answer,
-    /// which is what makes a missing child a genuine deletion.
+    /// Exposed so a caller (or a test) can tell that a merge was
+    /// ambiguous instead of trusting whichever entry won.
+    pub fn conflicts(&self) -> Vec<String> {
+        let mut known: Vec<String> = self.conflicts.lock().unwrap().iter().cloned().collect();
+        known.sort();
+        known
+    }
+
+    /// Which node owns `path`.
+    fn node_of(&self, path: &str) -> Result<String, StoreError> {
+        let tree = self.fstree.lock().unwrap();
+        tree.get_entry_by_path(path)
+            .map(|e| e.node_id.clone())
+            // An unknown path is routed to the first node so the server can
+            // produce the authoritative NotFound; guessing a node would be
+            // worse than asking one.
+            .or_else(|| self.nodes.first().map(|n| n.node_id.clone()))
+            .ok_or_else(|| StoreError::Io("no backing nodes configured".into()))
+    }
+
+    /// The connection that should serve `path`.
+    fn client_for(&self, path: &str) -> Result<(String, PunkFsClient<Channel>), StoreError> {
+        let node_id = self.node_of(path)?;
+        let conn = self.conn_for(&node_id)?;
+        Ok((node_id.clone(), conn.client.clone()))
+    }
+
+    /// Ask every node to list `dir`, concurrently, and reconcile the union.
+    ///
+    /// Partial failure is normal: a node that does not answer contributes
+    /// [`ListingOutcome::Unreachable`] and keeps its cached entries.
     fn fetch_listing(&self, dir: &str, force: bool) -> Result<(), StoreError> {
         if !force && self.listed.lock().unwrap().contains(dir) {
             return Ok(());
         }
 
-        let mut client = self.client.clone(); // cheap: shares the channel
-        let resp = self
-            .rt
-            .block_on(client.list_directory(ListDirectoryRequest { path: dir.into() }))?
-            .into_inner();
+        let mut outcomes: Vec<(String, ListingOutcome)> = Vec::new();
+        let mut any_answered = false;
 
-        let children = resp
-            .entries
-            .into_iter()
-            .map(|e| {
-                let full = join(dir, &e.name);
-                entry_from_attr(0, &full, e.attr.unwrap_or_default(), &self.node.node_id)
-            })
-            .collect::<Vec<_>>();
+        for conn in &self.nodes {
+            let mut client = conn.client.clone(); // cheap: shares the channel
+            let answer = self
+                .rt
+                .block_on(client.list_directory(ListDirectoryRequest { path: dir.into() }));
 
-        // Lock only after the network call is done.
-        self.fstree.lock().unwrap().reconcile(dir, children);
-        self.listed.lock().unwrap().insert(dir.to_owned());
-        Ok(())
+            match answer {
+                Ok(resp) => {
+                    conn.touch();
+                    any_answered = true;
+                    let children = resp
+                        .into_inner()
+                        .entries
+                        .into_iter()
+                        .map(|e| {
+                            let full = join(dir, &e.name);
+                            entry_from_attr(0, &full, e.attr.unwrap_or_default(), &conn.node_id)
+                        })
+                        .collect::<Vec<_>>();
+                    outcomes.push((conn.node_id.clone(), ListingOutcome::Answered(children)));
+                }
+                Err(_) => {
+                    outcomes.push((conn.node_id.clone(), ListingOutcome::Unreachable));
+                }
+            }
+        }
+
+        // Lock only after the network calls are done.
+        let conflicts = self.fstree.lock().unwrap().reconcile_from(dir, outcomes);
+        if !conflicts.is_empty() {
+            for path in &conflicts {
+                eprintln!(
+                    "punkfs: duplicate name across nodes, refusing to pick one: {path}"
+                );
+            }
+            let mut known = self.conflicts.lock().unwrap();
+            known.extend(conflicts);
+        }
+
+        if any_answered {
+            self.listed.lock().unwrap().insert(dir.to_owned());
+            Ok(())
+        } else {
+            Err(StoreError::Io("no backing node answered".into()))
+        }
     }
+
 
     /// Forget a cached directory so the next access refetches it.
     fn invalidate(&self, dir: &str) {
         self.listed.lock().unwrap().remove(dir);
     }
 
-    fn client(&self) -> PunkFsClient<Channel> {
-        self.client.clone()
-    }
-
+    /// Fetch one entry's attributes from the node that owns it.
     fn getattr(&self, path: &str) -> Result<FileAttrData, StoreError> {
-        let mut client = self.client();
+        let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
             .block_on(client.get_attr(GetAttrRequest {
                 path: path.to_owned(),
-            }))?
-            .into_inner();
-        Ok(attr_from_proto(resp.attr.unwrap_or_default()))
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
+        Ok(attr_from_proto(resp.into_inner().attr.unwrap_or_default()))
     }
 
     /// Store the attributes the server just reported for `path`.
+    ///
+    /// Ownership is preserved from the existing entry when we know it,
+    /// so a refresh cannot silently re-home a file onto the local node.
     fn store_attr(&self, path: &str, attr: FileAttrData) {
         let mut tree = self.fstree.lock().unwrap();
-        let inode = tree.get_inode(path).unwrap_or(0);
+        let existing = tree.get_entry_by_path(path).cloned();
+        let inode = existing.as_ref().map(|e| e.inode).unwrap_or(0);
+        let node_id = existing
+            .map(|e| e.node_id)
+            .unwrap_or_else(|| self.node.node_id.clone());
         tree.upsert_entry(FsEntry {
             inode,
             path: path.to_owned(),
-            uuid: attr.uuid.clone(),
+            guid: attr.guid.clone(),
             kind: attr.kind,
-            node_id: self.node.node_id.clone(),
+            node_id,
+            availability: Availability::Available,
             attr,
         });
+    }
+}
+
+/// The containing directory of a catalog path.
+fn parent_of(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((head, _)) if !head.is_empty() => head.to_owned(),
+        _ => "/".to_owned(),
     }
 }
 
@@ -259,7 +412,7 @@ fn attr_from_proto(attr: punk_fs::FileAttr) -> FileAttrData {
     let stat = attr.stat.unwrap_or_default();
 
     FileAttrData {
-        uuid: attr.uuid,
+        guid: attr.guid,
         kind: kind_from_proto(attr.kind),
         times: FileTimes::from_secs(
             times.accessed_unix.max(0) as u64,
@@ -289,9 +442,10 @@ fn entry_from_attr(inode: u64, path: &str, attr: punk_fs::FileAttr, node_id: &st
     FsEntry {
         inode,
         path: path.to_owned(),
-        uuid: attr.uuid.clone(),
+        guid: attr.guid.clone(),
         kind: attr.kind,
         node_id: node_id.to_owned(),
+        availability: Availability::Available,
         attr,
     }
 }
@@ -315,6 +469,15 @@ impl StoreApi for Store {
 
     fn get_entry(&self, inode: u64) -> Option<FsEntry> {
         self.fstree.lock().unwrap().get_entry(inode).cloned()
+    }
+
+    fn owner_of(&self, path: &str) -> Option<String> {
+        self.fstree
+            .lock()
+            .unwrap()
+            .get_entry_by_path(path)
+            .map(|e| e.node_id.clone())
+            .filter(|id| !id.is_empty())
     }
 
     /// Fetch and reconcile `dir`.
@@ -347,42 +510,51 @@ impl StoreApi for Store {
     }
 
     fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
-        let mut client = self.client();
+        self.require_reachable(path)?;
+        let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
             .block_on(client.read_file(ReadFileRequest {
                 path: path.to_owned(),
                 offset,
                 length: size,
-            }))?
-            .into_inner();
-        Ok(resp.data)
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
+        Ok(resp.into_inner().data)
     }
 
     fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
-        let mut client = self.client();
+        self.require_reachable(path)?;
+        let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
             .block_on(client.write_file(WriteFileRequest {
                 path: path.to_owned(),
                 offset,
                 data: data.to_vec(),
-            }))?
-            .into_inner();
-        Ok(resp.written)
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
+        Ok(resp.into_inner().written)
     }
 
     fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
-        let mut client = self.client();
-        self.rt.block_on(client.fsync_file(FsyncFileRequest {
-            path: path.to_owned(),
-            datasync,
-        }))?;
+        self.require_reachable(path)?;
+        let (node_id, mut client) = self.client_for(path)?;
+        self.rt
+            .block_on(client.fsync_file(FsyncFileRequest {
+                path: path.to_owned(),
+                datasync,
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
         Ok(())
     }
 
     fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
-        let mut client = self.client();
+        self.require_reachable(path)?;
+        let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
             .block_on(client.set_attr(SetAttrRequest {
@@ -393,10 +565,11 @@ impl StoreApi for Store {
                 modified_unix: changes.modified_unix,
                 uid: None,
                 gid: None,
-            }))?
-            .into_inner();
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
 
-        let attr = attr_from_proto(resp.attr.unwrap_or_default());
+        let attr = attr_from_proto(resp.into_inner().attr.unwrap_or_default());
         self.store_attr(path, attr.clone());
         Ok(attr)
     }
@@ -408,11 +581,18 @@ impl StoreApi for Store {
     }
 
     fn statfs(&self) -> Result<StatFs, StoreError> {
-        let mut client = self.client();
-        let resp = self
-            .rt
-            .block_on(client.stat_fs(StatFsRequest {}))?
-            .into_inner();
+        // Capacity is reported by the first reachable node: an aggregate
+        // would claim space no single node can actually serve.
+        let mut resp = None;
+        for conn in &self.nodes {
+            let mut client = conn.client.clone();
+            if let Ok(answer) = self.rt.block_on(client.stat_fs(StatFsRequest {})) {
+                conn.touch();
+                resp = Some(answer.into_inner());
+                break;
+            }
+        }
+        let resp = resp.ok_or_else(|| StoreError::Io("no backing node answered".into()))?;
         Ok(StatFs {
             blocks: resp.blocks,
             bfree: resp.bfree,
@@ -426,49 +606,90 @@ impl StoreApi for Store {
     }
 
     fn unlink(&self, path: &str) -> Result<(), StoreError> {
-        let mut client = self.client();
+        self.require_reachable(path)?;
+        let (node_id, mut client) = self.client_for(path)?;
         self.rt
             .block_on(client.remove_file(punk_fs::RemoveFileRequest {
                 path: path.to_owned(),
-            }))?;
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
         self.after_mutation(path);
         Ok(())
     }
 
     fn rmdir(&self, path: &str) -> Result<(), StoreError> {
-        let mut client = self.client();
-        self.rt.block_on(client.remove_dir(punk_fs::RemoveDirRequest {
-            path: path.to_owned(),
-        }))?;
+        self.require_reachable(path)?;
+        let (node_id, mut client) = self.client_for(path)?;
+        self.rt
+            .block_on(client.remove_dir(punk_fs::RemoveDirRequest {
+                path: path.to_owned(),
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
         self.after_mutation(path);
         Ok(())
     }
 
     fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError> {
-        let mut client = self.client();
-        self.rt.block_on(client.rename(punk_fs::RenameRequest {
-            old_path: old.to_owned(),
-            new_path: new.to_owned(),
-            flags: flags.bits(),
-        }))?;
+        self.require_reachable(old)?;
+        let (node_id, mut client) = self.client_for(old)?;
+        self.rt
+            .block_on(client.rename(punk_fs::RenameRequest {
+                old_path: old.to_owned(),
+                new_path: new.to_owned(),
+                flags: flags.bits(),
+            }))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node_id)?.touch();
 
-        self.after_mutation(old);
+        // Rename within one node: the entry keeps its guid and its inode,
+        // so move it locally instead of dropping and re-adding it. A
+        // cross-node move is refused by the op layer, never reaching here.
         self.after_mutation(new);
         self.fstree.lock().unwrap().rename_entry(old, new);
+        let parent = parent_of(old);
+        self.invalidate(&parent);
         Ok(())
     }
 }
 
 impl Store {
+    /// Refuse an operation that needs bytes from a node we cannot reach.
+    ///
+    /// This is what makes "node down" cheap instead of pathological: we
+    /// answer from `last_seen` rather than paying a connect timeout on
+    /// every `cat`. Browsing (`ls`, `stat`) deliberately does not call this
+    /// — the namespace stays visible while the content is not.
+    fn require_reachable(&self, path: &str) -> Result<(), StoreError> {
+        let node_id = self.node_of(path)?;
+        let conn = self.conn_for(&node_id)?;
+        if conn.reachable(Self::reachability_window()) {
+            return Ok(());
+        }
+        // Never seen, or silent for too long: one cheap retry, because a
+        // node that just came back should not need a second syscall.
+        let mut client = conn.client.clone();
+        let alive = self
+            .rt
+            .block_on(client.get_attr(GetAttrRequest {
+                path: path.to_owned(),
+            }))
+            .is_ok();
+        if alive {
+            conn.touch();
+            Ok(())
+        } else {
+            Err(StoreError::Inaccessible(node_id))
+        }
+    }
+
     /// Update the local snapshot after a successful mutation of `path`.
     ///
     /// The entry is dropped (or, for a directory, its children are) and the
     /// containing directory is invalidated so the next listing refetches.
     fn after_mutation(&self, path: &str) {
-        let parent = match path.rsplit_once('/') {
-            Some((head, _)) if !head.is_empty() => head.to_owned(),
-            _ => "/".to_owned(),
-        };
+        let parent = parent_of(path);
         self.invalidate(&parent);
         self.fstree.lock().unwrap().remove_entry(path);
     }

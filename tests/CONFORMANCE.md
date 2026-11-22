@@ -96,6 +96,34 @@ on write, which is worse than a plain refusal. Either implement `access` from
 the cached mode, or return `ENOSYS` so libc falls back on the real `stat`
 mode.
 
+## 7. Multi-node: a duplicate name after a node returns (1 test)
+
+`multinode_conformance::a_node_returning_with_a_duplicate_name_is_refused_not_guessed`
+
+Fixed in this iteration: a node going down no longer deletes its entries
+(`reconcile_from` only drops entries a node itself did not report), reading
+from a down node reports `EHOSTDOWN`, and the mount keeps working.
+
+Remaining gap: when a node comes back claiming a name another node already
+serves, the merge keeps the first node's entry and serves it. The collision
+*is* detected and logged to stderr (`duplicate name across nodes, refusing
+to pick one: /collide.txt`) and the process stays alive, but the mount cannot
+yet turn it into a visible failure. Picking a winner silently is the part
+that is wrong: a caller gets one file's bytes with no indication the other
+exists.
+
+Closing it needs a decision on the namespace (refuse the whole directory?
+suffix the loser?), which is why the test is left failing as a specification.
+
+Fixed during manual verification: a directory present on two nodes was
+reported as a duplicate name, which made any overlapping tree unusable.
+Directories merge; only files can collide. Guarded by
+`a_shared_directory_is_merged_without_being_reported_as_a_conflict`.
+
+Note that `the_store_reports_a_duplicate_name_collision` passes: the store
+*does* record conflicts and exposes them via `Store::conflicts()`. Only the
+FUSE layer does not surface them yet.
+
 ## Deliberate non-conformance (not gaps)
 
 These are product decisions, and the tests assert the refusal so a silent
@@ -105,5 +133,8 @@ change would be caught:
   `symlink`, `link`). Entries are created by the machine that owns the
   storage.
 - Ownership changes (`chown`) are refused.
+- Cross-node moves are refused with `EXDEV`. A rename that would move a file
+  between backing nodes is a copy, not a rename. Directory moves are
+  unchanged for now (still allowed), deferred rather than restricted.
 
 See `mutation_conformance` for those tests.

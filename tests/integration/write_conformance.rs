@@ -210,7 +210,7 @@ fn writes_from_many_handles_do_not_interfere() {
         return;
     }
     let (server, mount) = common::mount_empty();
-    server.seed("multi.txt", &vec![b'.'; 40]);
+    server.seed("multi.txt", &[b'.'; 40]);
 
     // Four handles, disjoint ranges. Positional I/O means no shared cursor,
     // so the result must be deterministic.
@@ -220,7 +220,7 @@ fn writes_from_many_handles_do_not_interfere() {
             .open(mount.at("multi.txt"))
             .unwrap();
         file.seek(SeekFrom::Start((i * 10) as u64)).unwrap();
-        file.write_all(&vec![*byte; 10]).unwrap();
+        file.write_all(&[*byte; 10]).unwrap();
     }
 
     let backing = server.backing("multi.txt");

@@ -106,10 +106,41 @@ impl Fs {
         node: FsNode,
     ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
         let fs = Fs::new(server_url, node)?;
+        Self::spawn(fs, mountpoint)
+    }
 
+    /// Mount several backing nodes as one merged namespace.
+    ///
+    /// Params:
+    /// - `nodes`: `(node_id, url)` pairs. Order is the precedence used when
+    ///   two nodes report the same name.
+    /// - `mountpoint`: directory the merged view appears under.
+    /// - `node`: this machine's identity.
+    ///
+    /// The nodes are not contacted here: connections are lazy, so a node
+    /// that is down at mount time simply contributes nothing until it
+    /// answers.
+    pub fn mount_cluster(
+        nodes: &[(String, String)],
+        mountpoint: &Path,
+        node: FsNode,
+    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
+        let store = Store::new_nodes(nodes, node)?;
+        Self::spawn(
+            Fs {
+                store: Box::new(store),
+            },
+            mountpoint,
+        )
+    }
+
+    /// Spawn the FUSE session for an already-constructed fs.
+    fn spawn(
+        fs: Fs,
+        mountpoint: &Path,
+    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
         let mut cfg = fuser::Config::default();
         cfg.mount_options = vec![MountOption::FSName("punkfs".into())];
-
         Ok(fuser::spawn_mount(fs, mountpoint, &cfg)?)
     }
 }

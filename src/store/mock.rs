@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use fuser::RenameFlags;
 
-use crate::db::fstree::{FileAttrData, FsEntry, FsEntryKind};
+use crate::db::fstree::{Availability, FileAttrData, FsEntry, FsEntryKind};
 use crate::store::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
 
 /// One recorded call per trait method, in order.
@@ -88,9 +88,9 @@ impl MockStore {
 
     /// Add an entry with default attributes but the given kind.
     pub(crate) fn insert(&self, path: &str, inode: u64, kind: FsEntryKind) {
-        let uuid = format!("uuid-{path}");
+        let guid = format!("guid-{path}");
         let attr = FileAttrData {
-            uuid: uuid.clone(),
+            guid: guid.clone(),
             kind,
             ..FileAttrData::default()
         };
@@ -104,9 +104,10 @@ impl MockStore {
         let entry = FsEntry {
             inode,
             path: path.to_owned(),
-            uuid: attr.uuid.clone(),
+            guid: attr.guid.clone(),
             kind,
             node_id: "mock-node".to_owned(),
+            availability: Availability::Available,
             attr,
         };
         match state
@@ -182,6 +183,10 @@ impl StoreApi for MockStore {
         let mut state = self.lock();
         state.calls.get_path.push(inode);
         state.find_inode(inode).map(|e| e.path.clone())
+    }
+
+    fn owner_of(&self, path: &str) -> Option<String> {
+        self.lock().find_path(path).map(|e| e.node_id.clone())
     }
 
     fn get_entry(&self, inode: u64) -> Option<FsEntry> {

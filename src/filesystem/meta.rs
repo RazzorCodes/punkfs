@@ -32,6 +32,7 @@ use fuser::TimeOrNow;
 use super::Fs;
 use super::error::{OpError, OpResult};
 use super::helpers;
+use crate::db::fstree::FsEntryKind;
 use crate::store::{StatFs, StoreApi};
 
 /// Apply the requested attribute changes to `ino`; returns the new attrs.
@@ -91,6 +92,17 @@ pub(crate) fn rmdir_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) ->
 
 /// Move `parent`/`name` to `newparent`/`newname`.
 ///
+/// Directory renames are **unchanged** for now: they keep working as they
+/// did before multi-node support. Nesting a directory under a name another
+/// node also uses is a known gap, deferred rather than refused.
+///
+/// The one new restriction, and it applies to files:
+///
+/// - **Within one node only.** A move that would cross backing nodes is
+///   refused with `EXDEV`, the same errno a real filesystem uses when a
+///   rename would cross a device. Silently copying the content would be a
+///   different operation with different failure modes.
+///
 /// Flags are passed through: `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are the
 /// backend's call to make or refuse.
 pub(crate) fn rename_decision(
@@ -105,6 +117,24 @@ pub(crate) fn rename_decision(
     let new_parent = helpers::path_of(store, newparent)?;
     let old_path = helpers::child_path(&old_parent, name)?;
     let new_path = helpers::child_path(&new_parent, newname)?;
+
+    // A file keeps the node that holds its bytes; moving it elsewhere would
+    // mean copying, which is not a rename. Directories are exempt: their
+    // handling is unchanged from before multi-node support.
+    let inode = store.get_inode(&old_path).ok_or(OpError::NotFound)?;
+    let source = store.get_entry(inode).ok_or(OpError::NotFound)?;
+
+    if source.kind != FsEntryKind::Directory {
+        let owner = store.owner_of(&old_path).ok_or(OpError::NotFound)?;
+        match store.owner_of(&new_path) {
+            // Renaming in place on the same node.
+            Some(dest_owner) if dest_owner == owner => {}
+            // The destination is new: it is created on the source's node.
+            None => {}
+            Some(_) => return Err(OpError::CrossDevice),
+        }
+    }
+
     Ok(store.rename(&old_path, &new_path, flags)?)
 }
 

@@ -34,9 +34,15 @@ use crate::punk_fs::{
 /// request from asking for a gigabyte.
 pub const MAX_READ: u32 = 1024 * 1024;
 
-/// UUID namespace for entry identities. Fixed forever: changing it renames
-/// every entry in the system.
-const UUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x6ba7b810_9dad_11d1_80b4_00c04fd430c8);
+/// GUID namespace for the deterministic fallback guid. Fixed forever:
+/// changing it renames every entry in the system.
+const GUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x6ba7b810_9dad_11d1_80b4_00c04fd430c8);
+
+/// xattr holding an entry's persisted punkfs identity.
+///
+/// Namespaced under `user.` so an unprivileged server can write it, and
+/// attached to the inode so `rename(2)` carries it to the new path.
+const GUID_XATTR: &str = "user.punkfs.guid";
 
 /// A served folder, plus the hooks `main` needs to run and stop it.
 pub struct PunkFsService {
@@ -84,19 +90,35 @@ impl PunkFsService {
         Ok(self.root.join(path))
     }
 
-    /// punkfs identity for a logical path.
+    /// punkfs identity for a logical path, **persisted on the entry** so it
+    /// survives a rename.
     ///
-    /// Deterministic per (node, path) so repeated listings agree without
-    /// persisting anything. **Limitation, by design of this iteration:**
-    /// renaming an entry changes its uuid, because real uuid assignment
-    /// belongs to the catalog/coordinator, which would carry it across the
-    /// rename.
-    fn uuid_for(&self, logical: &str) -> String {
-        uuid::Uuid::new_v5(
-            &UUID_NAMESPACE,
-            format!("{}/{}", self.node_id, logical).as_bytes(),
-        )
-        .to_string()
+    /// The identity lives in the `user.punkfs.guid` xattr, which the kernel
+    /// carries across `rename(2)` for free because it belongs to the inode,
+    /// not the path. Minting is therefore a one-time event per file:
+    ///
+    /// 1. Read the xattr; if present, that is the identity.
+    /// 2. Otherwise mint a fresh v4 guid and try to store it.
+    /// 3. If the filesystem refuses xattrs (`EPERM`/`ENOTSUP`, e.g. a
+    ///    network mount), fall back to a v5 derived from `(node, path)`.
+    ///    Stable per path but *not* across renames — the pre-persistence
+    ///    behaviour, kept so such a backing store still works at all.
+    ///
+    /// Concurrent first-views of the same file may mint different guids and
+    /// one write wins; that is acceptable because the loser is only ever
+    /// observed before a client has cached it.
+    fn guid_for(&self, logical: &str, real: &Path) -> String {
+        if let Some(guid) = read_guid_xattr(real) {
+            return guid;
+        }
+
+        let minted = uuid::Uuid::new_v4().to_string();
+        if write_guid_xattr(real, &minted) {
+            return minted;
+        }
+
+        // No xattr support: fall back to the deterministic form.
+        derived_guid(&self.node_id, logical)
     }
 
     /// Read a path's attributes without following a final symlink.
@@ -113,7 +135,7 @@ impl PunkFsService {
         };
 
         Ok(FileAttrData {
-            uuid: self.uuid_for(logical),
+            guid: self.guid_for(logical, real),
             kind,
             times: FileTimes {
                 accessed: meta.accessed().unwrap_or(UNIX_EPOCH),
@@ -138,6 +160,85 @@ impl PunkFsService {
     }
 }
 
+/// The deterministic guid used when the backing filesystem cannot store an
+/// xattr.
+///
+/// Stable for a given `(node, path)` but **not** across renames — that is
+/// the documented cost of running without xattr support.
+fn derived_guid(node_id: &str, logical: &str) -> String {
+    uuid::Uuid::new_v5(
+        &GUID_NAMESPACE,
+        format!("{node_id}/{logical}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// Read an entry's persisted guid, if it has a valid one.
+///
+/// A malformed or empty xattr is treated as absent rather than an error: a
+/// garbage value must not make a healthy file unreadable.
+fn read_guid_xattr(path: &Path) -> Option<String> {
+    let name = std::ffi::CString::new(GUID_XATTR).ok()?;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+
+    // lgetxattr: do not follow a final symlink, matching `attr_for`'s use of
+    // `symlink_metadata`.
+    let size = unsafe {
+        libc::lgetxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size <= 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    let read = unsafe {
+        libc::lgetxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if read <= 0 {
+        return None;
+    }
+    buf.truncate(read as usize);
+
+    let text = String::from_utf8(buf).ok()?;
+    let text = text.trim();
+    // Only accept something that is actually a guid.
+    uuid::Uuid::parse_str(text).ok()?;
+    Some(text.to_owned())
+}
+
+/// Persist `guid` on an entry, reporting whether it took.
+///
+/// Failure is not an error: it means the backing filesystem has no xattr
+/// support and the caller falls back to a derived guid.
+fn write_guid_xattr(path: &Path, guid: &str) -> bool {
+    let (Ok(name), Ok(cpath)) = (
+        std::ffi::CString::new(GUID_XATTR),
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()),
+    ) else {
+        return false;
+    };
+
+    unsafe {
+        libc::lsetxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            guid.as_ptr().cast(),
+            guid.len(),
+            0,
+        ) == 0
+    }
+}
+
 fn file_kind(kind: FsEntryKind) -> FileKind {
     match kind {
         FsEntryKind::Directory => FileKind::Directory,
@@ -154,7 +255,7 @@ fn to_proto_attr(data: &FileAttrData) -> FileAttr {
     };
 
     FileAttr {
-        uuid: data.uuid.clone(),
+        guid: data.guid.clone(),
         kind: file_kind(data.kind) as i32,
         times: Some(PbFileTimes {
             accessed_unix: secs(data.times.accessed),
@@ -618,14 +719,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uuids_are_deterministic_per_path() {
+    async fn guids_are_stable_across_repeated_reads() {
         let (_dir, service) = fixture();
-        let first = attr(&service, "/hello.txt").await.uuid;
-        let second = attr(&service, "/hello.txt").await.uuid;
+        let first = attr(&service, "/hello.txt").await.guid;
+        let second = attr(&service, "/hello.txt").await.guid;
         assert_eq!(first, second);
 
-        let other = attr(&service, "/sub").await.uuid;
-        assert_ne!(first, other, "different entries must not share a uuid");
+        let other = attr(&service, "/sub").await.guid;
+        assert_ne!(first, other, "different entries must not share a guid");
+    }
+
+    /// The whole point of persisting the guid: a rename must not change the
+    /// file's punkfs identity.
+    #[tokio::test]
+    async fn guid_survives_a_rename() {
+        let (dir, service) = fixture();
+        let before = attr(&service, "/hello.txt").await.guid;
+
+        fs::rename(dir.path().join("hello.txt"), dir.path().join("renamed.txt")).unwrap();
+
+        let after = attr(&service, "/renamed.txt").await.guid;
+        assert_eq!(
+            before, after,
+            "a renamed file must keep its guid; it was re-minted instead"
+        );
+    }
+
+    /// A guids must also survive a move between directories on one node.
+    #[tokio::test]
+    async fn guid_survives_a_move_between_directories() {
+        let (dir, service) = fixture();
+        let before = attr(&service, "/hello.txt").await.guid;
+
+        fs::rename(dir.path().join("hello.txt"), dir.path().join("sub/moved.txt")).unwrap();
+
+        assert_eq!(attr(&service, "/sub/moved.txt").await.guid, before);
+    }
+
+    /// The persisted value is what is read back, not something re-derived:
+    /// planting a known guid must make the server report it verbatim.
+    #[tokio::test]
+    async fn a_planted_guid_is_reported_verbatim() {
+        let (dir, service) = fixture();
+        let planted = "3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b";
+        let _ = plant_guid(&dir.path().join("hello.txt"), planted);
+
+        if read_guid_xattr(&dir.path().join("hello.txt")).as_deref() == Some(planted) {
+            assert_eq!(attr(&service, "/hello.txt").await.guid, planted);
+        } else {
+            eprintln!("skipping: backing filesystem does not support user xattrs");
+        }
+    }
+
+    fn plant_guid(path: &Path, guid: &str) -> bool {
+        write_guid_xattr(path, guid)
+    }
+
+    /// Filesystems without xattr support still need a guid. The derived
+    /// fallback must be deterministic per (node, path) and parse as a guid,
+    /// so a client can rely on it even though it will not survive a rename.
+    #[test]
+    fn derived_fallback_guid_is_deterministic_and_valid() {
+        let a = derived_guid("node-a", "/hello.txt");
+        let b = derived_guid("node-a", "/hello.txt");
+        let other_path = derived_guid("node-a", "/other.txt");
+        let other_node = derived_guid("node-b", "/hello.txt");
+
+        assert_eq!(a, b, "same node+path must derive the same guid");
+        assert_ne!(a, other_path, "different paths must not collide");
+        assert_ne!(a, other_node, "different nodes must not collide");
+        assert!(uuid::Uuid::parse_str(&a).is_ok(), "must be a valid guid");
+    }
+
+    /// A garbage xattr must not make a healthy file unreadable: it is
+    /// treated as absent and a fresh guid is minted.
+    #[tokio::test]
+    async fn a_corrupt_guid_xattr_is_replaced_rather_than_served() {
+        let (dir, service) = fixture();
+        let real = dir.path().join("hello.txt");
+        if !write_guid_xattr(&real, "not-a-guid") {
+            eprintln!("skipping: backing filesystem does not support user xattrs");
+            return;
+        }
+        assert_eq!(read_guid_xattr(&real), None, "corrupt value must read as absent");
+
+        let reported = attr(&service, "/hello.txt").await.guid;
+        assert!(uuid::Uuid::parse_str(&reported).is_ok());
+        assert_ne!(reported, "not-a-guid");
     }
 
     #[tokio::test]

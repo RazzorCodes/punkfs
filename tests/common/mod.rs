@@ -36,7 +36,7 @@ pub struct TestServer {
     pub url: String,
     pub addr: String,
     pub root: tempfile::TempDir,
-    child: Option<Child>,
+    child: std::sync::Mutex<Option<Child>>,
 }
 
 impl TestServer {
@@ -75,7 +75,7 @@ impl TestServer {
             url: format!("http://{addr}"),
             addr,
             root,
-            child: Some(child),
+            child: std::sync::Mutex::new(Some(child)),
         }
     }
 
@@ -104,6 +104,18 @@ impl TestServer {
         std::fs::read(self.root().join(path.trim_start_matches('/'))).expect("read backing")
     }
 
+    /// Kill this server's process, simulating the machine going away.
+    ///
+    /// Idempotent, and safe to call through `&self` so a test can take a
+    /// node down without moving the guard out of the cluster.
+    pub fn stop(&self) {
+        let mut guard = self.child.lock().unwrap();
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     /// Whether the backing store contains `path`.
     pub fn backing_exists(&self, path: &str) -> bool {
         self.root().join(path.trim_start_matches('/')).exists()
@@ -112,10 +124,7 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.stop();
     }
 }
 
@@ -169,7 +178,11 @@ impl Mount {
 
     /// Unmount, retrying with `-z` when the fs is still busy.
     fn unmount(&self) {
-        let target = self.path.path();
+        Mount::unmount_at(self.path.path());
+    }
+
+    /// Unmount `target`, tolerating an already-unmounted path.
+    fn unmount_at(target: &Path) {
         for lazy in [true, false] {
             let mut cmd = Command::new("fusermount3");
             cmd.arg("-u");
@@ -212,6 +225,99 @@ pub fn mount_empty() -> (TestServer, Mount) {
     let server = TestServer::empty();
     let mount = Mount::new(&server);
     (server, mount)
+}
+
+/// Several backing nodes merged into one mounted namespace.
+///
+/// Nodes are ordered and that order is the stable precedence used when two
+/// nodes claim the same name, so tests can assert deterministic behaviour.
+pub struct TestCluster {
+    pub servers: Vec<TestServer>,
+}
+
+impl TestCluster {
+    /// Start `n` independent servers, each over its own empty backing dir.
+    pub fn empty(n: usize) -> Self {
+        let servers: Vec<TestServer> = (0..n).map(|_| TestServer::empty()).collect();
+        TestCluster::from_servers(servers)
+    }
+
+    pub fn from_servers(servers: Vec<TestServer>) -> Self {
+        assert!(!servers.is_empty(), "cluster needs at least one node");
+        TestCluster { servers }
+    }
+
+    /// `(node_id, url)` pairs for `Store::new_nodes`.
+    ///
+    /// `TestServer` always registers as `test-node`, and node ids must be
+    /// unique, so they are qualified here; the backing dirs are what makes
+    /// the nodes distinct.
+    pub fn nodes(&self) -> Vec<(String, String)> {
+        self.servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("node-{i}"), s.url.clone()))
+            .collect()
+    }
+
+    pub fn node(&self, i: usize) -> &TestServer {
+        &self.servers[i]
+    }
+
+    /// Stop node `i`, leaving the cluster's other nodes running.
+    ///
+    /// Simulates a backing machine going away mid-session. The node's
+    /// entry stays in `servers`, so its `Drop` remains a harmless no-op.
+    pub fn stop(&self, i: usize) {
+        self.servers[i].stop();
+    }
+}
+
+/// A mount backed by several nodes.
+pub struct MultiMount {
+    pub path: tempfile::TempDir,
+}
+
+impl MultiMount {
+    pub fn new(cluster: &TestCluster) -> Self {
+        let path = tempfile::TempDir::new().expect("tempdir");
+        let node = punkfs::FsNode {
+            node_id: "test-node".into(),
+        };
+
+        let session = punkfs::PunkFs::mount_cluster(&cluster.nodes(), path.path(), node)
+            .unwrap_or_else(|e| panic!("mount failed: {e}"));
+        std::mem::forget(session);
+
+        let mount = MultiMount { path };
+        mount.wait_ready();
+        mount
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.path()
+    }
+
+    pub fn at(&self, rel: &str) -> PathBuf {
+        self.path().join(rel.trim_start_matches('/'))
+    }
+
+    fn wait_ready(&self) {
+        let deadline = Instant::now() + MOUNT_TIMEOUT;
+        while Instant::now() < deadline {
+            if std::fs::read_dir(self.path()).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("mount at {} never became readable", self.path().display());
+    }
+}
+
+impl Drop for MultiMount {
+    fn drop(&mut self) {
+        Mount::unmount_at(self.path.path());
+    }
 }
 
 /// Whether FUSE is usable here.

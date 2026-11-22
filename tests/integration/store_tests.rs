@@ -77,25 +77,25 @@ fn listing_drops_entries_removed_behind_our_back() {
 }
 
 #[test]
-fn repeated_listings_keep_uuids_stable() {
+fn repeated_listings_keep_guids_stable() {
     let server = TestServer::empty();
     server.seed("stable.txt", b"s");
     let store = store_for(&server);
 
-    let uuid_of = |store: &Store| -> Vec<String> {
+    let guid_of = |store: &Store| -> Vec<String> {
         store.ensure_listed("/").unwrap();
         store
             .get_children("/")
             .into_iter()
-            .map(|c| store.get_entry(c.inode).unwrap().uuid)
+            .map(|c| store.get_entry(c.inode).unwrap().guid)
             .collect()
     };
 
-    let first = uuid_of(&store);
-    let second = uuid_of(&store);
+    let first = guid_of(&store);
+    let second = guid_of(&store);
     assert_eq!(
         first, second,
-        "a uuid is the entry's identity and must survive re-listing"
+        "a guid is the entry's identity and must survive re-listing"
     );
 }
 

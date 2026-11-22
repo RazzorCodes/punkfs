@@ -3,11 +3,11 @@ package punk_fs;
 
 // punkfs wire protocol.
 //
-// Identity: every entry carries a `uuid` which is the punkfs identity of
+// Identity: every entry carries a `guid` which is the punkfs identity of
 // that entry. Inodes are never sent — they are a purely local FUSE
 // detail, allocated by each client. Requests are addressed by logical
-// path for now; addressing by uuid is the intended direction once the
-// catalog owns assignment, which is also why `uuid` is already carried in
+// path for now; addressing by guid is the intended direction once the
+// catalog owns assignment, which is also why `guid` is already carried in
 // every `FileAttr`.
 //
 // This iteration serves the read/write path against a single backing
@@ -15,7 +15,7 @@ package punk_fs;
 // symlinks) is deliberately absent: entries are created by the machine
 // that owns the storage, not through the merged mount.
 service PunkFs {
-  // Directory contents, including the uuid/attrs of each child.
+  // Directory contents, including the guid/attrs of each child.
   rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
 
   // Attributes of one path.
@@ -89,7 +89,7 @@ message Stat {
 
 message FileAttr {
   // punkfs identity of this entry.
-  string uuid = 1;
+  string guid = 1;
   FileKind kind = 2;
   FileTimes times = 3;
   Access access = 4;

@@ -186,7 +186,7 @@ mod tests {
             5,
             FsEntryKind::File,
             FileAttrData {
-                uuid: "uuid-f".into(),
+                guid: "guid-f".into(),
                 kind: FsEntryKind::File,
                 access: Access {
                     mode: 0o640,

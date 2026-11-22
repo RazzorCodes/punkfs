@@ -46,7 +46,7 @@ pub struct Stat {
 pub struct FileAttr {
     /// punkfs identity of this entry.
     #[prost(string, tag = "1")]
-    pub uuid: ::prost::alloc::string::String,
+    pub guid: ::prost::alloc::string::String,
     #[prost(enumeration = "FileKind", tag = "2")]
     pub kind: i32,
     #[prost(message, optional, tag = "3")]
@@ -269,11 +269,11 @@ pub mod punk_fs_client {
     use tonic::codegen::http::Uri;
     /// punkfs wire protocol.
     ///
-    /// Identity: every entry carries a `uuid` which is the punkfs identity of
+    /// Identity: every entry carries a `guid` which is the punkfs identity of
     /// that entry. Inodes are never sent — they are a purely local FUSE
     /// detail, allocated by each client. Requests are addressed by logical
-    /// path for now; addressing by uuid is the intended direction once the
-    /// catalog owns assignment, which is also why `uuid` is already carried in
+    /// path for now; addressing by guid is the intended direction once the
+    /// catalog owns assignment, which is also why `guid` is already carried in
     /// every `FileAttr`.
     ///
     /// This iteration serves the read/write path against a single backing
@@ -360,7 +360,7 @@ pub mod punk_fs_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
-        /// Directory contents, including the uuid/attrs of each child.
+        /// Directory contents, including the guid/attrs of each child.
         pub async fn list_directory(
             &mut self,
             request: impl tonic::IntoRequest<super::ListDirectoryRequest>,
@@ -619,7 +619,7 @@ pub mod punk_fs_server {
     /// Generated trait containing gRPC methods that should be implemented for use with PunkFsServer.
     #[async_trait]
     pub trait PunkFs: std::marker::Send + std::marker::Sync + 'static {
-        /// Directory contents, including the uuid/attrs of each child.
+        /// Directory contents, including the guid/attrs of each child.
         async fn list_directory(
             &self,
             request: tonic::Request<super::ListDirectoryRequest>,
@@ -701,11 +701,11 @@ pub mod punk_fs_server {
     }
     /// punkfs wire protocol.
     ///
-    /// Identity: every entry carries a `uuid` which is the punkfs identity of
+    /// Identity: every entry carries a `guid` which is the punkfs identity of
     /// that entry. Inodes are never sent — they are a purely local FUSE
     /// detail, allocated by each client. Requests are addressed by logical
-    /// path for now; addressing by uuid is the intended direction once the
-    /// catalog owns assignment, which is also why `uuid` is already carried in
+    /// path for now; addressing by guid is the intended direction once the
+    /// catalog owns assignment, which is also why `guid` is already carried in
     /// every `FileAttr`.
     ///
     /// This iteration serves the read/write path against a single backing

@@ -2,14 +2,14 @@
 //!
 //! Two distinct identities are in play:
 //!
-//! - **`uuid`** is the punkfs identity of an entry. It is what the catalog
+//! - **`guid`** is the punkfs identity of an entry. It is what the catalog
 //!   (and later the coordinator) uses to say "this is the same file", so it
 //!   survives renames, re-listings, and a client restart.
 //! - **`inode`** is a purely local FUSE convenience: the kernel needs a
 //!   `u64` and we need something cheap to index entries by. It is allocated
 //!   by this client and means nothing outside it.
 //!
-//! Entries are therefore looked up by `uuid` when we reconcile a listing,
+//! Entries are therefore looked up by `guid` when we reconcile a listing,
 //! and by `inode`/`path` when the kernel asks about something.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,7 +19,7 @@ pub struct FsNode {
 
 pub struct FsNodeMetadata {
     pub parent_node: String,
-    pub uuid: String,
+    pub guid: String,
 }
 
 /// The four POSIX timestamps, each defaulting to the epoch.
@@ -108,13 +108,27 @@ pub enum FsEntryKind {
     Link,
 }
 
+/// Whether the node that owns an entry is currently reachable.
+///
+/// An entry is deliberately **kept** in the catalog when its node goes
+/// away: the namespace stays browsable (`ls`, `stat`) and only the
+/// operations that need the bytes fail. Dropping the entry instead would
+/// make a transient outage look like a mass deletion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Availability {
+    #[default]
+    Available,
+    /// Owning node has not answered recently; content ops will fail.
+    Inaccessible,
+}
+
 /// The stat-shaped payload of an entry: everything except identity and
 /// location. Mirrors the proto `FileAttr` one-to-one so conversions are
 /// mechanical.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileAttrData {
     /// punkfs identity; stable across renames once the catalog owns it.
-    pub uuid: String,
+    pub guid: String,
     pub kind: FsEntryKind,
     pub times: FileTimes,
     pub access: Access,
@@ -128,11 +142,58 @@ pub struct FsEntry {
     pub inode: u64,
     pub path: String,
     /// punkfs identity, from the server.
-    pub uuid: String,
+    pub guid: String,
     pub kind: FsEntryKind,
     /// Where the authoritative bytes live.
     pub node_id: String,
+    /// Whether that node is currently answering.
+    pub availability: Availability,
     pub attr: FileAttrData,
+}
+
+/// One node in the cluster, as the catalog remembers it.
+///
+/// `last_seen` is the pull-model liveness record: it is stamped on every
+/// successful rpc to that node and is the single source of truth for
+/// [`Availability`]. `None` means the node has never answered.
+#[derive(Clone, Debug)]
+pub struct NodeStatus {
+    pub node_id: String,
+    pub last_seen: Option<SystemTime>,
+}
+
+impl NodeStatus {
+    pub fn new(node_id: impl Into<String>) -> Self {
+        NodeStatus {
+            node_id: node_id.into(),
+            last_seen: None,
+        }
+    }
+
+    /// Record that the node just answered.
+    pub fn mark_seen(&mut self, at: SystemTime) {
+        self.last_seen = Some(at);
+    }
+
+    /// Whether the node answered within `max_age` of `now`.
+    ///
+    /// A node that has never answered is unreachable, not reachable-by-
+    /// default: assuming health would make a fresh client silently serve
+    /// entries it cannot actually read.
+    pub fn is_reachable(&self, now: SystemTime, max_age: Duration) -> bool {
+        self.last_seen
+            .and_then(|seen| now.duration_since(seen).ok())
+            .is_some_and(|age| age <= max_age)
+    }
+}
+
+/// One node's answer to a directory listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListingOutcome {
+    /// The node answered; `children` is authoritative for its own entries.
+    Answered(Vec<FsEntry>),
+    /// The node could not be reached; its cached entries stay.
+    Unreachable,
 }
 
 pub struct FsTree {
@@ -166,8 +227,8 @@ impl FsTree {
         self.entries.iter().find(|e| e.path == path)
     }
 
-    pub fn get_entry_by_uuid(&self, uuid: &str) -> Option<&FsEntry> {
-        self.entries.iter().find(|e| e.uuid == uuid)
+    pub fn get_entry_by_guid(&self, guid: &str) -> Option<&FsEntry> {
+        self.entries.iter().find(|e| e.guid == guid)
     }
 
     pub fn get_inode(&self, path: &str) -> Option<u64> {
@@ -187,9 +248,9 @@ impl FsTree {
 
     /// Insert or update an entry.
     ///
-    /// Matching order is **uuid first, then path**, which is what keeps a
+    /// Matching order is **guid first, then path**, which is what keeps a
     /// renamed file pointing at the same local inode: the reconciler sees a
-    /// new path carrying a known uuid and updates the existing entry rather
+    /// new path carrying a known guid and updates the existing entry rather
     /// than allocating a second one.
     ///
     /// - `inode == 0` means "allocate a local inode".
@@ -200,13 +261,13 @@ impl FsTree {
         let mut entry = entry;
         if entry.inode == 0 {
             // Reuse the inode of the entry this one is replacing, matched
-            // by uuid (a rename) or by path (the same file with a new
-            // server-assigned uuid). Only a genuinely new entry gets a
+            // by guid (a rename) or by path (the same file with a new
+            // server-assigned guid). Only a genuinely new entry gets a
             // fresh inode.
             let known = self
                 .entries
                 .iter()
-                .find(|e| e.uuid == entry.uuid || e.path == entry.path)
+                .find(|e| e.guid == entry.guid || e.path == entry.path)
                 .map(|e| e.inode);
             entry.inode = known.unwrap_or_else(|| self.alloc_inode());
         } else {
@@ -216,7 +277,7 @@ impl FsTree {
         let existing = self
             .entries
             .iter()
-            .position(|e| e.uuid == entry.uuid || e.path == entry.path);
+            .position(|e| e.guid == entry.guid || e.path == entry.path);
 
         match existing {
             Some(idx) => {
@@ -233,16 +294,17 @@ impl FsTree {
     }
 
     /// Seed an entry at a known inode, used for the root at startup.
-    pub fn insert_root(&mut self, path: &str, uuid: &str, kind: FsEntryKind) {
+    pub fn insert_root(&mut self, path: &str, guid: &str, kind: FsEntryKind) {
         let inode = self.alloc_inode();
         self.entries.push(FsEntry {
             inode,
             path: path.to_owned(),
-            uuid: uuid.to_owned(),
+            guid: guid.to_owned(),
             kind,
             node_id: String::new(),
+            availability: Availability::Available,
             attr: FileAttrData {
-                uuid: uuid.to_owned(),
+                guid: guid.to_owned(),
                 kind,
                 ..FileAttrData::default()
             },
@@ -269,7 +331,7 @@ impl FsTree {
         Some(removed)
     }
 
-    /// Move `old` (and its subtree) to `new`, keeping inodes and uuids.
+    /// Move `old` (and its subtree) to `new`, keeping inodes and guids.
     ///
     /// This only rewrites our local view; the authoritative move happened
     /// on the server. Returns false if `old` was not known.
@@ -298,39 +360,115 @@ impl FsTree {
         self.entries.retain(|e| !e.path.starts_with(&prefix));
     }
 
-    /// Replace the cached children of `dir` with `children`.
+    /// Replace the cached children of `dir` from a **multi-node** listing.
     ///
-    /// Only called after a *successful* listing, which is what makes
-    /// "absent from the response" a safe deletion signal. Entries are
-    /// matched by uuid, so an unchanged file keeps its local inode.
-    pub fn reconcile(&mut self, dir: &str, children: Vec<FsEntry>) {
-        let known = self.get_children_of(dir);
-        // Children arrive with `inode == 0` (the server never sends an
-        // inode), so survival is decided by uuid, not by inode.
-        let keep: Vec<&str> = children.iter().map(|c| c.uuid.as_str()).collect();
-
-        // Drop cached children the server no longer reports.
+    /// Each element is one node's answer. The rule that keeps a partial
+    /// outage from looking like a mass deletion:
+    ///
+    /// - [`ListingOutcome::Answered`] — this node's own entries that it did
+    ///   not report are gone, and are dropped. Another node's entries are
+    ///   *never* dropped on this node's say-so.
+    /// - [`ListingOutcome::Unreachable`] — everything this node previously
+    ///   contributed is **kept** and marked [`Availability::Inaccessible`].
+    ///   `ls` keeps working; reads will fail.
+    ///
+    /// Returns the paths contributed by more than one node, in the order
+    /// they were detected. Those are *not* merged: the first node in
+    /// `outcomes` wins the name and the collision is reported so callers
+    /// can surface it instead of silently picking a file.
+    pub fn reconcile_from(&mut self, dir: &str, outcomes: Vec<(String, ListingOutcome)>) -> Vec<String> {
         let dir_prefix = if dir.ends_with('/') {
             dir.to_owned()
         } else {
             format!("{dir}/")
         };
-        let stale: Vec<String> = known
-            .iter()
-            .filter(|e| !keep.contains(&e.uuid.as_str()))
-            .filter(|e| {
-                e.path
-                    .strip_prefix(&dir_prefix)
-                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-            })
-            .map(|e| e.path.clone())
-            .collect();
-        self.entries
-            .retain(|e| !stale.iter().any(|s| &e.path == s));
+        let direct_child = |path: &str| {
+            path.strip_prefix(&dir_prefix)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        };
 
-        for child in children {
-            self.upsert_entry(child);
+        let mut conflicts: Vec<String> = Vec::new();
+        let mut claimed: Vec<String> = Vec::new();
+
+        for (node_id, outcome) in outcomes {
+            match outcome {
+                ListingOutcome::Unreachable => {
+                    // Keep this node's entries, but stop pretending they are
+                    // readable.
+                    let paths: Vec<String> = self
+                        .entries
+                        .iter()
+                        .filter(|e| e.node_id == node_id && direct_child(&e.path))
+                        .map(|e| e.path.clone())
+                        .collect();
+                    for path in paths {
+                        let survivors: Vec<FsEntry> = self
+                            .entries
+                            .iter()
+                            .filter(|e| e.path == path)
+                            .map(|e| {
+                                let mut kept = e.clone();
+                                if kept.node_id == node_id {
+                                    kept.availability = Availability::Inaccessible;
+                                }
+                                kept
+                            })
+                            .collect();
+                        self.entries.retain(|e| e.path != path);
+                        for entry in survivors {
+                            self.entries.push(entry);
+                        }
+                    }
+                }
+                ListingOutcome::Answered(children) => {
+                    let reported: Vec<&str> = children.iter().map(|c| c.guid.as_str()).collect();
+
+                    // Only this node's own unreported entries are provably gone.
+                    let stale: Vec<String> = self
+                        .entries
+                        .iter()
+                        .filter(|e| e.node_id == node_id && direct_child(&e.path))
+                        .filter(|e| !reported.contains(&e.guid.as_str()))
+                        .map(|e| e.path.clone())
+                        .collect();
+                    self.entries.retain(|e| {
+                        !(e.node_id == node_id && stale.iter().any(|s| s == &e.path))
+                    });
+
+                    for child in children {
+                        let also = self.entries.iter().any(|e| {
+                            e.path == child.path && e.node_id != child.node_id
+                        });
+
+                        if also {
+                            // Two nodes have a name in common. Directories
+                            // merge: both sides contribute children, which
+                            // is the whole point of a merged namespace.
+                            // Anything else is a genuine collision — two
+                            // different files claiming one name — and must
+                            // not be resolved silently.
+                            if child.kind == FsEntryKind::Directory
+                                && self
+                                    .entries
+                                    .iter()
+                                    .any(|e| e.path == child.path && e.kind == FsEntryKind::Directory)
+                            {
+                                continue;
+                            }
+                            if !conflicts.contains(&child.path) {
+                                conflicts.push(child.path.clone());
+                            }
+                            continue;
+                        }
+
+                        claimed.push(child.path.clone());
+                        self.upsert_entry(child);
+                    }
+                }
+            }
         }
+
+        conflicts
     }
 
     pub fn get_children_of(&self, path: &str) -> Vec<&FsEntry> {
@@ -357,15 +495,16 @@ impl FsTree {
 mod tests {
     use super::*;
 
-    fn entry(inode: u64, path: &str, uuid: &str, kind: FsEntryKind) -> FsEntry {
+    fn entry(inode: u64, path: &str, guid: &str, kind: FsEntryKind) -> FsEntry {
         FsEntry {
             inode,
             path: path.to_owned(),
-            uuid: uuid.to_owned(),
+            guid: guid.to_owned(),
             kind,
             node_id: "n".into(),
+            availability: Availability::Available,
             attr: FileAttrData {
-                uuid: uuid.to_owned(),
+                guid: guid.to_owned(),
                 kind,
                 ..FileAttrData::default()
             },
@@ -374,11 +513,11 @@ mod tests {
 
     fn tree() -> FsTree {
         let mut tree = FsTree::new();
-        tree.insert_root("/", "root-uuid", FsEntryKind::Directory);
-        tree.upsert_entry(entry(0, "/docs", "uuid-docs", FsEntryKind::Directory));
-        tree.upsert_entry(entry(0, "/docs/a", "uuid-a", FsEntryKind::File));
-        tree.upsert_entry(entry(0, "/docs/sub", "uuid-sub", FsEntryKind::Directory));
-        tree.upsert_entry(entry(0, "/docs/sub/b", "uuid-b", FsEntryKind::File));
+        tree.insert_root("/", "root-guid", FsEntryKind::Directory);
+        tree.upsert_entry(entry(0, "/docs", "guid-docs", FsEntryKind::Directory));
+        tree.upsert_entry(entry(0, "/docs/a", "guid-a", FsEntryKind::File));
+        tree.upsert_entry(entry(0, "/docs/sub", "guid-sub", FsEntryKind::Directory));
+        tree.upsert_entry(entry(0, "/docs/sub/b", "guid-b", FsEntryKind::File));
         tree
     }
 
@@ -399,7 +538,7 @@ mod tests {
     #[test]
     fn sibling_prefix_is_not_a_child() {
         let mut tree = tree();
-        tree.upsert_entry(entry(0, "/docsx", "uuid-x", FsEntryKind::File));
+        tree.upsert_entry(entry(0, "/docsx", "guid-x", FsEntryKind::File));
         assert!(tree.get_children_of("/docs").iter().all(|e| e.path != "/docsx"));
     }
 
@@ -416,7 +555,7 @@ mod tests {
         let tree = tree();
         let a = tree.get_inode("/docs/a").unwrap();
         assert_eq!(tree.get_path(a), Some("/docs/a"));
-        assert_eq!(tree.get_entry_by_uuid("uuid-a").map(|e| e.path.as_str()), Some("/docs/a"));
+        assert_eq!(tree.get_entry_by_guid("guid-a").map(|e| e.path.as_str()), Some("/docs/a"));
         assert_eq!(tree.get_inode("/nope"), None);
     }
 
@@ -424,39 +563,39 @@ mod tests {
     fn inodes_are_unique_and_never_reused() {
         let mut tree = FsTree::new();
         tree.insert_root("/", "root", FsEntryKind::Directory);
-        tree.upsert_entry(entry(0, "/a", "uuid-a", FsEntryKind::File));
-        tree.upsert_entry(entry(0, "/b", "uuid-b", FsEntryKind::File));
+        tree.upsert_entry(entry(0, "/a", "guid-a", FsEntryKind::File));
+        tree.upsert_entry(entry(0, "/b", "guid-b", FsEntryKind::File));
         let a = tree.get_inode("/a").unwrap();
         let b = tree.get_inode("/b").unwrap();
         assert_ne!(a, b);
 
         // Removing and re-adding must not hand out the retired inode.
         tree.remove_entry("/a");
-        tree.upsert_entry(entry(0, "/a", "uuid-a2", FsEntryKind::File));
+        tree.upsert_entry(entry(0, "/a", "guid-a2", FsEntryKind::File));
         assert_ne!(tree.get_inode("/a").unwrap(), a);
     }
 
     #[test]
-    fn upsert_matches_by_uuid_so_a_rename_keeps_the_inode() {
+    fn upsert_matches_by_guid_so_a_rename_keeps_the_inode() {
         let mut tree = tree();
         let inode = tree.get_inode("/docs/a").unwrap();
 
-        // Same uuid, new path: the reconciler must reuse the inode.
-        tree.upsert_entry(entry(0, "/docs/renamed", "uuid-a", FsEntryKind::File));
+        // Same guid, new path: the reconciler must reuse the inode.
+        tree.upsert_entry(entry(0, "/docs/renamed", "guid-a", FsEntryKind::File));
         assert_eq!(tree.get_inode("/docs/renamed"), Some(inode));
         assert_eq!(tree.get_inode("/docs/a"), None);
         assert_eq!(tree.entries.len(), 5, "no duplicate row for the old path");
     }
 
     #[test]
-    fn upsert_matches_by_path_when_the_uuid_changes() {
+    fn upsert_matches_by_path_when_the_guid_changes() {
         let mut tree = tree();
         let inode = tree.get_inode("/docs/a").unwrap();
-        tree.upsert_entry(entry(0, "/docs/a", "uuid-different", FsEntryKind::File));
-        // Path wins, so the inode is stable for the kernel; uuid follows the
+        tree.upsert_entry(entry(0, "/docs/a", "guid-different", FsEntryKind::File));
+        // Path wins, so the inode is stable for the kernel; guid follows the
         // server's new answer.
         assert_eq!(tree.get_inode("/docs/a"), Some(inode));
-        assert_eq!(tree.get_entry_by_uuid("uuid-a"), None);
+        assert_eq!(tree.get_entry_by_guid("guid-a"), None);
     }
 
     #[test]
@@ -494,33 +633,186 @@ mod tests {
         assert!(tree.get_entry_by_path("/docs/sub/b").is_none());
     }
 
-    #[test]
-    fn reconcile_keeps_inodes_by_uuid_and_drops_stale_children() {
-        let mut tree = tree();
-        let a_inode = tree.get_inode("/docs/a").unwrap();
+    /// Build an entry owned by a specific node.
+    fn owned(inode: u64, path: &str, guid: &str, node: &str) -> FsEntry {
+        let mut e = entry(inode, path, guid, FsEntryKind::File);
+        e.node_id = node.to_owned();
+        e
+    }
 
-        tree.reconcile(
-            "/docs",
+    fn dir_owned(inode: u64, path: &str, guid: &str, node: &str) -> FsEntry {
+        let mut e = entry(inode, path, guid, FsEntryKind::Directory);
+        e.node_id = node.to_owned();
+        e
+    }
+
+    /// A node that answered drops its own unreported entries.
+    #[test]
+    fn an_answer_delete_only_the_answering_nodes_own_entries() {
+        let mut tree = FsTree::new();
+        tree.insert_root("/", "root", FsEntryKind::Directory);
+        tree.upsert_entry(owned(0, "/a.txt", "guid-a", "node-a"));
+        tree.upsert_entry(owned(0, "/b.txt", "guid-b", "node-b"));
+
+        // node-a answers with nothing: only its own entry may go.
+        let conflicts = tree.reconcile_from("/", vec![("node-a".into(), ListingOutcome::Answered(vec![]))]);
+
+        assert!(conflicts.is_empty());
+        assert!(tree.get_entry_by_path("/a.txt").is_none(), "node-a's entry is gone");
+        assert!(
+            tree.get_entry_by_path("/b.txt").is_some(),
+            "node-b's entry must survive another node's listing"
+        );
+    }
+
+    /// The safety property: an unreachable node keeps everything it
+    /// contributed, marked inaccessible.
+    #[test]
+    fn an_unreachable_node_keeps_its_entries_and_marks_them_inaccessible() {
+        let mut tree = FsTree::new();
+        tree.insert_root("/", "root", FsEntryKind::Directory);
+        tree.upsert_entry(owned(0, "/a.txt", "guid-a", "node-a"));
+        tree.upsert_entry(owned(0, "/b.txt", "guid-b", "node-b"));
+
+        tree.reconcile_from(
+            "/",
             vec![
-                entry(0, "/docs/a", "uuid-a", FsEntryKind::File),
-                entry(0, "/docs/new", "uuid-new", FsEntryKind::File),
+                ("node-a".into(), ListingOutcome::Answered(vec![])),
+                ("node-b".into(), ListingOutcome::Unreachable),
             ],
         );
 
-        // Survived: same uuid, same inode.
-        assert_eq!(tree.get_inode("/docs/a"), Some(a_inode));
-        // Added.
-        assert!(tree.get_entry_by_path("/docs/new").is_some());
-        // Gone: the server did not report it.
-        assert!(tree.get_entry_by_path("/docs/sub").is_none());
+        assert!(tree.get_entry_by_path("/a.txt").is_none(), "answering node's entry dropped");
+        let kept = tree
+            .get_entry_by_path("/b.txt")
+            .expect("an outage must not delete entries");
+        assert_eq!(kept.availability, Availability::Inaccessible);
     }
 
+    /// A reachable node's entries come back to Available after an outage.
     #[test]
-    fn reconcile_does_not_touch_unrelated_directories() {
-        let mut tree = tree();
-        tree.reconcile("/docs", vec![entry(0, "/docs/a", "uuid-a", FsEntryKind::File)]);
-        // "/" and its own children are outside the reconciled directory.
-        assert!(tree.get_entry_by_path("/").is_some());
+    fn an_entry_becomes_available_again_when_its_node_returns() {
+        let mut tree = FsTree::new();
+        tree.insert_root("/", "root", FsEntryKind::Directory);
+        tree.upsert_entry(owned(0, "/a.txt", "guid-a", "node-a"));
+
+        tree.reconcile_from("/", vec![("node-a".into(), ListingOutcome::Unreachable)]);
+        assert_eq!(
+            tree.get_entry_by_path("/a.txt").unwrap().availability,
+            Availability::Inaccessible
+        );
+
+        tree.reconcile_from(
+            "/",
+            vec![(
+                "node-a".into(),
+                ListingOutcome::Answered(vec![owned(0, "/a.txt", "guid-a", "node-a")]),
+            )],
+        );
+        assert_eq!(
+            tree.get_entry_by_path("/a.txt").unwrap().availability,
+            Availability::Available
+        );
+    }
+
+    /// A directory contributed by two nodes is a merge point, not a
+    /// collision: it is reported once, both sides' children survive.
+    #[test]
+    fn a_shared_directory_merges_and_is_not_a_conflict() {
+        let mut tree = FsTree::new();
+        tree.insert_root("/", "root", FsEntryKind::Directory);
+
+        tree.reconcile_from(
+            "/",
+            vec![
+                (
+                    "node-a".into(),
+                    ListingOutcome::Answered(vec![dir_owned(0, "/shared", "guid-sa", "node-a")]),
+                ),
+                (
+                    "node-b".into(),
+                    ListingOutcome::Answered(vec![dir_owned(0, "/shared", "guid-sb", "node-b")]),
+                ),
+            ],
+        );
+
+        assert!(
+            tree.get_children_of("/").iter().filter(|e| e.path == "/shared").count() == 1,
+            "a shared directory must appear once"
+        );
+
+        // Both sides contribute children.
+        tree.reconcile_from(
+            "/shared",
+            vec![
+                (
+                    "node-a".into(),
+                    ListingOutcome::Answered(vec![owned(0, "/shared/a.txt", "guid-a", "node-a")]),
+                ),
+                (
+                    "node-b".into(),
+                    ListingOutcome::Answered(vec![owned(0, "/shared/b.txt", "guid-b", "node-b")]),
+                ),
+            ],
+        );
+
+        let mut names: Vec<String> = tree
+            .get_children_of("/shared")
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["/shared/a.txt", "/shared/b.txt"]);
+    }
+
+    /// Two *files* with one name is a genuine collision: reported, and the
+    /// first node by precedence wins.
+    #[test]
+    fn two_files_with_one_name_are_reported_as_a_conflict() {
+        let mut tree = FsTree::new();
+        tree.insert_root("/", "root", FsEntryKind::Directory);
+
+        let conflicts = tree.reconcile_from(
+            "/",
+            vec![
+                (
+                    "node-a".into(),
+                    ListingOutcome::Answered(vec![owned(0, "/dup.txt", "guid-a", "node-a")]),
+                ),
+                (
+                    "node-b".into(),
+                    ListingOutcome::Answered(vec![owned(0, "/dup.txt", "guid-b", "node-b")]),
+                ),
+            ],
+        );
+
+        assert_eq!(conflicts, vec!["/dup.txt"]);
+        // First by precedence, deterministically.
+        assert_eq!(tree.get_entry_by_path("/dup.txt").unwrap().node_id, "node-a");
+    }
+
+    /// A child's inode is stable across listings while its guid is unchanged.
+    #[test]
+    fn reconcile_keeps_inodes_for_unchanged_guids() {
+        let mut tree = FsTree::new();
+        tree.insert_root("/", "root", FsEntryKind::Directory);
+        tree.reconcile_from(
+            "/",
+            vec![(
+                "node-a".into(),
+                ListingOutcome::Answered(vec![owned(0, "/a.txt", "guid-a", "node-a")]),
+            )],
+        );
+        let inode = tree.get_inode("/a.txt").unwrap();
+
+        tree.reconcile_from(
+            "/",
+            vec![(
+                "node-a".into(),
+                ListingOutcome::Answered(vec![owned(0, "/a.txt", "guid-a", "node-a")]),
+            )],
+        );
+        assert_eq!(tree.get_inode("/a.txt"), Some(inode));
     }
 
     #[test]

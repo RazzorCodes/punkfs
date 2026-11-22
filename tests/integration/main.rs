@@ -17,6 +17,7 @@ mod common;
 mod cli_conformance;
 mod handle_conformance;
 mod metadata_conformance;
+mod multinode_conformance;
 mod mutation_conformance;
 mod read_conformance;
 mod store_tests;

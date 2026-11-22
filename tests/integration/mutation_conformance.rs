@@ -318,6 +318,6 @@ fn rename_preserves_the_inode_of_the_moved_entry() {
     let after = std::fs::metadata(mount.at("new.txt")).unwrap().ino();
     assert_eq!(
         after, before,
-        "CONTRACT VIOLATED\n  contract: a rename must keep the entry's inode and uuid\n  cause:    Store::rename removes the old entry (after_mutation) before moving it,\n            so the new path is allocated a fresh local inode"
+        "CONTRACT VIOLATED\n  contract: a rename must keep the entry's inode and guid\n  cause:    Store::rename removes the old entry (after_mutation) before moving it,\n            so the new path is allocated a fresh local inode"
     );
 }

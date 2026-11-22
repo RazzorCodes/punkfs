@@ -21,6 +21,17 @@ pub(crate) enum OpError {
     InvalidInput,
     /// The operation is not supported by this build/backend (ENOSYS).
     Unsupported,
+    /// The node owning the entry did not answer (EHOSTDOWN).
+    ///
+    /// Distinct from `Io`/`EIO` on purpose: "the machine holding these
+    /// bytes is unreachable" is a transient, actionable condition, and a
+    /// caller must be able to tell it apart from a disk-level failure.
+    Inaccessible,
+    /// A move would cross backing nodes (EXDEV).
+    ///
+    /// The same errno a local filesystem reports for a rename across
+    /// devices, because that is exactly what this is.
+    CrossDevice,
     /// Anything else from the store/transport (EIO).
     Io(String),
 }
@@ -33,6 +44,8 @@ impl OpError {
             OpError::NotPermitted => Errno::EPERM,
             OpError::InvalidInput => Errno::EINVAL,
             OpError::Unsupported => Errno::ENOSYS,
+            OpError::Inaccessible => Errno::EHOSTDOWN,
+            OpError::CrossDevice => Errno::EXDEV,
             OpError::Io(_) => Errno::EIO,
         }
     }
@@ -44,6 +57,7 @@ impl From<StoreError> for OpError {
             StoreError::NotFound => OpError::NotFound,
             StoreError::NotPermitted => OpError::NotPermitted,
             StoreError::Unsupported(_) => OpError::Unsupported,
+            StoreError::Inaccessible(_) => OpError::Inaccessible,
             StoreError::Io(msg) => OpError::Io(msg),
         }
     }
@@ -73,12 +87,22 @@ mod tests {
     }
 
     #[test]
+    fn an_unreachable_node_is_ehostdown_not_eio() {
+        assert_eq!(
+            OpError::from(StoreError::Inaccessible("node-a".into())).errno(),
+            Errno::EHOSTDOWN
+        );
+    }
+
+    #[test]
     fn errnos_cover_every_variant() {
         assert_eq!(OpError::NotFound.errno(), Errno::ENOENT);
         assert_eq!(OpError::NotEmpty.errno(), Errno::ENOTEMPTY);
         assert_eq!(OpError::NotPermitted.errno(), Errno::EPERM);
         assert_eq!(OpError::InvalidInput.errno(), Errno::EINVAL);
         assert_eq!(OpError::Unsupported.errno(), Errno::ENOSYS);
+        assert_eq!(OpError::Inaccessible.errno(), Errno::EHOSTDOWN);
+        assert_eq!(OpError::CrossDevice.errno(), Errno::EXDEV);
         assert_eq!(OpError::Io("x".into()).errno(), Errno::EIO);
     }
 }

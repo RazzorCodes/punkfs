@@ -151,7 +151,7 @@ mod tests {
 
     fn attr_data(kind: FsEntryKind) -> FileAttrData {
         FileAttrData {
-            uuid: "u".into(),
+            guid: "u".into(),
             kind,
             ..FileAttrData::default()
         }
