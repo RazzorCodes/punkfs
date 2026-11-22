@@ -344,6 +344,170 @@ fn metadata_cache_logs_share_store_and_fuse_rpc_correlation() {
 }
 
 #[test]
+fn local_cache_telemetry_child() {
+    let Some(log_path) = std::env::var_os("PUNKFS_LOCAL_TEST_LOG") else {
+        return;
+    };
+    if !super::common::require_fuse() {
+        return;
+    }
+    let log_path = std::path::PathBuf::from(log_path);
+    let mut guard = telemetry::init_global(Config {
+        threshold: Severity::Trace,
+        destination: Destination::File(log_path.clone()),
+        queue_capacity: 1024,
+        max_file_bytes: 1_000_000,
+        retained_files: 1,
+        service: "test".into(),
+    })
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let session = punkfs::PunkFs::mount_with_local(
+        &[],
+        root.path(),
+        FsNode {
+            node_id: "local".into(),
+        },
+    )
+    .unwrap();
+    std::fs::write(root.path().join("private-name"), b"private-contents").unwrap();
+    assert!(telemetry::global().unwrap().flush(Duration::from_secs(2)));
+    let raw = std::fs::read_to_string(&log_path).unwrap();
+    assert!(!raw.contains("private-name") && !raw.contains("private-contents"));
+    let events: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let create = events
+        .iter()
+        .find(|event| {
+            event["component"] == "filesystem.passthrough"
+                && event["operation"] == "create"
+                && event["fields"]["outcome"] == "ok"
+        })
+        .expect("local create event");
+    let id = create["correlation_id"].as_str().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["component"] == "metadata_cache"
+                && event["operation"] == "upsert"
+                && event["correlation_id"] == id),
+        "cache update must share FUSE create correlation ID"
+    );
+    drop(session);
+    assert!(guard.shutdown(Duration::from_secs(2)));
+}
+
+#[test]
+fn local_create_and_cache_events_share_correlation() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "telemetry_tests::local_cache_telemetry_child",
+            "--nocapture",
+        ])
+        .env("PUNKFS_LOCAL_TEST_LOG", dir.path().join("events.jsonl"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn route_console_child() {
+    let Some(path) = std::env::var_os("PUNKFS_ROUTE_TEST_LOG") else {
+        return;
+    };
+    if !super::common::require_fuse() {
+        return;
+    }
+    let mut guard = telemetry::init_global(Config {
+        threshold: Severity::Info,
+        destination: Destination::File(path.into()),
+        queue_capacity: 1024,
+        max_file_bytes: 1_000_000,
+        retained_files: 1,
+        service: "route-test".into(),
+    })
+    .unwrap();
+    let server = super::common::TestServer::empty();
+    server.seed("remote.txt", b"remote-content-secret");
+    let mount = tempfile::tempdir().unwrap();
+    std::fs::write(mount.path().join("local.txt"), b"local-content-secret").unwrap();
+    let session = punkfs::PunkFs::mount_with_local_console(
+        &[("remote-node".into(), server.url.clone())],
+        mount.path(),
+        FsNode {
+            node_id: "local-node".into(),
+        },
+    )
+    .unwrap();
+    let _ = std::fs::read(mount.path().join("local.txt")).unwrap();
+    let _ = std::fs::read(mount.path().join("remote.txt")).unwrap();
+    let _ = std::fs::read_dir(mount.path()).unwrap().collect::<Vec<_>>();
+    drop(session);
+    assert!(guard.shutdown(Duration::from_secs(2)));
+}
+
+#[test]
+fn route_console_identifies_local_remote_and_merged_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("routes.jsonl");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "telemetry_tests::route_console_child",
+            "--nocapture",
+        ])
+        .env("PUNKFS_ROUTE_TEST_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !super::common::require_fuse() {
+        return;
+    }
+    let console = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        console.contains("/local.txt") && console.contains("node=\"local-node\" location=local")
+    );
+    assert!(
+        console.contains("/remote.txt") && console.contains("node=\"remote-node\" location=remote")
+    );
+    assert!(console.contains("location=merged"));
+    assert!(!console.contains("content-secret"));
+    let raw = std::fs::read_to_string(log).unwrap();
+    let events: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let routes: Vec<_> = events
+        .iter()
+        .filter(|e| e["component"] == "filesystem.route")
+        .collect();
+    assert!(!routes.is_empty());
+    assert!(routes.iter().all(|e| e["severity"] == "info"
+        && e["console"] == true
+        && e["correlation_id"].as_str().is_some()));
+    assert!(routes.iter().any(|e| e["fields"]["path"] == "/local.txt"
+        && e["fields"]["node_id"] == "local-node"
+        && e["fields"]["location"] == "local"));
+    assert!(routes.iter().any(|e| e["fields"]["path"] == "/remote.txt"
+        && e["fields"]["node_id"] == "remote-node"
+        && e["fields"]["location"] == "remote"));
+    assert!(!raw.contains("content-secret"));
+}
+
+#[test]
 fn fuse_listing_fanout_reuses_one_id_for_both_nodes() {
     if !super::common::require_fuse() {
         return;

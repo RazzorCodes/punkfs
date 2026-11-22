@@ -3,10 +3,8 @@
 //!
 //! Deliberately absent this iteration:
 //!
-//! - **Creation** (`mkdir`, and by extension file creation) — entries are
-//!   created by the machine that owns the storage, not through the merged
-//!   mount. `mkdir` is not in the `Filesystem` impl at all, so the kernel
-//!   reports `ENOSYS`.
+//! - **Remote creation** — local creation is handled by the passthrough
+//!   layer, not the remote backing store.
 //! - **Ownership changes** — refused by the backend rather than silently
 //!   ignored.
 //!
@@ -19,19 +17,19 @@ use std::ffi::OsStr;
 use std::time::SystemTime;
 
 use fuser::BsdFileFlags;
-use fuser::FileHandle;
 use fuser::FileAttr;
+use fuser::FileHandle;
 use fuser::INodeNo;
+use fuser::RenameFlags;
 use fuser::ReplyAttr;
 use fuser::ReplyEmpty;
 use fuser::ReplyStatfs;
 use fuser::Request;
-use fuser::RenameFlags;
 use fuser::TimeOrNow;
 
-use super::Fs;
 use super::error::{OpError, OpResult};
 use super::helpers;
+use crate::core::punkfs::Fs;
 use crate::store::db::attributes::FsEntryKind;
 use crate::store::{StatFs, StoreApi};
 
@@ -125,6 +123,7 @@ pub(crate) fn rename_decision(
     let source = store.get_entry(inode).ok_or(OpError::NotFound)?;
 
     if source.kind != FsEntryKind::Directory {
+        let _ = store.ensure_listed(&new_parent);
         let owner = store.owner_of(&old_path).ok_or(OpError::NotFound)?;
         match store.owner_of(&new_path) {
             // Renaming in place on the same node.
@@ -208,7 +207,14 @@ pub(crate) fn rename(
     flags: RenameFlags,
     reply: ReplyEmpty,
 ) {
-    match rename_decision(fs.store.as_ref(), parent.0, name, newparent.0, newname, flags) {
+    match rename_decision(
+        fs.store.as_ref(),
+        parent.0,
+        name,
+        newparent.0,
+        newname,
+        flags,
+    ) {
         Ok(()) => reply.ok(),
         Err(e) => reply.error(e.errno()),
     }
@@ -233,8 +239,8 @@ pub(crate) fn statfs(fs: &Fs, _req: &Request, _ino: INodeNo, reply: ReplyStatfs)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::db::attributes::FsEntryKind;
     use crate::store::StoreError;
+    use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {
@@ -250,7 +256,21 @@ mod tests {
     fn setattr_unknown_inode_is_not_found() {
         let store = seeded();
         let err = setattr_decision(
-            &store, 0, 0, 99, Some(0o600), None, None, None, None, None, None, None, None, None, None,
+            &store,
+            0,
+            0,
+            99,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err, OpError::NotFound);
@@ -262,7 +282,21 @@ mod tests {
         // metadata semantics exist, and says so with a recoverable errno.
         let store = seeded();
         let err = setattr_decision(
-            &store, 5, 6, 3, Some(0o600), None, None, None, None, None, None, None, None, None, None,
+            &store,
+            5,
+            6,
+            3,
+            Some(0o600),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap_err();
         assert_eq!(err, OpError::Unsupported);
@@ -276,26 +310,10 @@ mod tests {
     #[test]
     fn truncation_and_ownership_changes_are_also_refused() {
         let store = seeded();
-        for call in [
-            (None, None, Some(10u64)),
-            (None, Some(1000u32), None),
-        ] {
+        for call in [(None, None, Some(10u64)), (None, Some(1000u32), None)] {
             let (mode, uid_change, size) = call;
             let err = setattr_decision(
-                &store,
-                0,
-                0,
-                3,
-                mode,
-                uid_change,
-                None,
-                size,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                &store, 0, 0, 3, mode, uid_change, None, size, None, None, None, None, None, None,
                 None,
             )
             .unwrap_err();

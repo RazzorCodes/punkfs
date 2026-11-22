@@ -3,9 +3,8 @@
 //!
 //! punkfs rejects special files and links outright: `EPERM` ("operation
 //! not permitted" — the caller sees an explicit refusal) rather than
-//! `ENOSYS`, matching fuser's own defaults for symlink/link. Creating any
-//! new entry through the merged mount is out of scope for now, and
-//! symlinks additionally need a resolution policy that does not exist yet.
+//! `ENOSYS`, matching fuser's own defaults for symlink/link. Local regular
+//! file and directory creation is handled by the passthrough layer.
 //!
 //! Each decision still resolves its inodes through the store first, so an
 //! op on a nonexistent parent reports `ENOENT` rather than a misleading
@@ -18,9 +17,9 @@ use fuser::ReplyData;
 use fuser::ReplyEntry;
 use fuser::Request;
 
-use super::Fs;
 use super::error::{OpError, OpResult};
 use super::helpers;
+use crate::core::punkfs::Fs;
 use crate::store::StoreApi;
 
 /// Read a symlink target; punkfs stores no symlinks, so always `EPERM`
@@ -135,13 +134,19 @@ mod tests {
     #[test]
     fn readlink_existing_inode_is_refused() {
         let store = seeded();
-        assert_eq!(readlink_decision(&store, 3).unwrap_err(), OpError::NotPermitted);
+        assert_eq!(
+            readlink_decision(&store, 3).unwrap_err(),
+            OpError::NotPermitted
+        );
     }
 
     #[test]
     fn readlink_unknown_inode_is_not_found() {
         let store = seeded();
-        assert_eq!(readlink_decision(&store, 99).unwrap_err(), OpError::NotFound);
+        assert_eq!(
+            readlink_decision(&store, 99).unwrap_err(),
+            OpError::NotFound
+        );
     }
 
     #[test]

@@ -6,10 +6,8 @@
 //!
 //! Two properties worth stating because they shape this module:
 //!
-//! - **No creation.** `open` for writing requires the entry to already
-//!   exist. punkfs entries are created by the machine that owns the
-//!   storage, so `O_CREAT` on a missing path is `ENOENT` — which is what a
-//!   caller sees for `touch` or `echo > newfile` on this mount.
+//! - **No remote creation.** `open` requires an existing catalog entry;
+//!   local creation is handled separately by the passthrough layer.
 //! - **Positional I/O.** The server's read/write rpcs take an explicit
 //!   offset and keep no per-handle cursor, so the local handle is bookkeeping
 //!   only and there is nothing to leak.
@@ -25,9 +23,9 @@ use fuser::ReplyWrite;
 use fuser::Request;
 use fuser::WriteFlags;
 
-use super::Fs;
 use super::error::{OpError, OpResult};
 use super::helpers;
+use crate::core::punkfs::Fs;
 use crate::store::StoreApi;
 
 /// Open file `ino`; returns the handle later ops must present.
@@ -35,11 +33,7 @@ use crate::store::StoreApi;
 /// Refuses to conjure an entry that does not exist: `O_CREAT` does not
 /// imply creation here, so a missing path is `ENOENT` whether or not the
 /// flag is set.
-pub(crate) fn open_decision(
-    store: &dyn StoreApi,
-    ino: u64,
-    _flags: OpenFlags,
-) -> OpResult<u64> {
+pub(crate) fn open_decision(store: &dyn StoreApi, ino: u64, _flags: OpenFlags) -> OpResult<u64> {
     let path = helpers::path_of(store, ino)?;
     // Confirms the entry is still known to the catalog before we hand out a
     // handle; the handle itself is positional and carries no server state.
@@ -189,8 +183,8 @@ pub(crate) fn fsync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::db::attributes::FsEntryKind;
     use crate::store::StoreError;
+    use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {

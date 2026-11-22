@@ -14,9 +14,9 @@ use fuser::ReplyDirectory;
 use fuser::ReplyOpen;
 use fuser::Request;
 
-use super::Fs;
 use super::error::OpResult;
 use super::helpers;
+use crate::core::punkfs::Fs;
 use crate::store::StoreApi;
 
 /// One row of a directory listing, in the shape `reply.add` wants.
@@ -60,11 +60,16 @@ pub(crate) fn readdir_decision(
             name: "..".into(),
         },
     ];
-    entries.extend(store.get_children(&dir_path).into_iter().map(|child| DirItem {
-        inode: child.inode,
-        kind: helpers::file_type(child.kind),
-        name: OsString::from(child.name),
-    }));
+    entries.extend(
+        store
+            .get_children(&dir_path)
+            .into_iter()
+            .map(|child| DirItem {
+                inode: child.inode,
+                kind: helpers::file_type(child.kind),
+                name: OsString::from(child.name),
+            }),
+    );
 
     Ok(entries.into_iter().skip(offset as usize).collect())
 }
@@ -74,13 +79,8 @@ pub(crate) fn readdir_decision(
 /// We keep no per-session state, so the handle is a dummy `0` and
 /// `readdir` re-resolves everything from the inode. Never errors;
 /// replying ENOSYS here would make `ls` fail outright.
-pub(crate) fn opendir(
-    _fs: &Fs,
-    _req: &Request,
-    _ino: INodeNo,
-    _flags: OpenFlags,
-    reply: ReplyOpen,
-) {
+pub(crate) fn opendir(fs: &Fs, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fs.log_route("opendir", ino.0);
     reply.opened(FileHandle(0), FopenFlags::empty());
 }
 
@@ -104,7 +104,11 @@ pub(crate) fn readdir(
         }
     };
 
+    fs.log_route("readdir", ino.0);
     for (i, entry) in entries.into_iter().enumerate() {
+        if entry.name != "." && entry.name != ".." {
+            fs.log_route("readdir_entry", entry.inode);
+        }
         let next_offset = offset + i as u64 + 1;
         if reply.add(INodeNo(entry.inode), next_offset, entry.kind, entry.name) {
             break;

@@ -34,6 +34,7 @@ pub(crate) enum OpError {
     CrossDevice,
     /// Anything else from the store/transport (EIO).
     Io(String),
+    Local(i32),
 }
 
 impl OpError {
@@ -47,6 +48,7 @@ impl OpError {
             OpError::Inaccessible => Errno::EHOSTDOWN,
             OpError::CrossDevice => Errno::EXDEV,
             OpError::Io(_) => Errno::EIO,
+            OpError::Local(errno) => Errno::from_i32(*errno),
         }
     }
 }
@@ -59,6 +61,7 @@ impl From<StoreError> for OpError {
             StoreError::Unsupported(_) => OpError::Unsupported,
             StoreError::Inaccessible(_) => OpError::Inaccessible,
             StoreError::Io(msg) => OpError::Io(msg),
+            StoreError::Local(errno) => OpError::Local(errno),
         }
     }
 }

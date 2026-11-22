@@ -19,10 +19,10 @@ use fuser::ReplyAttr;
 use fuser::ReplyEntry;
 use fuser::Request;
 
-use super::Fs;
 use super::error::{OpError, OpResult};
 use super::helpers;
 use crate::TIMEOUT;
+use crate::core::punkfs::Fs;
 use crate::store::StoreApi;
 
 /// Resolve `parent`/`name` to an inode and its attributes.
@@ -56,6 +56,9 @@ pub(crate) fn lookup_decision(
         let _ = store.ensure_listed(&parent_path);
     }
 
+    if store.has_conflict(&full_path) {
+        return Err(OpError::Local(libc::EIO));
+    }
     let inode = store.get_inode(&full_path).ok_or(OpError::NotFound)?;
     let attr = helpers::attr_or_not_found(store, inode, uid, gid)?;
     Ok((inode, attr))
@@ -73,6 +76,11 @@ pub(crate) fn getattr_decision(
     ino: u64,
 ) -> OpResult<FileAttr> {
     if let Some(path) = store.get_path(ino)
+        && store.has_conflict(&path)
+    {
+        return Err(OpError::Local(libc::EIO));
+    }
+    if let Some(path) = store.get_path(ino)
         && store.refresh(&path).is_ok()
     {
         // The refresh stored the fresh attributes; serve from there.
@@ -85,7 +93,10 @@ pub(crate) fn getattr_decision(
 pub(crate) fn lookup(fs: &Fs, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
     match lookup_decision(fs.store.as_ref(), req.uid(), req.gid(), parent.0, name) {
         // Zero TTL so the kernel re-asks us instead of caching.
-        Ok((_inode, attr)) => reply.entry(&TIMEOUT, &attr, Generation(0)),
+        Ok((inode, attr)) => {
+            fs.log_route("lookup", inode);
+            reply.entry(&TIMEOUT, &attr, Generation(0));
+        }
         Err(e) => reply.error(e.errno()),
     }
 }
@@ -98,7 +109,10 @@ pub(crate) fn getattr(
     reply: ReplyAttr,
 ) {
     match getattr_decision(fs.store.as_ref(), req.uid(), req.gid(), ino.0) {
-        Ok(attr) => reply.attr(&TIMEOUT, &attr),
+        Ok(attr) => {
+            fs.log_route("getattr", ino.0);
+            reply.attr(&TIMEOUT, &attr);
+        }
         Err(e) => reply.error(e.errno()),
     }
 }
@@ -106,8 +120,8 @@ pub(crate) fn getattr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::db::attributes::FsEntryKind;
     use crate::store::StoreError;
+    use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {

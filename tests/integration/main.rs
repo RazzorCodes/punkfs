@@ -16,6 +16,7 @@ mod common;
 
 mod cli_conformance;
 mod handle_conformance;
+mod local_passthrough_tests;
 mod metadata_cache_tests;
 mod metadata_conformance;
 mod multinode_conformance;

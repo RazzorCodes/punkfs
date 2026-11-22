@@ -47,6 +47,8 @@ pub enum StoreError {
     Inaccessible(String),
     /// Anything from the transport or the server.
     Io(String),
+    /// A local syscall failed with its original errno.
+    Local(i32),
 }
 
 impl From<tonic::Status> for StoreError {
@@ -100,7 +102,7 @@ pub struct StatFs {
 /// The filesystem's only view of the catalog.
 ///
 /// The op modules (`crate::filesystem::*`) take this as a trait object so
-/// every method can be unit tested against [`mock::MockStore`] without a
+/// every method can be unit tested against a mock store without a
 /// server, a runtime, or a FUSE session.
 pub trait StoreApi: Send + Sync {
     /// The ingress operation bound to this store view, if any.
@@ -124,6 +126,18 @@ pub trait StoreApi: Send + Sync {
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError>;
     /// Children of `path`, using whatever listing is cached.
     fn get_children(&self, path: &str) -> Vec<StoreChild>;
+    /// Read already-reconciled children without issuing a network request.
+    fn cached_children(&self, path: &str) -> Vec<StoreChild> {
+        self.get_children(path)
+    }
+    /// Whether a logical name has multiple known owners.
+    fn has_conflict(&self, _path: &str) -> bool {
+        false
+    }
+    /// The local configuration can mount with no remote backends.
+    fn has_remote_nodes(&self) -> bool {
+        true
+    }
 
     // --- content -------------------------------------------------------
     /// Read at most `size` bytes at `offset`; a short read means EOF.
@@ -142,8 +156,8 @@ pub trait StoreApi: Send + Sync {
     fn statfs(&self) -> Result<StatFs, StoreError>;
 
     // --- namespace mutation --------------------------------------------
-    // Creation is deliberately absent: entries are created by the machine
-    // that owns the storage, never through the merged mount.
+    // Local creation is handled by the passthrough layer; the remote API
+    // has no creation RPC.
     /// Remove the file at `path`.
     fn unlink(&self, path: &str) -> Result<(), StoreError>;
     /// Remove the *empty* directory at `path`.
@@ -214,6 +228,31 @@ pub trait StoreApi: Send + Sync {
     ) -> Result<(), StoreError> {
         self.rename(old, new, flags)
     }
+
+    /// Reconcile local directory entries without contacting a server.
+    fn reconcile_local_in(
+        &self,
+        _ctx: &OperationContext,
+        _dir: &str,
+        _entries: Vec<FsEntry>,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("local catalog unavailable".into()))
+    }
+    /// Cache one newly created or refreshed local entry, returning its inode.
+    fn upsert_local_in(&self, _ctx: &OperationContext, _entry: FsEntry) -> Result<u64, StoreError> {
+        Err(StoreError::Unsupported("local catalog unavailable".into()))
+    }
+    fn remove_local_in(&self, _ctx: &OperationContext, _path: &str) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("local catalog unavailable".into()))
+    }
+    fn rename_local_in(
+        &self,
+        _ctx: &OperationContext,
+        _old: &str,
+        _new: &str,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("local catalog unavailable".into()))
+    }
 }
 
 pub struct Store {
@@ -225,6 +264,7 @@ pub struct Store {
     node: FsNode, // where am i running right now
     /// Paths contributed by more than one node in the last listing.
     conflicts: Mutex<HashSet<String>>,
+    local_node_enabled: bool,
 }
 
 /// A reachable backing node: its identity, its live connection, and when
@@ -266,6 +306,21 @@ impl Store {
         nodes: &[(String, String)],
         local: FsNode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_nodes_mode(nodes, local, false)
+    }
+
+    pub(crate) fn new_with_local(
+        nodes: &[(String, String)],
+        local: FsNode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_nodes_mode(nodes, local, true)
+    }
+
+    fn new_nodes_mode(
+        nodes: &[(String, String)],
+        local: FsNode,
+        local_node_enabled: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let rt = Runtime::new()?;
 
         // connect_lazy doesn't fail if the server is down; the first RPC
@@ -290,6 +345,9 @@ impl Store {
         // guid, but a mount has exactly one root. Its children resolve per
         // node normally.
         metadata_cache.insert_root("/", "/", FsEntryKind::Directory);
+        if local_node_enabled {
+            metadata_cache.set_local_node(local.node_id.clone());
+        }
 
         Ok(Store {
             metadata_cache: Mutex::new(metadata_cache),
@@ -298,6 +356,7 @@ impl Store {
             nodes: conns,
             node: local,
             conflicts: Mutex::new(HashSet::new()),
+            local_node_enabled,
         })
     }
 
@@ -393,6 +452,10 @@ impl Store {
         }
 
         // Lock only after the network calls are done.
+        // No configured remote nodes is normal in local-passthrough mode.
+        if outcomes.is_empty() && self.local_node_enabled {
+            return Ok(());
+        }
         let conflicts = self
             .metadata_cache
             .lock()
@@ -529,6 +592,67 @@ fn entry_from_attr(inode: u64, path: &str, attr: punk_fs::FileAttr, node_id: &st
 }
 
 impl StoreApi for Store {
+    fn reconcile_local_in(
+        &self,
+        ctx: &OperationContext,
+        dir: &str,
+        entries: Vec<FsEntry>,
+    ) -> Result<(), StoreError> {
+        let conflicts = self.metadata_cache.lock().unwrap().reconcile_from_in(
+            ctx,
+            dir,
+            vec![(self.node.node_id.clone(), ListingOutcome::Answered(entries))],
+        );
+        if !conflicts.is_empty() {
+            self.conflicts.lock().unwrap().extend(conflicts);
+        }
+        Ok(())
+    }
+    fn upsert_local_in(&self, ctx: &OperationContext, entry: FsEntry) -> Result<u64, StoreError> {
+        if entry.node_id != self.node.node_id {
+            return Err(StoreError::NotPermitted);
+        }
+        let mut cache = self.metadata_cache.lock().unwrap();
+        let path = entry.path.clone();
+        if cache
+            .get_entry_by_path(&path)
+            .is_some_and(|existing| existing.node_id != self.node.node_id)
+        {
+            return Err(StoreError::Local(libc::EEXIST));
+        }
+        cache.upsert_entry_in(ctx, entry);
+        cache.get_inode(&path).ok_or(StoreError::NotFound)
+    }
+    fn remove_local_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .remove_entry_in(ctx, path);
+        self.invalidate(&parent_of(path));
+        Ok(())
+    }
+    fn rename_local_in(
+        &self,
+        ctx: &OperationContext,
+        old: &str,
+        new: &str,
+    ) -> Result<(), StoreError> {
+        let mut cache = self.metadata_cache.lock().unwrap();
+        if old != new {
+            cache.remove_entry_in(ctx, new);
+        }
+        cache.rename_entry_in(ctx, old, new);
+        drop(cache);
+        self.invalidate(&parent_of(old));
+        self.invalidate(&parent_of(new));
+        Ok(())
+    }
+    fn has_conflict(&self, path: &str) -> bool {
+        self.conflicts.lock().unwrap().contains(path)
+    }
+    fn has_remote_nodes(&self) -> bool {
+        !self.nodes.is_empty()
+    }
     fn node_id(&self) -> &str {
         &self.node.node_id
     }
@@ -585,7 +709,10 @@ impl StoreApi for Store {
 
     fn get_children_in(&self, ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
         let _ = self.fetch_listing(ctx, path, true);
+        self.cached_children(path)
+    }
 
+    fn cached_children(&self, path: &str) -> Vec<StoreChild> {
         self.metadata_cache
             .lock()
             .unwrap()

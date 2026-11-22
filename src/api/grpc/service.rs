@@ -123,7 +123,7 @@ impl PunkFsService {
     }
 
     /// Read a path's attributes without following a final symlink.
-    fn attr_for(&self, logical: &str, real: &Path) -> io::Result<FileAttrData> {
+    pub(crate) fn attr_for(&self, logical: &str, real: &Path) -> io::Result<FileAttrData> {
         let meta = std::fs::symlink_metadata(real)?;
         let file_type = meta.file_type();
 

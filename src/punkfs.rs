@@ -1,12 +1,13 @@
 //! punkfs: the amalgamation — fs (fuse), grpc, store.
+pub mod core;
 mod filesystem;
+pub use core::store;
 #[path = "api/grpc/mod.rs"]
 pub mod grpc;
-pub mod store;
 pub mod telemetry;
 
+pub use core::punkfs::Fs as PunkFs;
 pub use store::db::metadata_cache::FsNode;
-pub use filesystem::Fs as PunkFs;
 pub use store::{SetattrChanges, StatFs, Store, StoreApi, StoreChild, StoreError};
 
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(0);

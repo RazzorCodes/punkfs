@@ -104,6 +104,7 @@ pub struct MetadataCache {
     pub entries: Vec<FsEntry>,
     next_inode: u64,
     logger: Option<Logger>,
+    local_node: Option<String>,
 }
 
 impl Default for MetadataCache {
@@ -128,6 +129,7 @@ impl MetadataCache {
             entries: Vec::new(),
             next_inode: 1,
             logger,
+            local_node: None,
         };
         cache.emit(
             None,
@@ -137,6 +139,11 @@ impl MetadataCache {
             &[],
         );
         cache
+    }
+
+    /// Mark a node as locally accessible even during remote-only reconciliation.
+    pub(crate) fn set_local_node(&mut self, node: String) {
+        self.local_node = Some(node);
     }
 
     fn enabled(&self, severity: Severity) -> bool {
@@ -580,7 +587,7 @@ impl MetadataCache {
             }
         }
 
-        if answered_count == 0 {
+        if answered_count == 0 && self.local_node.is_none() {
             self.emit(
                 Some(ctx),
                 Severity::Error,
