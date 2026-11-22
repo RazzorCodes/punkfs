@@ -10,7 +10,7 @@
 
 use punkfs::FsNode;
 use punkfs::Store;
-use punkfs::db::fstree::FsEntryKind;
+use punkfs::store::db::attributes::FsEntryKind;
 use punkfs::store::{StoreApi, StoreError};
 
 use crate::common::TestServer;

@@ -34,7 +34,7 @@ use fuser::MountOption;
 use fuser::ReplyAttr;
 use fuser::Request;
 
-use crate::db::fstree::FsNode;
+use crate::store::db::metadata_cache::FsNode;
 use crate::store::Store;
 use crate::store::StoreApi;
 
@@ -446,7 +446,7 @@ impl Filesystem for Fs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::fstree::FsEntryKind;
+    use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
     /// The DI seam works end-to-end: an `Fs` over a fake store serves

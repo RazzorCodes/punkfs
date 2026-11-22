@@ -9,7 +9,7 @@ use fuser::FileType;
 use fuser::INodeNo;
 
 use super::error::{OpError, OpResult};
-use crate::db::fstree::{FileAttrData, FsEntryKind};
+use crate::store::db::attributes::{FileAttrData, FsEntryKind};
 use crate::store::StoreApi;
 
 /// Sentinel for "the server did not tell us" on a timestamp. Entry times
@@ -146,7 +146,7 @@ pub(crate) fn child_path(parent: &str, name: &OsStr) -> OpResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::fstree::{Access, FileTimes, Stat};
+    use crate::store::db::attributes::{Access, FileTimes, Stat};
     use std::time::{Duration, UNIX_EPOCH};
 
     fn attr_data(kind: FsEntryKind) -> FileAttrData {

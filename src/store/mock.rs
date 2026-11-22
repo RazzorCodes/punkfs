@@ -2,7 +2,7 @@
 //!
 //! Two jobs:
 //! - **Fake catalog**: an in-memory set of entries with the same lookup
-//!   semantics as the real `FsTree`, seeded by `insert`/`insert_with`.
+//!   semantics as the real `MetadataCache`, seeded by `insert`/`insert_with`.
 //! - **Spy + scripted stubs**: every trait method appends to a [`Calls`]
 //!   log so a test can assert what reached the store, and the fallible
 //!   methods can be told what to answer via `expect_*`. Left unscripted
@@ -13,7 +13,8 @@ use std::sync::Mutex;
 
 use fuser::RenameFlags;
 
-use crate::db::fstree::{Availability, FileAttrData, FsEntry, FsEntryKind};
+use crate::store::db::attributes::{FileAttrData, FsEntryKind};
+use crate::store::db::metadata_cache::{Availability, FsEntry};
 use crate::store::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
 
 /// One recorded call per trait method, in order.

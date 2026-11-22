@@ -32,7 +32,7 @@ use fuser::TimeOrNow;
 use super::Fs;
 use super::error::{OpError, OpResult};
 use super::helpers;
-use crate::db::fstree::FsEntryKind;
+use crate::store::db::attributes::FsEntryKind;
 use crate::store::{StatFs, StoreApi};
 
 /// Apply the requested attribute changes to `ino`; returns the new attrs.
@@ -233,7 +233,7 @@ pub(crate) fn statfs(fs: &Fs, _req: &Request, _ino: INodeNo, reply: ReplyStatfs)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::fstree::FsEntryKind;
+    use crate::store::db::attributes::FsEntryKind;
     use crate::store::StoreError;
     use crate::store::mock::MockStore;
 

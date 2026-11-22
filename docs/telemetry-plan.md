@@ -1,10 +1,9 @@
 # Local-first telemetry plan
 
 **Status:** the local logger and request correlation are implemented for the
-supported request paths. OTel export and application event instrumentation are not
-implemented. The latter is deliberately left to future work; existing
-application output is unchanged. See `docs/telemetry.md` for configuration
-and operational limits.
+supported request paths. The metadata cache emits diagnostic events; broader
+application instrumentation and OTel export are not yet implemented. See
+`docs/telemetry.md` for configuration and operational limits.
 
 ## Goal and boundaries
 
@@ -100,9 +99,8 @@ context; separate concurrent ingress operations must never share it.
    payload. Cover all RPCs, including retry/reachability probes and fan-out.
    Direct store/library entry points without a FUSE request need a documented
    root-context entry point rather than implicitly reusing another request.
-5. Add events to new or modified behavior as required by `AGENTS.md` in a
-   later implementation run. This implementation adds no application event
-   calls.
+5. Add events to new or modified behavior as required by `AGENTS.md`. The
+   metadata cache is instrumented; other components remain future work.
 
 ### Failure isolation
 

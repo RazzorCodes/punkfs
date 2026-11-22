@@ -1,6 +1,7 @@
 //! Bind an operation context to the store without global or thread-local state.
 use super::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
-use crate::db::fstree::{FileAttrData, FsEntry};
+use crate::store::db::attributes::FileAttrData;
+use crate::store::db::metadata_cache::FsEntry;
 use crate::telemetry::OperationContext;
 use fuser::RenameFlags;
 

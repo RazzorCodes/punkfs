@@ -19,7 +19,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
-use crate::db::fstree::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
+use crate::store::db::attributes::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use crate::punk_fs::punk_fs_server::PunkFs;
 use crate::punk_fs::{
     Access as PbAccess, DirEntry, FileAttr, FileKind, FileTimes as PbFileTimes, FsyncFileRequest,

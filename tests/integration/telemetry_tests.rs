@@ -7,7 +7,9 @@ use punkfs::grpc::service::PunkFsService;
 use punkfs::punk_fs::ListDirectoryRequest;
 use punkfs::punk_fs::punk_fs_client::PunkFsClient;
 use punkfs::punk_fs::punk_fs_server::PunkFsServer;
-use punkfs::telemetry::{CORRELATION_HEADER, OperationContext};
+use punkfs::telemetry::{
+    self, CORRELATION_HEADER, Config, Destination, OperationContext, Severity,
+};
 use punkfs::{FsNode, Store, StoreApi};
 use tonic::{Request, Status};
 
@@ -204,6 +206,140 @@ fn concurrent_store_operations_keep_separate_ids() {
     assert!(
         ids.iter().all(|id| expected.contains(id)),
         "no request may invent or leak a different ID: {ids:?}"
+    );
+}
+
+/// Isolated so the global logger does not affect other parallel tests.
+#[test]
+fn metadata_cache_correlation_child() {
+    let Some(log_path) = std::env::var_os("PUNKFS_CACHE_TEST_LOG") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(log_path);
+    let mut guard = telemetry::init_global(Config {
+        threshold: Severity::Trace,
+        destination: Destination::File(path.clone()),
+        queue_capacity: 1024,
+        max_file_bytes: 1_000_000,
+        retained_files: 1,
+        service: "test".into(),
+    })
+    .unwrap();
+    let server = ObservedServer::new();
+    let store = Store::new(
+        &server.url,
+        FsNode {
+            node_id: "node".into(),
+        },
+    )
+    .unwrap();
+    let listing = OperationContext::new();
+    let refresh = OperationContext::new();
+    let rename = OperationContext::new();
+    let unlink = OperationContext::new();
+    store.ensure_listed_in(&listing, "/").unwrap();
+    store.refresh_in(&refresh, "/hello.txt").unwrap();
+    store
+        .rename_in(
+            &rename,
+            "/hello.txt",
+            "/renamed.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+    store.unlink_in(&unlink, "/renamed.txt").unwrap();
+    assert!(telemetry::global().unwrap().flush(Duration::from_secs(2)));
+    let read_events = || -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let events = read_events();
+    for (operation, ctx) in [
+        ("reconcile", &listing),
+        ("upsert", &refresh),
+        ("rename", &rename),
+        ("remove", &unlink),
+    ] {
+        assert!(
+            events.iter().any(|e| e["component"] == "metadata_cache"
+                && e["operation"] == operation
+                && e["correlation_id"] == ctx.id().to_string()),
+            "missing {operation} event for {}: {events:?}",
+            ctx.id()
+        );
+        assert!(
+            server.ids().contains(&ctx.id().to_string()),
+            "cache event must share the outbound RPC ID"
+        );
+    }
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("hello.txt")
+    );
+
+    if super::common::require_fuse() {
+        let a = ObservedServer::new();
+        let b = ObservedServer::new();
+        std::fs::rename(
+            b.root.path().join("hello.txt"),
+            b.root.path().join("other.txt"),
+        )
+        .unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        let nodes = vec![
+            ("a".to_owned(), a.url.clone()),
+            ("b".to_owned(), b.url.clone()),
+        ];
+        let session = punkfs::PunkFs::mount_cluster(
+            &nodes,
+            mount.path(),
+            FsNode {
+                node_id: "client".into(),
+            },
+        )
+        .unwrap();
+        let _ = std::fs::read_dir(mount.path()).unwrap().collect::<Vec<_>>();
+        assert!(telemetry::global().unwrap().flush(Duration::from_secs(2)));
+        let events = read_events();
+        let ids_a = a.ids();
+        let ids_b = b.ids();
+        assert!(
+            events
+                .iter()
+                .filter(|e| e["component"] == "metadata_cache" && e["operation"] == "reconcile")
+                .any(|event| {
+                    event["correlation_id"].as_str().is_some_and(|id| {
+                        ids_a.iter().any(|a| a == id) && ids_b.iter().any(|b| b == id)
+                    })
+                }),
+            "FUSE fan-out and cache event must share the operation ID"
+        );
+        drop(session);
+    }
+    assert!(guard.shutdown(Duration::from_secs(2)));
+}
+
+#[test]
+fn metadata_cache_logs_share_store_and_fuse_rpc_correlation() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "telemetry_tests::metadata_cache_correlation_child",
+            "--nocapture",
+        ])
+        .env("PUNKFS_CACHE_TEST_LOG", dir.path().join("events.jsonl"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

@@ -116,7 +116,7 @@ pub(crate) fn readdir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::fstree::FsEntryKind;
+    use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {

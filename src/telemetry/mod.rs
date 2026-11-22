@@ -262,6 +262,11 @@ pub struct Logger {
 }
 
 impl Logger {
+    /// Whether this severity passes the configured threshold.
+    pub fn enabled(&self, severity: Severity) -> bool {
+        severity >= self.threshold
+    }
+
     /// Emit an operation event with its explicit ingress identity.
     pub fn emit_in(&self, context: &OperationContext, mut event: Event) {
         event.correlation_id = Some(context.id.to_string());
@@ -271,7 +276,7 @@ impl Logger {
     /// Never waits for the writer. A full queue or oversized event is counted.
     /// Use [`Logger::emit_in`] for operation-scoped events.
     pub fn emit(&self, mut event: Event) {
-        if event.severity < self.threshold {
+        if !self.enabled(event.severity) {
             return;
         }
         event.severity_number = event.severity as u8;

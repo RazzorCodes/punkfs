@@ -106,7 +106,7 @@ pub(crate) fn getattr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::fstree::FsEntryKind;
+    use crate::store::db::attributes::FsEntryKind;
     use crate::store::StoreError;
     use crate::store::mock::MockStore;
 
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn getattr_reports_refreshed_metadata() {
-        use crate::db::fstree::{Access, FileAttrData, Stat};
+        use crate::store::db::attributes::{Access, FileAttrData, Stat};
         let store = MockStore::new();
         store.insert_with(
             "/f",

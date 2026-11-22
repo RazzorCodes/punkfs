@@ -1,9 +1,9 @@
 # Local telemetry
 
 The telemetry module supplies a structured local logger and per-operation
-correlation. It does not itself add log events to filesystem operations, and
-there is no OTel exporter yet. The design and future acceptance criteria are
-in `telemetry-plan.md`.
+correlation. The metadata cache emits events, but broader filesystem and gRPC
+instrumentation and an OTel exporter are not yet implemented. The design and
+future acceptance criteria are in `telemetry-plan.md`.
 
 ## Configuration
 
@@ -40,6 +40,16 @@ reports dropped records and sink failures; telemetry failures do not affect
 filesystem operation results. `flush` and guard shutdown are bounded and
 best-effort, not a durability guarantee. Forced termination cannot guarantee
 flush, and the current executables do not install graceful signal handlers.
+
+The metadata cache emits an `info` initialization event and recovery events,
+`warning` events for unreachable nodes and conflicts, and an `error` when no
+node answers a listing. Reconciliation summaries and cache mutations use
+`debug`; individual upserts use `trace`. Events include counts and relevant
+node IDs, but not paths, GUIDs or file contents. Request-driven cache events
+retain the originating operation ID. A direct cache caller can use the
+`*_in` methods with an existing `OperationContext`; the ordinary methods create
+a new context. A cache can use the global logger or an explicitly supplied
+logger via `MetadataCache::with_logger`.
 
 ## Correlation
 

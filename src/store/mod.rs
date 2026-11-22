@@ -1,7 +1,7 @@
 //! The client-side store: the only way the filesystem layer reaches the
 //! catalog.
 //!
-//! It owns the local snapshot of the server's tree ([`FsTree`]), the grpc
+//! It owns the local snapshot of the server's tree ([`MetadataCache`]), the grpc
 //! client, and the tokio runtime used to drive async calls from the
 //! synchronous FUSE callbacks.
 //!
@@ -16,10 +16,8 @@ use fuser::RenameFlags;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::db::fstree::{
-    Access, Availability, FileAttrData, FileTimes, FsEntry, FsEntryKind, FsNode, FsTree,
-    ListingOutcome, Stat,
-};
+use self::db::attributes::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
+use self::db::metadata_cache::{Availability, FsEntry, FsNode, ListingOutcome, MetadataCache};
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
     self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, SetAttrRequest,
@@ -27,6 +25,7 @@ use crate::punk_fs::{
 };
 use crate::telemetry::OperationContext;
 pub(crate) mod contextual;
+pub mod db;
 
 #[cfg(test)]
 pub(crate) mod mock;
@@ -218,7 +217,7 @@ pub trait StoreApi: Send + Sync {
 }
 
 pub struct Store {
-    fstree: Mutex<FsTree>,
+    metadata_cache: Mutex<MetadataCache>,
     listed: Mutex<HashSet<String>>, // directories already fetched from the server
     rt: Runtime,
     /// One connection per backing node, in stable merge order.
@@ -286,14 +285,14 @@ impl Store {
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
         };
 
-        let mut fstree = FsTree::new();
+        let mut metadata_cache = MetadataCache::new();
         // The root is synthetic: every node answers "/" with a different
         // guid, but a mount has exactly one root. Its children resolve per
         // node normally.
-        fstree.insert_root("/", "/", FsEntryKind::Directory);
+        metadata_cache.insert_root("/", "/", FsEntryKind::Directory);
 
         Ok(Store {
-            fstree: Mutex::new(fstree),
+            metadata_cache: Mutex::new(metadata_cache),
             listed: Mutex::new(HashSet::new()),
             rt,
             nodes: conns,
@@ -332,7 +331,7 @@ impl Store {
 
     /// Which node owns `path`.
     fn node_of(&self, path: &str) -> Result<String, StoreError> {
-        let tree = self.fstree.lock().unwrap();
+        let tree = self.metadata_cache.lock().unwrap();
         tree.get_entry_by_path(path)
             .map(|e| e.node_id.clone())
             // An unknown path is routed to the first node so the server can
@@ -394,7 +393,11 @@ impl Store {
         }
 
         // Lock only after the network calls are done.
-        let conflicts = self.fstree.lock().unwrap().reconcile_from(dir, outcomes);
+        let conflicts = self
+            .metadata_cache
+            .lock()
+            .unwrap()
+            .reconcile_from_in(ctx, dir, outcomes);
         if !conflicts.is_empty() {
             for path in &conflicts {
                 eprintln!("punkfs: duplicate name across nodes, refusing to pick one: {path}");
@@ -433,22 +436,25 @@ impl Store {
     ///
     /// Ownership is preserved from the existing entry when we know it,
     /// so a refresh cannot silently re-home a file onto the local node.
-    fn store_attr(&self, path: &str, attr: FileAttrData) {
-        let mut tree = self.fstree.lock().unwrap();
+    fn store_attr(&self, ctx: &OperationContext, path: &str, attr: FileAttrData) {
+        let mut tree = self.metadata_cache.lock().unwrap();
         let existing = tree.get_entry_by_path(path).cloned();
         let inode = existing.as_ref().map(|e| e.inode).unwrap_or(0);
         let node_id = existing
             .map(|e| e.node_id)
             .unwrap_or_else(|| self.node.node_id.clone());
-        tree.upsert_entry(FsEntry {
-            inode,
-            path: path.to_owned(),
-            guid: attr.guid.clone(),
-            kind: attr.kind,
-            node_id,
-            availability: Availability::Available,
-            attr,
-        });
+        tree.upsert_entry_in(
+            ctx,
+            FsEntry {
+                inode,
+                path: path.to_owned(),
+                guid: attr.guid.clone(),
+                kind: attr.kind,
+                node_id,
+                availability: Availability::Available,
+                attr,
+            },
+        );
     }
 }
 
@@ -528,11 +534,11 @@ impl StoreApi for Store {
     }
 
     fn get_inode(&self, path: &str) -> Option<u64> {
-        self.fstree.lock().unwrap().get_inode(path)
+        self.metadata_cache.lock().unwrap().get_inode(path)
     }
 
     fn get_path(&self, inode: u64) -> Option<String> {
-        self.fstree
+        self.metadata_cache
             .lock()
             .unwrap()
             .get_path(inode)
@@ -540,11 +546,15 @@ impl StoreApi for Store {
     }
 
     fn get_entry(&self, inode: u64) -> Option<FsEntry> {
-        self.fstree.lock().unwrap().get_entry(inode).cloned()
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .get_entry(inode)
+            .cloned()
     }
 
     fn owner_of(&self, path: &str) -> Option<String> {
-        self.fstree
+        self.metadata_cache
             .lock()
             .unwrap()
             .get_entry_by_path(path)
@@ -576,7 +586,7 @@ impl StoreApi for Store {
     fn get_children_in(&self, ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
         let _ = self.fetch_listing(ctx, path, true);
 
-        self.fstree
+        self.metadata_cache
             .lock()
             .unwrap()
             .get_children_of(path)
@@ -688,7 +698,7 @@ impl StoreApi for Store {
         self.conn_for(&node_id)?.touch();
 
         let attr = attr_from_proto(resp.into_inner().attr.unwrap_or_default());
-        self.store_attr(path, attr.clone());
+        self.store_attr(ctx, path, attr.clone());
         Ok(attr)
     }
 
@@ -698,7 +708,7 @@ impl StoreApi for Store {
 
     fn refresh_in(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
         let attr = self.getattr(ctx, path)?;
-        self.store_attr(path, attr.clone());
+        self.store_attr(ctx, path, attr.clone());
         Ok(attr)
     }
 
@@ -747,7 +757,7 @@ impl StoreApi for Store {
             })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
-        self.after_mutation(path);
+        self.after_mutation(ctx, path);
         Ok(())
     }
 
@@ -764,7 +774,7 @@ impl StoreApi for Store {
             })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
-        self.after_mutation(path);
+        self.after_mutation(ctx, path);
         Ok(())
     }
 
@@ -793,8 +803,11 @@ impl StoreApi for Store {
         // Rename within one node: the entry keeps its guid and its inode,
         // so move it locally instead of dropping and re-adding it. A
         // cross-node move is refused by the op layer, never reaching here.
-        self.after_mutation(new);
-        self.fstree.lock().unwrap().rename_entry(old, new);
+        self.after_mutation(ctx, new);
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .rename_entry_in(ctx, old, new);
         let parent = parent_of(old);
         self.invalidate(&parent);
         Ok(())
@@ -835,9 +848,12 @@ impl Store {
     ///
     /// The entry is dropped (or, for a directory, its children are) and the
     /// containing directory is invalidated so the next listing refetches.
-    fn after_mutation(&self, path: &str) {
+    fn after_mutation(&self, ctx: &OperationContext, path: &str) {
         let parent = parent_of(path);
         self.invalidate(&parent);
-        self.fstree.lock().unwrap().remove_entry(path);
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .remove_entry_in(ctx, path);
     }
 }

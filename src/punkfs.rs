@@ -1,12 +1,11 @@
-//! punkfs: the amalgamation — fs (fuse), grpc, db, store.
-pub mod db;
+//! punkfs: the amalgamation — fs (fuse), grpc, store.
 mod filesystem;
 #[path = "api/grpc/mod.rs"]
 pub mod grpc;
 pub mod store;
 pub mod telemetry;
 
-pub use db::fstree::FsNode;
+pub use store::db::metadata_cache::FsNode;
 pub use filesystem::Fs as PunkFs;
 pub use store::{SetattrChanges, StatFs, Store, StoreApi, StoreChild, StoreError};
 
