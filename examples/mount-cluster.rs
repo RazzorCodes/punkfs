@@ -15,6 +15,8 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _telemetry =
+        punkfs::telemetry::init_global(punkfs::telemetry::Config::from_env("punkfs-mount")?)?;
     let mut args = std::env::args().skip(1);
     let mountpoint: PathBuf = args
         .next()

@@ -23,10 +23,11 @@ use crate::db::fstree::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use crate::punk_fs::punk_fs_server::PunkFs;
 use crate::punk_fs::{
     Access as PbAccess, DirEntry, FileAttr, FileKind, FileTimes as PbFileTimes, FsyncFileRequest,
-    FsyncFileResponse, GetAttrRequest, GetAttrResponse, ListDirectoryRequest, ListDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, RemoveDirRequest, RemoveDirResponse, RemoveFileRequest,
-    RemoveFileResponse, RenameRequest, RenameResponse, SetAttrRequest, SetAttrResponse, StatFsRequest,
-    StatFsResponse, StatFsResponse as PbStatFs, Stat as PbStat, WriteFileRequest, WriteFileResponse,
+    FsyncFileResponse, GetAttrRequest, GetAttrResponse, ListDirectoryRequest,
+    ListDirectoryResponse, ReadFileRequest, ReadFileResponse, RemoveDirRequest, RemoveDirResponse,
+    RemoveFileRequest, RemoveFileResponse, RenameRequest, RenameResponse, SetAttrRequest,
+    SetAttrResponse, Stat as PbStat, StatFsRequest, StatFsResponse, StatFsResponse as PbStatFs,
+    WriteFileRequest, WriteFileResponse,
 };
 
 /// Upper bound on a single `ReadFile` answer. The FUSE layer asks for
@@ -166,11 +167,7 @@ impl PunkFsService {
 /// Stable for a given `(node, path)` but **not** across renames — that is
 /// the documented cost of running without xattr support.
 fn derived_guid(node_id: &str, logical: &str) -> String {
-    uuid::Uuid::new_v5(
-        &GUID_NAMESPACE,
-        format!("{node_id}/{logical}").as_bytes(),
-    )
-    .to_string()
+    uuid::Uuid::new_v5(&GUID_NAMESPACE, format!("{node_id}/{logical}").as_bytes()).to_string()
 }
 
 /// Read an entry's persisted guid, if it has a valid one.
@@ -183,14 +180,7 @@ fn read_guid_xattr(path: &Path) -> Option<String> {
 
     // lgetxattr: do not follow a final symlink, matching `attr_for`'s use of
     // `symlink_metadata`.
-    let size = unsafe {
-        libc::lgetxattr(
-            cpath.as_ptr(),
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
+    let size = unsafe { libc::lgetxattr(cpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
     if size <= 0 {
         return None;
     }
@@ -324,6 +314,7 @@ impl PunkFs for PunkFsService {
         &self,
         request: Request<ListDirectoryRequest>,
     ) -> Result<Response<ListDirectoryResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let logical = request.get_ref().path.clone();
         let dir = self.resolve(&logical)?;
 
@@ -348,17 +339,18 @@ impl PunkFs for PunkFsService {
 
         // Stable order so listings are reproducible and diffable.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Response::new(ListDirectoryResponse { entries }))
+        Ok(context.response(ListDirectoryResponse { entries }))
     }
 
     async fn get_attr(
         &self,
         request: Request<GetAttrRequest>,
     ) -> Result<Response<GetAttrResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let logical = request.get_ref().path.clone();
         let real = self.resolve(&logical)?;
         let attr = self.attr_for(&logical, &real).map_err(io_status)?;
-        Ok(Response::new(GetAttrResponse {
+        Ok(context.response(GetAttrResponse {
             attr: Some(to_proto_attr(&attr)),
         }))
     }
@@ -367,12 +359,15 @@ impl PunkFs for PunkFsService {
         &self,
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
         let real = self.resolve(&req.path)?;
         let length = req.length.min(MAX_READ) as usize;
 
         let path = real.clone();
+        let blocking_context = context.clone();
         let data = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+            let _context = blocking_context;
             let file = PositionalFile(open_for_read(&path)?);
             let mut buf = vec![0u8; length];
             let read = file.read_at(&mut buf, req.offset)?;
@@ -383,18 +378,21 @@ impl PunkFs for PunkFsService {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(io_status)?;
 
-        Ok(Response::new(ReadFileResponse { data }))
+        Ok(context.response(ReadFileResponse { data }))
     }
 
     async fn write_file(
         &self,
         request: Request<WriteFileRequest>,
     ) -> Result<Response<WriteFileResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
         let real = self.resolve(&req.path)?;
 
         let path = real.clone();
+        let blocking_context = context.clone();
         let written = tokio::task::spawn_blocking(move || -> io::Result<u32> {
+            let _context = blocking_context;
             let file = PositionalFile(open_for_write(&path)?);
             let mut written = 0usize;
             // A short write is rare but legal; keep going until the buffer
@@ -412,17 +410,20 @@ impl PunkFs for PunkFsService {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(io_status)?;
 
-        Ok(Response::new(WriteFileResponse { written }))
+        Ok(context.response(WriteFileResponse { written }))
     }
 
     async fn fsync_file(
         &self,
         request: Request<FsyncFileRequest>,
     ) -> Result<Response<FsyncFileResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
         let real = self.resolve(&req.path)?;
 
+        let blocking_context = context.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let _context = blocking_context;
             let file = open_for_write(&real)?;
             if req.datasync {
                 file.sync_data()
@@ -434,13 +435,14 @@ impl PunkFs for PunkFsService {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(io_status)?;
 
-        Ok(Response::new(FsyncFileResponse {}))
+        Ok(context.response(FsyncFileResponse {}))
     }
 
     async fn set_attr(
         &self,
         request: Request<SetAttrRequest>,
     ) -> Result<Response<SetAttrResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
 
         // Ownership changes need privilege this backend does not assume.
@@ -468,17 +470,20 @@ impl PunkFs for PunkFsService {
         }
 
         let attr = self.attr_for(&req.path, &real).map_err(io_status)?;
-        Ok(Response::new(SetAttrResponse {
+        Ok(context.response(SetAttrResponse {
             attr: Some(to_proto_attr(&attr)),
         }))
     }
 
     async fn stat_fs(
         &self,
-        _request: Request<StatFsRequest>,
+        request: Request<StatFsRequest>,
     ) -> Result<Response<StatFsResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let root = self.root.clone();
+        let blocking_context = context.clone();
         let stats = tokio::task::spawn_blocking(move || -> io::Result<PbStatFs> {
+            let _context = blocking_context;
             let vfs = statvfs(&root)?;
             Ok(PbStatFs {
                 blocks: vfs.blocks,
@@ -495,33 +500,36 @@ impl PunkFs for PunkFsService {
         .map_err(|e| Status::internal(e.to_string()))?
         .map_err(io_status)?;
 
-        Ok(Response::new(stats))
+        Ok(context.response(stats))
     }
 
     async fn remove_file(
         &self,
         request: Request<RemoveFileRequest>,
     ) -> Result<Response<RemoveFileResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let real = self.resolve(&request.get_ref().path)?;
         tokio::fs::remove_file(&real).await.map_err(io_status)?;
-        Ok(Response::new(RemoveFileResponse {}))
+        Ok(context.response(RemoveFileResponse {}))
     }
 
     async fn remove_dir(
         &self,
         request: Request<RemoveDirRequest>,
     ) -> Result<Response<RemoveDirResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let real = self.resolve(&request.get_ref().path)?;
         // std/tokio refuse a non-empty directory, which is the behaviour
         // `rmdir` needs; the message is what the client turns into ENOTEMPTY.
         tokio::fs::remove_dir(&real).await.map_err(io_status)?;
-        Ok(Response::new(RemoveDirResponse {}))
+        Ok(context.response(RemoveDirResponse {}))
     }
 
     async fn rename(
         &self,
         request: Request<RenameRequest>,
     ) -> Result<Response<RenameResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
         if req.flags != 0 {
             return Err(Status::unimplemented(
@@ -532,18 +540,19 @@ impl PunkFs for PunkFsService {
         let from = self.resolve(&req.old_path)?;
         let to = self.resolve(&req.new_path)?;
         tokio::fs::rename(&from, &to).await.map_err(io_status)?;
-        Ok(Response::new(RenameResponse {}))
+        Ok(context.response(RenameResponse {}))
     }
 
     async fn shutdown(
         &self,
-        _request: Request<crate::punk_fs::ShutdownRequest>,
+        request: Request<crate::punk_fs::ShutdownRequest>,
     ) -> Result<Response<crate::punk_fs::ShutdownResponse>, Status> {
+        let _context = crate::telemetry::OperationContext::from_request(&request)?;
         #[cfg(feature = "dev-shutdown")]
         {
             self.shutdown_requested.store(true, Ordering::SeqCst);
             self.shutdown.notify_waiters();
-            Ok(Response::new(crate::punk_fs::ShutdownResponse {}))
+            Ok(_context.response(crate::punk_fs::ShutdownResponse {}))
         }
         #[cfg(not(feature = "dev-shutdown"))]
         {
@@ -675,12 +684,7 @@ mod tests {
             .data
     }
 
-    async fn write(
-        service: &Arc<PunkFsService>,
-        path: &str,
-        offset: u64,
-        data: &[u8],
-    ) -> u32 {
+    async fn write(service: &Arc<PunkFsService>, path: &str, offset: u64, data: &[u8]) -> u32 {
         service
             .write_file(Request::new(WriteFileRequest {
                 path: path.to_owned(),
@@ -712,7 +716,11 @@ mod tests {
     #[tokio::test]
     async fn list_directory_is_sorted() {
         let (_dir, service) = fixture();
-        let names: Vec<String> = list(&service, "/").await.into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = list(&service, "/")
+            .await
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
@@ -751,7 +759,11 @@ mod tests {
         let (dir, service) = fixture();
         let before = attr(&service, "/hello.txt").await.guid;
 
-        fs::rename(dir.path().join("hello.txt"), dir.path().join("sub/moved.txt")).unwrap();
+        fs::rename(
+            dir.path().join("hello.txt"),
+            dir.path().join("sub/moved.txt"),
+        )
+        .unwrap();
 
         assert_eq!(attr(&service, "/sub/moved.txt").await.guid, before);
     }
@@ -801,7 +813,11 @@ mod tests {
             eprintln!("skipping: backing filesystem does not support user xattrs");
             return;
         }
-        assert_eq!(read_guid_xattr(&real), None, "corrupt value must read as absent");
+        assert_eq!(
+            read_guid_xattr(&real),
+            None,
+            "corrupt value must read as absent"
+        );
 
         let reported = attr(&service, "/hello.txt").await.guid;
         assert!(uuid::Uuid::parse_str(&reported).is_ok());
@@ -852,7 +868,10 @@ mod tests {
     async fn read_past_eof_after_a_write_sees_the_new_size() {
         let (_dir, service) = fixture();
         write(&service, "/hello.txt", 11, b"!!").await;
-        assert_eq!(read(&service, "/hello.txt", 0, 1024).await, b"hello world!!");
+        assert_eq!(
+            read(&service, "/hello.txt", 0, 1024).await,
+            b"hello world!!"
+        );
     }
 
     #[tokio::test]
@@ -1063,7 +1082,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!dir.path().join("hello.txt").exists());
-        assert_eq!(fs::read(dir.path().join("renamed.txt")).unwrap(), b"hello world");
+        assert_eq!(
+            fs::read(dir.path().join("renamed.txt")).unwrap(),
+            b"hello world"
+        );
     }
 
     #[tokio::test]
@@ -1096,9 +1118,7 @@ mod tests {
     async fn resolve_rejects_traversal_and_absolute_paths() {
         let (_dir, service) = fixture();
         for bad in ["../etc/passwd", "/..", "a/../../b", ""] {
-            let result = service.get_attr(Request::new(GetAttrRequest {
-                path: bad.into(),
-            }));
+            let result = service.get_attr(Request::new(GetAttrRequest { path: bad.into() }));
             // "/.." and traversal must be rejected outright; an empty path
             // resolves to the root itself, which is legitimate.
             if bad.is_empty() {
@@ -1141,7 +1161,10 @@ mod tests {
     fn io_errors_map_to_the_expected_codes() {
         let cases = [
             (io::ErrorKind::NotFound, tonic::Code::NotFound),
-            (io::ErrorKind::PermissionDenied, tonic::Code::PermissionDenied),
+            (
+                io::ErrorKind::PermissionDenied,
+                tonic::Code::PermissionDenied,
+            ),
             (io::ErrorKind::AlreadyExists, tonic::Code::AlreadyExists),
             (io::ErrorKind::InvalidInput, tonic::Code::InvalidArgument),
             (io::ErrorKind::Unsupported, tonic::Code::Unimplemented),

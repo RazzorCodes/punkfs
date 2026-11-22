@@ -14,6 +14,8 @@ use punkfs::punk_fs::punk_fs_server::PunkFsServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _telemetry =
+        punkfs::telemetry::init_global(punkfs::telemetry::Config::from_env("punkfs-server")?)?;
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
     let addr = args
@@ -26,10 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !tokio::fs::metadata(&root).await?.is_dir() {
         return Err(format!("{} is not a directory", root.display()).into());
     }
-    println!(
-        "serving {} on {addr} as {node_id}",
-        root.display()
-    );
+    println!("serving {} on {addr} as {node_id}", root.display());
 
     let service = PunkFsService::new(root, node_id);
 

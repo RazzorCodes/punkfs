@@ -4,6 +4,7 @@ mod filesystem;
 #[path = "api/grpc/mod.rs"]
 pub mod grpc;
 pub mod store;
+pub mod telemetry;
 
 pub use db::fstree::FsNode;
 pub use filesystem::Fs as PunkFs;

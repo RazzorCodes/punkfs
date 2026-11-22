@@ -24,6 +24,7 @@ mod meta;
 mod misc;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use fuser::FileHandle;
@@ -50,10 +51,20 @@ pub struct Fs {
     /// In-memory snapshot of the server's tree, plus the grpc client used
     /// to fetch listings on demand. `pub(crate)` so the op modules can
     /// reach it without accessors.
-    pub(crate) store: Box<dyn StoreApi>,
+    pub(crate) store: Arc<dyn StoreApi>,
 }
 
 impl Fs {
+    /// Bind a fresh ingress identity to this FUSE callback and all its store work.
+    fn for_operation(&self) -> Self {
+        Self {
+            store: Arc::new(crate::store::contextual::ContextualStore {
+                inner: self.store.clone(),
+                context: crate::telemetry::OperationContext::new(),
+            }),
+        }
+    }
+
     /// Create an `Fs` bound to a punkfs-server.
     ///
     /// Params:
@@ -65,13 +76,10 @@ impl Fs {
     ///
     /// Returns: the new `Fs`, or any error from building the tokio
     /// runtime / grpc endpoint. The root inode is seeded by `Store::new`.
-    pub fn new(
-        server_url: &str,
-        node: FsNode,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(server_url: &str, node: FsNode) -> Result<Self, Box<dyn std::error::Error>> {
         let store = Store::new(server_url, node)?; // root is seeded inside Store::new
         Ok(Fs {
-            store: Box::new(store),
+            store: Arc::new(store),
         })
     }
 
@@ -81,7 +89,9 @@ impl Fs {
     /// drive the op modules against a catalog with no server behind it.
     #[cfg(test)]
     pub(crate) fn with_store(store: Box<dyn StoreApi>) -> Self {
-        Fs { store }
+        Fs {
+            store: Arc::from(store),
+        }
     }
 
     /// Attributes of `inode`, as served to the kernel (see [`helpers::attr_for`]).
@@ -128,7 +138,7 @@ impl Fs {
         let store = Store::new_nodes(nodes, node)?;
         Self::spawn(
             Fs {
-                store: Box::new(store),
+                store: Arc::new(store),
             },
             mountpoint,
         )
@@ -159,13 +169,15 @@ impl Filesystem for Fs {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        lookup::lookup(self, req, parent, name, reply);
+        let operation = self.for_operation();
+        lookup::lookup(&operation, req, parent, name, reply);
     }
 
     /// Answer with the attributes of `ino` (stat). Delegates to
     /// `lookup::getattr`.
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
-        lookup::getattr(self, req, ino, fh, reply);
+        let operation = self.for_operation();
+        lookup::getattr(&operation, req, ino, fh, reply);
     }
 
     // dir.rs
@@ -178,7 +190,8 @@ impl Filesystem for Fs {
         flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        dir::opendir(self, req, ino, flags, reply);
+        let operation = self.for_operation();
+        dir::opendir(&operation, req, ino, flags, reply);
     }
 
     /// List the contents of the directory `ino`, starting at `offset`
@@ -193,14 +206,16 @@ impl Filesystem for Fs {
         offset: u64,
         reply: fuser::ReplyDirectory,
     ) {
-        dir::readdir(self, req, ino, fh, offset, reply);
+        let operation = self.for_operation();
+        dir::readdir(&operation, req, ino, fh, offset, reply);
     }
 
     // file.rs
     /// Open a file; the returned `fh` is passed to `read`/`write`/etc.
     /// Delegates to `file::open`.
     fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
-        file::open(self, req, ino, flags, reply);
+        let operation = self.for_operation();
+        file::open(&operation, req, ino, flags, reply);
     }
 
     /// Read up to `size` bytes of file `ino` starting at byte `offset`.
@@ -216,7 +231,10 @@ impl Filesystem for Fs {
         lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        file::read(self, req, ino, fh, offset, size, flags, lock_owner, reply);
+        let operation = self.for_operation();
+        file::read(
+            &operation, req, ino, fh, offset, size, flags, lock_owner, reply,
+        );
     }
 
     /// Write `data` into file `ino` at byte `offset`. Delegates to
@@ -233,8 +251,9 @@ impl Filesystem for Fs {
         lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
+        let operation = self.for_operation();
         file::write(
-            self,
+            &operation,
             req,
             ino,
             fh,
@@ -257,7 +276,8 @@ impl Filesystem for Fs {
         lock_owner: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
-        file::flush(self, req, ino, fh, lock_owner, reply);
+        let operation = self.for_operation();
+        file::flush(&operation, req, ino, fh, lock_owner, reply);
     }
 
     /// Called exactly once per `open`, when the last reference to the
@@ -272,7 +292,8 @@ impl Filesystem for Fs {
         flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        file::release(self, req, ino, fh, flags, lock_owner, flush, reply);
+        let operation = self.for_operation();
+        file::release(&operation, req, ino, fh, flags, lock_owner, flush, reply);
     }
 
     /// Flush file contents to stable storage (`fsync`/`fdatasync`):
@@ -285,7 +306,8 @@ impl Filesystem for Fs {
         datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        file::fsync(self, req, ino, fh, datasync, reply);
+        let operation = self.for_operation();
+        file::fsync(&operation, req, ino, fh, datasync, reply);
     }
 
     // meta.rs
@@ -310,8 +332,9 @@ impl Filesystem for Fs {
         flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let operation = self.for_operation();
         meta::setattr(
-            self, req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime,
+            &operation, req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime,
             bkuptime, flags, reply,
         );
     }
@@ -325,7 +348,8 @@ impl Filesystem for Fs {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        meta::unlink(self, req, parent, name, reply);
+        let operation = self.for_operation();
+        meta::unlink(&operation, req, parent, name, reply);
     }
 
     /// Remove the empty directory `name` inside `parent`. Delegates to
@@ -337,7 +361,8 @@ impl Filesystem for Fs {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        meta::rmdir(self, req, parent, name, reply);
+        let operation = self.for_operation();
+        meta::rmdir(&operation, req, parent, name, reply);
     }
 
     /// Rename/move `parent/name` to `newparent/newname` (`mv`).
@@ -352,20 +377,25 @@ impl Filesystem for Fs {
         flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        meta::rename(self, req, parent, name, newparent, newname, flags, reply);
+        let operation = self.for_operation();
+        meta::rename(
+            &operation, req, parent, name, newparent, newname, flags, reply,
+        );
     }
 
     /// Report the filesystem's overall stats (free space, inodes):
     /// backs `df`. Delegates to `meta::statfs`.
     fn statfs(&self, req: &Request, ino: INodeNo, reply: fuser::ReplyStatfs) {
-        meta::statfs(self, req, ino, reply);
+        let operation = self.for_operation();
+        meta::statfs(&operation, req, ino, reply);
     }
 
     // misc.rs
     /// Read the target of a symlink (`readlink`). Delegates to
     /// `misc::readlink`.
     fn readlink(&self, req: &Request, ino: INodeNo, reply: fuser::ReplyData) {
-        misc::readlink(self, req, ino, reply);
+        let operation = self.for_operation();
+        misc::readlink(&operation, req, ino, reply);
     }
 
     /// Create a special file (device/fifo/socket) — `mknod`. Delegates
@@ -380,7 +410,8 @@ impl Filesystem for Fs {
         rdev: u32,
         reply: fuser::ReplyEntry,
     ) {
-        misc::mknod(self, req, parent, name, mode, umask, rdev, reply);
+        let operation = self.for_operation();
+        misc::mknod(&operation, req, parent, name, mode, umask, rdev, reply);
     }
 
     /// Create a symlink at `parent/link_name` pointing to `target`.
@@ -393,7 +424,8 @@ impl Filesystem for Fs {
         target: &Path,
         reply: fuser::ReplyEntry,
     ) {
-        misc::symlink(self, req, parent, link_name, target, reply);
+        let operation = self.for_operation();
+        misc::symlink(&operation, req, parent, link_name, target, reply);
     }
 
     /// Create a hard link `newparent/newname` referring to `ino`.
@@ -406,7 +438,8 @@ impl Filesystem for Fs {
         newname: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        misc::link(self, req, ino, newparent, newname, reply);
+        let operation = self.for_operation();
+        misc::link(&operation, req, ino, newparent, newname, reply);
     }
 }
 

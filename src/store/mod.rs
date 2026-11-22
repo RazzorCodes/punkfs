@@ -12,20 +12,21 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-
 use fuser::RenameFlags;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::db::fstree::{
-    Access, Availability, FsEntry, FsEntryKind, FsNode, FsTree, FileAttrData, FileTimes, ListingOutcome,
-    Stat,
+    Access, Availability, FileAttrData, FileTimes, FsEntry, FsEntryKind, FsNode, FsTree,
+    ListingOutcome, Stat,
 };
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
     self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, SetAttrRequest,
     StatFsRequest, WriteFileRequest,
 };
+use crate::telemetry::OperationContext;
+pub(crate) mod contextual;
 
 #[cfg(test)]
 pub(crate) mod mock;
@@ -103,6 +104,11 @@ pub struct StatFs {
 /// every method can be unit tested against [`mock::MockStore`] without a
 /// server, a runtime, or a FUSE session.
 pub trait StoreApi: Send + Sync {
+    /// The ingress operation bound to this store view, if any.
+    fn operation_context(&self) -> Option<&OperationContext> {
+        None
+    }
+
     /// This machine's identity, as registered with the server.
     fn node_id(&self) -> &str;
 
@@ -145,6 +151,70 @@ pub trait StoreApi: Send + Sync {
     fn rmdir(&self, path: &str) -> Result<(), StoreError>;
     /// Move `old` to `new`, honouring `flags`.
     fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError>;
+
+    // Context-aware entry points. Existing mock/embedded implementations can
+    // retain their original behavior; the network store overrides these.
+    fn ensure_listed_in(&self, _ctx: &OperationContext, dir: &str) -> Result<(), StoreError> {
+        self.ensure_listed(dir)
+    }
+    fn get_children_in(&self, _ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
+        self.get_children(path)
+    }
+    fn read_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.read(path, offset, size)
+    }
+    fn write_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, StoreError> {
+        self.write(path, offset, data)
+    }
+    fn fsync_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        datasync: bool,
+    ) -> Result<(), StoreError> {
+        self.fsync(path, datasync)
+    }
+    fn setattr_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        changes: SetattrChanges,
+    ) -> Result<FileAttrData, StoreError> {
+        self.setattr(path, changes)
+    }
+    fn refresh_in(&self, _ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
+        self.refresh(path)
+    }
+    fn statfs_in(&self, _ctx: &OperationContext) -> Result<StatFs, StoreError> {
+        self.statfs()
+    }
+    fn unlink_in(&self, _ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
+        self.unlink(path)
+    }
+    fn rmdir_in(&self, _ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
+        self.rmdir(path)
+    }
+    fn rename_in(
+        &self,
+        _ctx: &OperationContext,
+        old: &str,
+        new: &str,
+        flags: RenameFlags,
+    ) -> Result<(), StoreError> {
+        self.rename(old, new, flags)
+    }
 }
 
 pub struct Store {
@@ -283,7 +353,12 @@ impl Store {
     ///
     /// Partial failure is normal: a node that does not answer contributes
     /// [`ListingOutcome::Unreachable`] and keeps its cached entries.
-    fn fetch_listing(&self, dir: &str, force: bool) -> Result<(), StoreError> {
+    fn fetch_listing(
+        &self,
+        ctx: &OperationContext,
+        dir: &str,
+        force: bool,
+    ) -> Result<(), StoreError> {
         if !force && self.listed.lock().unwrap().contains(dir) {
             return Ok(());
         }
@@ -293,9 +368,9 @@ impl Store {
 
         for conn in &self.nodes {
             let mut client = conn.client.clone(); // cheap: shares the channel
-            let answer = self
-                .rt
-                .block_on(client.list_directory(ListDirectoryRequest { path: dir.into() }));
+            let answer = self.rt.block_on(
+                client.list_directory(ctx.request(ListDirectoryRequest { path: dir.into() })),
+            );
 
             match answer {
                 Ok(resp) => {
@@ -322,9 +397,7 @@ impl Store {
         let conflicts = self.fstree.lock().unwrap().reconcile_from(dir, outcomes);
         if !conflicts.is_empty() {
             for path in &conflicts {
-                eprintln!(
-                    "punkfs: duplicate name across nodes, refusing to pick one: {path}"
-                );
+                eprintln!("punkfs: duplicate name across nodes, refusing to pick one: {path}");
             }
             let mut known = self.conflicts.lock().unwrap();
             known.extend(conflicts);
@@ -338,20 +411,19 @@ impl Store {
         }
     }
 
-
     /// Forget a cached directory so the next access refetches it.
     fn invalidate(&self, dir: &str) {
         self.listed.lock().unwrap().remove(dir);
     }
 
     /// Fetch one entry's attributes from the node that owns it.
-    fn getattr(&self, path: &str) -> Result<FileAttrData, StoreError> {
+    fn getattr(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
         let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
-            .block_on(client.get_attr(GetAttrRequest {
+            .block_on(client.get_attr(ctx.request(GetAttrRequest {
                 path: path.to_owned(),
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
         Ok(attr_from_proto(resp.into_inner().attr.unwrap_or_default()))
@@ -488,13 +560,21 @@ impl StoreApi for Store {
     /// ones). Correctness first; caching belongs behind a validity check
     /// we do not have yet.
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError> {
-        self.fetch_listing(dir, true)
+        self.ensure_listed_in(&OperationContext::new(), dir)
+    }
+
+    fn ensure_listed_in(&self, ctx: &OperationContext, dir: &str) -> Result<(), StoreError> {
+        self.fetch_listing(ctx, dir, true)
     }
 
     /// Children as (inode, name, kind). A server error is reported to the
     /// caller, which decides whether browsing may fall back to the cache.
     fn get_children(&self, path: &str) -> Vec<StoreChild> {
-        let _ = self.fetch_listing(path, true);
+        self.get_children_in(&OperationContext::new(), path)
+    }
+
+    fn get_children_in(&self, ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
+        let _ = self.fetch_listing(ctx, path, true);
 
         self.fstree
             .lock()
@@ -510,54 +590,92 @@ impl StoreApi for Store {
     }
 
     fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
-        self.require_reachable(path)?;
+        self.read_in(&OperationContext::new(), path, offset, size)
+    }
+
+    fn read_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.require_reachable(ctx, path)?;
         let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
-            .block_on(client.read_file(ReadFileRequest {
+            .block_on(client.read_file(ctx.request(ReadFileRequest {
                 path: path.to_owned(),
                 offset,
                 length: size,
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
         Ok(resp.into_inner().data)
     }
 
     fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
-        self.require_reachable(path)?;
+        self.write_in(&OperationContext::new(), path, offset, data)
+    }
+
+    fn write_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, StoreError> {
+        self.require_reachable(ctx, path)?;
         let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
-            .block_on(client.write_file(WriteFileRequest {
+            .block_on(client.write_file(ctx.request(WriteFileRequest {
                 path: path.to_owned(),
                 offset,
                 data: data.to_vec(),
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
         Ok(resp.into_inner().written)
     }
 
     fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
-        self.require_reachable(path)?;
+        self.fsync_in(&OperationContext::new(), path, datasync)
+    }
+
+    fn fsync_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        datasync: bool,
+    ) -> Result<(), StoreError> {
+        self.require_reachable(ctx, path)?;
         let (node_id, mut client) = self.client_for(path)?;
         self.rt
-            .block_on(client.fsync_file(FsyncFileRequest {
+            .block_on(client.fsync_file(ctx.request(FsyncFileRequest {
                 path: path.to_owned(),
                 datasync,
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
         Ok(())
     }
 
     fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
-        self.require_reachable(path)?;
+        self.setattr_in(&OperationContext::new(), path, changes)
+    }
+
+    fn setattr_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        changes: SetattrChanges,
+    ) -> Result<FileAttrData, StoreError> {
+        self.require_reachable(ctx, path)?;
         let (node_id, mut client) = self.client_for(path)?;
         let resp = self
             .rt
-            .block_on(client.set_attr(SetAttrRequest {
+            .block_on(client.set_attr(ctx.request(SetAttrRequest {
                 path: path.to_owned(),
                 mode: changes.mode,
                 size: changes.size,
@@ -565,7 +683,7 @@ impl StoreApi for Store {
                 modified_unix: changes.modified_unix,
                 uid: None,
                 gid: None,
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
 
@@ -575,18 +693,29 @@ impl StoreApi for Store {
     }
 
     fn refresh(&self, path: &str) -> Result<FileAttrData, StoreError> {
-        let attr = self.getattr(path)?;
+        self.refresh_in(&OperationContext::new(), path)
+    }
+
+    fn refresh_in(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
+        let attr = self.getattr(ctx, path)?;
         self.store_attr(path, attr.clone());
         Ok(attr)
     }
 
     fn statfs(&self) -> Result<StatFs, StoreError> {
+        self.statfs_in(&OperationContext::new())
+    }
+
+    fn statfs_in(&self, ctx: &OperationContext) -> Result<StatFs, StoreError> {
         // Capacity is reported by the first reachable node: an aggregate
         // would claim space no single node can actually serve.
         let mut resp = None;
         for conn in &self.nodes {
             let mut client = conn.client.clone();
-            if let Ok(answer) = self.rt.block_on(client.stat_fs(StatFsRequest {})) {
+            if let Ok(answer) = self
+                .rt
+                .block_on(client.stat_fs(ctx.request(StatFsRequest {})))
+            {
                 conn.touch();
                 resp = Some(answer.into_inner());
                 break;
@@ -606,12 +735,16 @@ impl StoreApi for Store {
     }
 
     fn unlink(&self, path: &str) -> Result<(), StoreError> {
-        self.require_reachable(path)?;
+        self.unlink_in(&OperationContext::new(), path)
+    }
+
+    fn unlink_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
+        self.require_reachable(ctx, path)?;
         let (node_id, mut client) = self.client_for(path)?;
         self.rt
-            .block_on(client.remove_file(punk_fs::RemoveFileRequest {
+            .block_on(client.remove_file(ctx.request(punk_fs::RemoveFileRequest {
                 path: path.to_owned(),
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
         self.after_mutation(path);
@@ -619,12 +752,16 @@ impl StoreApi for Store {
     }
 
     fn rmdir(&self, path: &str) -> Result<(), StoreError> {
-        self.require_reachable(path)?;
+        self.rmdir_in(&OperationContext::new(), path)
+    }
+
+    fn rmdir_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
+        self.require_reachable(ctx, path)?;
         let (node_id, mut client) = self.client_for(path)?;
         self.rt
-            .block_on(client.remove_dir(punk_fs::RemoveDirRequest {
+            .block_on(client.remove_dir(ctx.request(punk_fs::RemoveDirRequest {
                 path: path.to_owned(),
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
         self.after_mutation(path);
@@ -632,14 +769,24 @@ impl StoreApi for Store {
     }
 
     fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError> {
-        self.require_reachable(old)?;
+        self.rename_in(&OperationContext::new(), old, new, flags)
+    }
+
+    fn rename_in(
+        &self,
+        ctx: &OperationContext,
+        old: &str,
+        new: &str,
+        flags: RenameFlags,
+    ) -> Result<(), StoreError> {
+        self.require_reachable(ctx, old)?;
         let (node_id, mut client) = self.client_for(old)?;
         self.rt
-            .block_on(client.rename(punk_fs::RenameRequest {
+            .block_on(client.rename(ctx.request(punk_fs::RenameRequest {
                 old_path: old.to_owned(),
                 new_path: new.to_owned(),
                 flags: flags.bits(),
-            }))
+            })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
 
@@ -661,7 +808,7 @@ impl Store {
     /// answer from `last_seen` rather than paying a connect timeout on
     /// every `cat`. Browsing (`ls`, `stat`) deliberately does not call this
     /// — the namespace stays visible while the content is not.
-    fn require_reachable(&self, path: &str) -> Result<(), StoreError> {
+    fn require_reachable(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
         let node_id = self.node_of(path)?;
         let conn = self.conn_for(&node_id)?;
         if conn.reachable(Self::reachability_window()) {
@@ -672,9 +819,9 @@ impl Store {
         let mut client = conn.client.clone();
         let alive = self
             .rt
-            .block_on(client.get_attr(GetAttrRequest {
+            .block_on(client.get_attr(ctx.request(GetAttrRequest {
                 path: path.to_owned(),
-            }))
+            })))
             .is_ok();
         if alive {
             conn.touch();

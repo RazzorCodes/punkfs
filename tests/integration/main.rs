@@ -21,6 +21,7 @@ mod multinode_conformance;
 mod mutation_conformance;
 mod read_conformance;
 mod store_tests;
+mod telemetry_tests;
 mod write_conformance;
 
 /// Guards the harness itself: a failing test must not leave an orphan server
