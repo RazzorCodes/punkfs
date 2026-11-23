@@ -53,6 +53,14 @@ pub enum StoreError {
 
 impl From<tonic::Status> for StoreError {
     fn from(status: tonic::Status) -> Self {
+        if let Some(errno) = status
+            .metadata()
+            .get("x-punkfs-errno")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i32>().ok())
+        {
+            return StoreError::Local(errno);
+        }
         match status.code() {
             tonic::Code::NotFound => StoreError::NotFound,
             tonic::Code::Unavailable => StoreError::Inaccessible("unavailable".into()),
@@ -75,15 +83,18 @@ pub struct StoreChild {
 
 /// Requested attribute changes from one `setattr` call.
 ///
-/// `None` means "leave this alone". The fields mirror the proto
-/// `SetAttrRequest`; times are already resolved to concrete seconds by the
-/// op layer, so the store never sees `TimeOrNow`.
+/// `None` means "leave this alone". Times use signed seconds and optional
+/// nanoseconds; the operation layer resolves `TimeOrNow`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SetattrChanges {
     pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
     pub size: Option<u64>,
     pub accessed_unix: Option<i64>,
     pub modified_unix: Option<i64>,
+    pub accessed_nanos: Option<u32>,
+    pub modified_nanos: Option<u32>,
 }
 
 /// Filesystem-wide capacity counters backing `statfs` / `df`.
@@ -152,6 +163,53 @@ pub trait StoreApi: Send + Sync {
     fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError>;
 
     // --- metadata ------------------------------------------------------
+    fn get_xattr(&self, _path: &str, _name: &[u8]) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Unsupported("xattr".into()))
+    }
+    fn list_xattr(&self, _path: &str) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Unsupported("xattr".into()))
+    }
+    fn set_xattr(
+        &self,
+        _path: &str,
+        _name: &[u8],
+        _value: &[u8],
+        _flags: i32,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("xattr".into()))
+    }
+    fn remove_xattr(&self, _path: &str, _name: &[u8]) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("xattr".into()))
+    }
+    fn get_xattr_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        name: &[u8],
+    ) -> Result<Vec<u8>, StoreError> {
+        self.get_xattr(path, name)
+    }
+    fn list_xattr_in(&self, _ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
+        self.list_xattr(path)
+    }
+    fn set_xattr_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), StoreError> {
+        self.set_xattr(path, name, value, flags)
+    }
+    fn remove_xattr_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        name: &[u8],
+    ) -> Result<(), StoreError> {
+        self.remove_xattr(path, name)
+    }
     /// Apply the requested attribute changes, returning the new attributes.
     fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError>;
     /// Re-read one entry's attributes, bypassing the cache.
@@ -250,6 +308,14 @@ pub trait StoreApi: Send + Sync {
         Err(StoreError::Unsupported("local catalog unavailable".into()))
     }
     fn remove_local_in(&self, _ctx: &OperationContext, _path: &str) -> Result<(), StoreError> {
+        Err(StoreError::Unsupported("local catalog unavailable".into()))
+    }
+    fn exchange_local_in(
+        &self,
+        _ctx: &OperationContext,
+        _old: &str,
+        _new: &str,
+    ) -> Result<(), StoreError> {
         Err(StoreError::Unsupported("local catalog unavailable".into()))
     }
     fn rename_local_in(
@@ -639,6 +705,10 @@ fn kind_from_proto(kind: i32) -> FsEntryKind {
         Ok(punk_fs::FileKind::Directory) => FsEntryKind::Directory,
         Ok(punk_fs::FileKind::Symlink) => FsEntryKind::Link,
         Ok(punk_fs::FileKind::File) => FsEntryKind::File,
+        Ok(punk_fs::FileKind::Fifo) => FsEntryKind::Fifo,
+        Ok(punk_fs::FileKind::Socket) => FsEntryKind::Socket,
+        Ok(punk_fs::FileKind::BlockDevice) => FsEntryKind::BlockDevice,
+        Ok(punk_fs::FileKind::CharDevice) => FsEntryKind::CharDevice,
         _ => FsEntryKind::Unknown,
     }
 }
@@ -651,12 +721,24 @@ fn attr_from_proto(attr: punk_fs::FileAttr) -> FileAttrData {
     FileAttrData {
         guid: attr.guid,
         kind: kind_from_proto(attr.kind),
-        times: FileTimes::from_secs(
-            times.accessed_unix.max(0) as u64,
-            times.modified_unix.max(0) as u64,
-            times.changed_unix.max(0) as u64,
-            times.created_unix.max(0) as u64,
-        ),
+        times: {
+            let time = |secs: i64, nanos: u32| {
+                let base = if secs >= 0 {
+                    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs as u64))
+                } else {
+                    std::time::UNIX_EPOCH
+                        .checked_sub(std::time::Duration::from_secs(secs.unsigned_abs()))
+                };
+                base.and_then(|t| t.checked_add(std::time::Duration::from_nanos(nanos as u64)))
+                    .unwrap_or(std::time::UNIX_EPOCH)
+            };
+            FileTimes {
+                accessed: time(times.accessed_unix, times.accessed_nanos),
+                modified: time(times.modified_unix, times.modified_nanos),
+                changed: time(times.changed_unix, times.changed_nanos),
+                created: time(times.created_unix, times.created_nanos),
+            }
+        },
         access: Access {
             mode: access.mode as u16,
             uid: access.uid,
@@ -666,7 +748,7 @@ fn attr_from_proto(attr: punk_fs::FileAttr) -> FileAttrData {
             size: stat.size,
             blocks: stat.blocks as u32,
             block_size: stat.block_size as u16,
-            rdev: stat.rdev as u16,
+            rdev: stat.rdev,
             nlink: stat.nlink,
             flags: stat.flags,
         },
@@ -730,6 +812,20 @@ impl StoreApi for Store {
             .unwrap()
             .remove_entry_in(ctx, path);
         self.invalidate(&parent_of(path));
+        Ok(())
+    }
+    fn exchange_local_in(
+        &self,
+        _ctx: &OperationContext,
+        old: &str,
+        new: &str,
+    ) -> Result<(), StoreError> {
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .exchange_entries(old, new);
+        self.invalidate(&parent_of(old));
+        self.invalidate(&parent_of(new));
         Ok(())
     }
     fn rename_local_in(
@@ -924,6 +1020,104 @@ impl StoreApi for Store {
         Ok(())
     }
 
+    fn get_xattr(&self, path: &str, name: &[u8]) -> Result<Vec<u8>, StoreError> {
+        self.get_xattr_in(&OperationContext::new(), path, name)
+    }
+    fn list_xattr(&self, path: &str) -> Result<Vec<u8>, StoreError> {
+        self.list_xattr_in(&OperationContext::new(), path)
+    }
+    fn set_xattr(
+        &self,
+        path: &str,
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), StoreError> {
+        self.set_xattr_in(&OperationContext::new(), path, name, value, flags)
+    }
+    fn remove_xattr(&self, path: &str, name: &[u8]) -> Result<(), StoreError> {
+        self.remove_xattr_in(&OperationContext::new(), path, name)
+    }
+    fn get_xattr_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        name: &[u8],
+    ) -> Result<Vec<u8>, StoreError> {
+        self.require_reachable(ctx, path)?;
+        let (node, mut client) = self.client_for(path)?;
+        let request = punk_fs::XattrRequest {
+            path: path.into(),
+            name: name.into(),
+            value: vec![],
+            flags: 0,
+        };
+        let response = self
+            .rt
+            .block_on(client.get_xattr(ctx.request(request)))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node)?.touch();
+        Ok(response.into_inner().value)
+    }
+    fn list_xattr_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
+        self.require_reachable(ctx, path)?;
+        let (node, mut client) = self.client_for(path)?;
+        let request = punk_fs::XattrRequest {
+            path: path.into(),
+            name: vec![],
+            value: vec![],
+            flags: 0,
+        };
+        let response = self
+            .rt
+            .block_on(client.list_xattr(ctx.request(request)))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node)?.touch();
+        Ok(response.into_inner().value)
+    }
+    fn set_xattr_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), StoreError> {
+        self.require_reachable(ctx, path)?;
+        let (node, mut client) = self.client_for(path)?;
+        let request = punk_fs::XattrRequest {
+            path: path.into(),
+            name: name.into(),
+            value: value.into(),
+            flags,
+        };
+        self.rt
+            .block_on(client.set_xattr(ctx.request(request)))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node)?.touch();
+        Ok(())
+    }
+    fn remove_xattr_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        name: &[u8],
+    ) -> Result<(), StoreError> {
+        self.require_reachable(ctx, path)?;
+        let (node, mut client) = self.client_for(path)?;
+        let request = punk_fs::XattrRequest {
+            path: path.into(),
+            name: name.into(),
+            value: vec![],
+            flags: 0,
+        };
+        self.rt
+            .block_on(client.remove_xattr(ctx.request(request)))
+            .map_err(StoreError::from)?;
+        self.conn_for(&node)?.touch();
+        Ok(())
+    }
+
     fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
         self.setattr_in(&OperationContext::new(), path, changes)
     }
@@ -944,8 +1138,10 @@ impl StoreApi for Store {
                 size: changes.size,
                 accessed_unix: changes.accessed_unix,
                 modified_unix: changes.modified_unix,
-                uid: None,
-                gid: None,
+                uid: changes.uid,
+                gid: changes.gid,
+                accessed_nanos: changes.accessed_nanos,
+                modified_nanos: changes.modified_nanos,
             })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
@@ -1042,6 +1238,18 @@ impl StoreApi for Store {
         new: &str,
         flags: RenameFlags,
     ) -> Result<(), StoreError> {
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            let cache = self.metadata_cache.lock().unwrap();
+            let source = cache.get_entry_by_path(old).ok_or(StoreError::NotFound)?;
+            let destination = cache.get_entry_by_path(new).ok_or(StoreError::NotFound)?;
+            if source.node_id != destination.node_id {
+                return Err(StoreError::Local(libc::EXDEV));
+            }
+            drop(cache);
+            if self.has_conflict(old) || self.has_conflict(new) {
+                return Err(StoreError::Local(libc::EIO));
+            }
+        }
         self.require_reachable(ctx, old)?;
         let (node_id, mut client) = self.client_for(old)?;
         self.rt
@@ -1056,11 +1264,19 @@ impl StoreApi for Store {
         // Rename within one node: the entry keeps its guid and its inode,
         // so move it locally instead of dropping and re-adding it. A
         // cross-node move is refused by the op layer, never reaching here.
-        self.after_mutation(ctx, new);
-        self.metadata_cache
-            .lock()
-            .unwrap()
-            .rename_entry_in(ctx, old, new);
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            self.metadata_cache
+                .lock()
+                .unwrap()
+                .exchange_entries(old, new);
+            self.invalidate(&parent_of(new));
+        } else {
+            self.after_mutation(ctx, new);
+            self.metadata_cache
+                .lock()
+                .unwrap()
+                .rename_entry_in(ctx, old, new);
+        }
         let parent = parent_of(old);
         self.invalidate(&parent);
         Ok(())

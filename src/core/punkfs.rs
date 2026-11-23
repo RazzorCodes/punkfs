@@ -494,60 +494,6 @@ impl Filesystem for Fs {
     ) {
         let operation = self.for_operation();
         operation.log_route("setattr", ino.0);
-        if operation.local.is_some()
-            && operation
-                .store
-                .get_entry(ino.0)
-                .is_some_and(|e| e.node_id == operation.store.node_id())
-        {
-            if uid.is_some()
-                || gid.is_some()
-                || ctime.is_some()
-                || crtime.is_some()
-                || chgtime.is_some()
-                || bkuptime.is_some()
-                || flags.is_some()
-            {
-                reply.error(fuser::Errno::ENOSYS);
-                return;
-            }
-            let seconds = |time: Option<fuser::TimeOrNow>| {
-                time.map(|t| {
-                    let t = match t {
-                        fuser::TimeOrNow::SpecificTime(t) => t,
-                        fuser::TimeOrNow::Now => SystemTime::now(),
-                    };
-                    t.duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                })
-            };
-            let changes = crate::store::SetattrChanges {
-                mode,
-                size,
-                accessed_unix: seconds(atime),
-                modified_unix: seconds(mtime),
-            };
-            let result = operation
-                .store
-                .get_path(ino.0)
-                .ok_or(crate::store::StoreError::NotFound)
-                .and_then(|path| operation.store.setattr(&path, changes))
-                .and_then(|_| {
-                    crate::filesystem::remote::helpers::attr_for(
-                        operation.store.as_ref(),
-                        ino.0,
-                        req.uid(),
-                        req.gid(),
-                    )
-                    .ok_or(crate::store::StoreError::NotFound)
-                });
-            match result {
-                Ok(attr) => reply.attr(&crate::TIMEOUT, &attr),
-                Err(e) => reply.error(crate::filesystem::remote::error::OpError::from(e).errno()),
-            }
-            return;
-        }
         meta::setattr(
             &operation, req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime,
             bkuptime, flags, reply,
@@ -706,6 +652,86 @@ impl Filesystem for Fs {
         }
     }
 
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &std::ffi::OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        use std::os::unix::ffi::OsStrExt;
+        let operation = self.for_operation();
+        operation.log_route("setxattr", ino.0);
+        let result = if position != 0 {
+            Err(crate::store::StoreError::Local(libc::EINVAL))
+        } else {
+            operation
+                .store
+                .get_path(ino.0)
+                .ok_or(crate::store::StoreError::NotFound)
+                .and_then(|path| {
+                    operation
+                        .store
+                        .set_xattr(&path, name.as_bytes(), value, flags)
+                })
+        };
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(crate::filesystem::remote::error::OpError::from(e).errno()),
+        }
+    }
+    fn getxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &std::ffi::OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        use std::os::unix::ffi::OsStrExt;
+        let operation = self.for_operation();
+        operation.log_route("getxattr", ino.0);
+        let result = operation
+            .store
+            .get_path(ino.0)
+            .ok_or(crate::store::StoreError::NotFound)
+            .and_then(|path| operation.store.get_xattr(&path, name.as_bytes()));
+        reply_xattr(result, size, reply);
+    }
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        let operation = self.for_operation();
+        operation.log_route("listxattr", ino.0);
+        let result = operation
+            .store
+            .get_path(ino.0)
+            .ok_or(crate::store::StoreError::NotFound)
+            .and_then(|path| operation.store.list_xattr(&path));
+        reply_xattr(result, size, reply);
+    }
+    fn removexattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        use std::os::unix::ffi::OsStrExt;
+        let operation = self.for_operation();
+        operation.log_route("removexattr", ino.0);
+        let result = operation
+            .store
+            .get_path(ino.0)
+            .ok_or(crate::store::StoreError::NotFound)
+            .and_then(|path| operation.store.remove_xattr(&path, name.as_bytes()));
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(crate::filesystem::remote::error::OpError::from(e).errno()),
+        }
+    }
+
     // misc.rs
     /// Read the target of a symlink (`readlink`). Delegates to
     /// `misc::readlink`.
@@ -728,7 +754,36 @@ impl Filesystem for Fs {
         reply: fuser::ReplyEntry,
     ) {
         let operation = self.for_operation();
-        misc::mknod(&operation, req, parent, name, mode, umask, rdev, reply);
+        let Some(local) = &operation.local else {
+            misc::mknod(&operation, req, parent, name, mode, umask, rdev, reply);
+            return;
+        };
+        let result = (|| {
+            let parent_path =
+                crate::filesystem::remote::helpers::path_of(operation.store.as_ref(), parent.0)?;
+            let path = helpers_for_create::path(&operation, parent.0, name)?;
+            operation
+                .store
+                .ensure_listed(&parent_path)
+                .map_err(crate::filesystem::remote::error::OpError::from)?;
+            let ctx = operation
+                .store
+                .operation_context()
+                .expect("operation context");
+            let inode = local
+                .create_special(self.store.as_ref(), ctx, &path, mode & !umask, rdev)
+                .map_err(crate::filesystem::remote::error::OpError::from)?;
+            crate::filesystem::remote::helpers::attr_or_not_found(
+                operation.store.as_ref(),
+                inode,
+                req.uid(),
+                req.gid(),
+            )
+        })();
+        match result {
+            Ok(attr) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
+            Err(e) => reply.error(e.errno()),
+        }
     }
 
     /// Create a symlink at `parent/link_name` pointing to `target`.
@@ -789,6 +844,19 @@ impl Filesystem for Fs {
     ) {
         let operation = self.for_operation();
         misc::link(&operation, req, ino, newparent, newname, reply);
+    }
+}
+
+fn reply_xattr(
+    result: Result<Vec<u8>, crate::store::StoreError>,
+    size: u32,
+    reply: fuser::ReplyXattr,
+) {
+    match result {
+        Ok(data) if size == 0 => reply.size(data.len() as u32),
+        Ok(data) if data.len() <= size as usize => reply.data(&data),
+        Ok(_) => reply.error(fuser::Errno::ERANGE),
+        Err(e) => reply.error(crate::filesystem::remote::error::OpError::from(e).errno()),
     }
 }
 

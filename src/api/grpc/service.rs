@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
@@ -121,25 +121,43 @@ fn file_kind(kind: FsEntryKind) -> FileKind {
     match kind {
         FsEntryKind::Directory => FileKind::Directory,
         FsEntryKind::Link => FileKind::Symlink,
+        FsEntryKind::Fifo => FileKind::Fifo,
+        FsEntryKind::Socket => FileKind::Socket,
+        FsEntryKind::BlockDevice => FileKind::BlockDevice,
+        FsEntryKind::CharDevice => FileKind::CharDevice,
         FsEntryKind::Unknown | FsEntryKind::File => FileKind::File,
     }
 }
 
 pub(crate) fn to_proto_attr(data: &FileAttrData) -> FileAttr {
-    let secs = |t: std::time::SystemTime| {
-        t.duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+    let parts = |t: std::time::SystemTime| match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            if d.subsec_nanos() == 0 {
+                (-(d.as_secs() as i64), 0)
+            } else {
+                (-(d.as_secs() as i64) - 1, 1_000_000_000 - d.subsec_nanos())
+            }
+        }
     };
+    let (accessed_unix, accessed_nanos) = parts(data.times.accessed);
+    let (modified_unix, modified_nanos) = parts(data.times.modified);
+    let (changed_unix, changed_nanos) = parts(data.times.changed);
+    let (created_unix, created_nanos) = parts(data.times.created);
 
     FileAttr {
         guid: data.guid.clone(),
         kind: file_kind(data.kind) as i32,
         times: Some(PbFileTimes {
-            accessed_unix: secs(data.times.accessed),
-            modified_unix: secs(data.times.modified),
-            changed_unix: secs(data.times.changed),
-            created_unix: secs(data.times.created),
+            accessed_unix,
+            modified_unix,
+            changed_unix,
+            created_unix,
+            accessed_nanos,
+            modified_nanos,
+            changed_nanos,
+            created_nanos,
         }),
         access: Some(PbAccess {
             mode: data.access.mode as u32,
@@ -150,7 +168,7 @@ pub(crate) fn to_proto_attr(data: &FileAttrData) -> FileAttr {
             size: data.stat.size,
             blocks: data.stat.blocks as u64,
             block_size: data.stat.block_size as u32,
-            rdev: data.stat.rdev as u32,
+            rdev: data.stat.rdev,
             nlink: data.stat.nlink,
             flags: data.stat.flags,
         }),
@@ -161,6 +179,22 @@ pub(crate) fn to_proto_attr(data: &FileAttrData) -> FileAttr {
 /// into an errno. The mapping is deliberately narrow: anything the client
 /// cannot act on becomes `internal`.
 pub fn io_status(err: io::Error) -> Status {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ENOTEMPTY) | Some(libc::EEXIST) | Some(libc::EINVAL) | Some(libc::EXDEV)
+    ) {
+        let errno = err.raw_os_error().expect("checked above");
+        let mut status = if errno == libc::EINVAL {
+            Status::invalid_argument(err.to_string())
+        } else {
+            Status::failed_precondition(err.to_string())
+        };
+        status.metadata_mut().insert(
+            "x-punkfs-errno",
+            errno.to_string().parse().expect("errno metadata"),
+        );
+        return status;
+    }
     if err.raw_os_error() == Some(libc::ELOOP) {
         return Status::permission_denied("symlink traversal is not supported");
     }
@@ -174,6 +208,18 @@ pub fn io_status(err: io::Error) -> Status {
         io::ErrorKind::DirectoryNotEmpty => Status::failed_precondition("directory not empty"),
         io::ErrorKind::Unsupported => Status::unimplemented(err.to_string()),
         _ => Status::internal(err.to_string()),
+    }
+}
+
+fn xattr_status(err: io::Error) -> Status {
+    if let Some(errno) = err.raw_os_error() {
+        let mut status = io_status(err);
+        if let Ok(value) = errno.to_string().parse() {
+            status.metadata_mut().insert("x-punkfs-errno", value);
+        }
+        status
+    } else {
+        io_status(err)
     }
 }
 
@@ -316,39 +362,123 @@ impl PunkFs for PunkFsService {
     ) -> Result<Response<SetAttrResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
+        let result = (|| {
+            if req.accessed_nanos.is_some_and(|n| n >= 1_000_000_000)
+                || req.modified_nanos.is_some_and(|n| n >= 1_000_000_000)
+            {
+                return Err(Status::invalid_argument("invalid nanoseconds"));
+            }
+            let real = self.backing.existing(&req.path).map_err(io_status)?;
+            if req.uid.is_some() || req.gid.is_some() {
+                let path = std::ffi::CString::new(real.as_os_str().as_encoded_bytes())
+                    .map_err(|_| Status::invalid_argument("path contains NUL"))?;
+                if unsafe {
+                    libc::chown(
+                        path.as_ptr(),
+                        req.uid.unwrap_or(u32::MAX),
+                        req.gid.unwrap_or(u32::MAX),
+                    )
+                } != 0
+                {
+                    return Err(io_status(io::Error::last_os_error()));
+                }
+            }
 
-        // Ownership changes need privilege this backend does not assume.
-        // Refusing explicitly beats silently not applying them.
-        if req.uid.is_some() || req.gid.is_some() {
-            return Err(Status::unimplemented("changing ownership is not supported"));
-        }
+            if let Some(mode) = req.mode {
+                std::fs::set_permissions(&real, std::fs::Permissions::from_mode(mode & 0o7777))
+                    .map_err(io_status)?;
+            }
 
-        let real = self.backing.existing(&req.path).map_err(io_status)?;
+            if let Some(size) = req.size {
+                let file = open_for_write(&real).map_err(io_status)?;
+                file.set_len(size).map_err(io_status)?;
+            }
 
-        if let Some(mode) = req.mode {
-            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(mode & 0o7777))
+            // atime/mtime: only applied when the caller asked for one of them,
+            // using the pair so the untouched half is preserved.
+            if req.accessed_unix.is_some() || req.modified_unix.is_some() {
+                apply_times(
+                    &real,
+                    req.accessed_unix,
+                    req.accessed_nanos,
+                    req.modified_unix,
+                    req.modified_nanos,
+                )?;
+            }
+
+            let entry = self.resolve(&req.path)?;
+            let attr = self
+                .backing
+                .attr_for(&req.path, &entry)
                 .map_err(io_status)?;
-        }
+            Ok::<_, Status>(SetAttrResponse {
+                attr: Some(to_proto_attr(&attr)),
+            })
+        })();
+        self.log_io(&context, "setattr", &result);
+        Ok(context.response(result?))
+    }
 
-        if let Some(size) = req.size {
-            let file = open_for_write(&real).map_err(io_status)?;
-            file.set_len(size).map_err(io_status)?;
-        }
-
-        // atime/mtime: only applied when the caller asked for one of them,
-        // using the pair so the untouched half is preserved.
-        if req.accessed_unix.is_some() || req.modified_unix.is_some() {
-            apply_times(&real, req.accessed_unix, req.modified_unix)?;
-        }
-
-        let entry = self.resolve(&req.path)?;
-        let attr = self
+    async fn get_xattr(
+        &self,
+        request: Request<crate::punk_fs::XattrRequest>,
+    ) -> Result<Response<crate::punk_fs::XattrResponse>, Status> {
+        let ctx = crate::telemetry::OperationContext::from_request(&request)?;
+        let req = request.into_inner();
+        let result = self
             .backing
-            .attr_for(&req.path, &entry)
-            .map_err(io_status)?;
-        Ok(context.response(SetAttrResponse {
-            attr: Some(to_proto_attr(&attr)),
-        }))
+            .entry_path(&req.path)
+            .map_err(io_status)
+            .and_then(|path| crate::core::xattr::get(&path, &req.name).map_err(xattr_status));
+        self.log_io(&ctx, "getxattr", &result);
+        Ok(ctx.response(crate::punk_fs::XattrResponse { value: result? }))
+    }
+    async fn list_xattr(
+        &self,
+        request: Request<crate::punk_fs::XattrRequest>,
+    ) -> Result<Response<crate::punk_fs::XattrResponse>, Status> {
+        let ctx = crate::telemetry::OperationContext::from_request(&request)?;
+        let req = request.into_inner();
+        let result = self
+            .backing
+            .entry_path(&req.path)
+            .map_err(io_status)
+            .and_then(|path| crate::core::xattr::list(&path).map_err(xattr_status));
+        self.log_io(&ctx, "listxattr", &result);
+        Ok(ctx.response(crate::punk_fs::XattrResponse { value: result? }))
+    }
+    async fn set_xattr(
+        &self,
+        request: Request<crate::punk_fs::XattrRequest>,
+    ) -> Result<Response<crate::punk_fs::XattrResponse>, Status> {
+        let ctx = crate::telemetry::OperationContext::from_request(&request)?;
+        let req = request.into_inner();
+        let result = self
+            .backing
+            .entry_path(&req.path)
+            .map_err(io_status)
+            .and_then(|path| {
+                crate::core::xattr::set(&path, &req.name, &req.value, req.flags)
+                    .map_err(xattr_status)
+            });
+        self.log_io(&ctx, "setxattr", &result);
+        result?;
+        Ok(ctx.response(crate::punk_fs::XattrResponse { value: vec![] }))
+    }
+    async fn remove_xattr(
+        &self,
+        request: Request<crate::punk_fs::XattrRequest>,
+    ) -> Result<Response<crate::punk_fs::XattrResponse>, Status> {
+        let ctx = crate::telemetry::OperationContext::from_request(&request)?;
+        let req = request.into_inner();
+        let result = self
+            .backing
+            .entry_path(&req.path)
+            .map_err(io_status)
+            .and_then(|path| crate::core::xattr::remove(&path, &req.name).map_err(xattr_status));
+        self.log_io(&ctx, "removexattr", &result);
+        result?;
+        Ok(ctx.response(crate::punk_fs::XattrResponse { value: vec![] }))
     }
 
     async fn stat_fs(
@@ -410,16 +540,29 @@ impl PunkFs for PunkFsService {
     ) -> Result<Response<RenameResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
-        if req.flags != 0 {
-            return Err(Status::unimplemented(
-                "rename flags (NOREPLACE/EXCHANGE) are not supported",
-            ));
-        }
-
-        let from = self.backing.entry_path(&req.old_path).map_err(io_status)?;
-        let to = self.backing.entry_path(&req.new_path).map_err(io_status)?;
-        tokio::fs::rename(&from, &to).await.map_err(io_status)?;
-        Ok(context.response(RenameResponse {}))
+        let result = (|| {
+            let from = self.backing.entry_path(&req.old_path).map_err(io_status)?;
+            let to = self.backing.entry_path(&req.new_path).map_err(io_status)?;
+            let from = std::ffi::CString::new(from.as_os_str().as_encoded_bytes())
+                .map_err(|_| Status::invalid_argument("path contains NUL"))?;
+            let to = std::ffi::CString::new(to.as_os_str().as_encoded_bytes())
+                .map_err(|_| Status::invalid_argument("path contains NUL"))?;
+            if unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    from.as_ptr(),
+                    libc::AT_FDCWD,
+                    to.as_ptr(),
+                    req.flags,
+                )
+            } != 0
+            {
+                return Err(io_status(io::Error::last_os_error()));
+            }
+            Ok::<_, Status>(RenameResponse {})
+        })();
+        self.log_io(&context, "rename", &result);
+        Ok(context.response(result?))
     }
 
     async fn shutdown(
@@ -451,23 +594,26 @@ impl PunkFs for PunkFsService {
 fn apply_times(
     path: &Path,
     accessed_unix: Option<i64>,
+    accessed_nanos: Option<u32>,
     modified_unix: Option<i64>,
+    modified_nanos: Option<u32>,
 ) -> Result<(), Status> {
-    let meta = std::fs::metadata(path).map_err(io_status)?;
-    let to_timespec = |secs: Option<i64>, fallback: std::time::SystemTime| {
-        let t = secs
-            .map(|s| UNIX_EPOCH + Duration::from_secs(s.max(0) as u64))
-            .unwrap_or(fallback);
-        let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-        libc::timespec {
-            tv_sec: dur.as_secs() as libc::time_t,
-            tv_nsec: dur.subsec_nanos() as _,
-        }
+    if accessed_nanos.is_some_and(|n| n >= 1_000_000_000)
+        || modified_nanos.is_some_and(|n| n >= 1_000_000_000)
+    {
+        return Err(Status::invalid_argument("invalid nanoseconds"));
+    }
+    let to_timespec = |secs: Option<i64>, nanos: Option<u32>| libc::timespec {
+        tv_sec: secs.unwrap_or(0) as libc::time_t,
+        tv_nsec: if secs.is_some() {
+            nanos.unwrap_or(0) as libc::c_long
+        } else {
+            libc::UTIME_OMIT
+        },
     };
-
     let times = [
-        to_timespec(accessed_unix, meta.accessed().unwrap_or(UNIX_EPOCH)),
-        to_timespec(modified_unix, meta.modified().unwrap_or(UNIX_EPOCH)),
+        to_timespec(accessed_unix, accessed_nanos),
+        to_timespec(modified_unix, modified_nanos),
     ];
 
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
@@ -603,23 +749,6 @@ mod tests {
         assert_ne!(a, other_path);
         assert_ne!(a, other_node);
         assert!(uuid::Uuid::parse_str(&a).is_ok());
-    }
-
-    /// The backing grpc layer refuses ownership changes and path traversal
-    /// before touching disk, and maps io errors to the codes the client
-    /// translates back into errnos.
-    #[tokio::test]
-    async fn set_attr_refuses_ownership_changes() {
-        let (_dir, service) = fixture();
-        let err = service
-            .set_attr(Request::new(SetAttrRequest {
-                path: "/hello.txt".into(),
-                uid: Some(0),
-                ..SetAttrRequest::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
     #[tokio::test]

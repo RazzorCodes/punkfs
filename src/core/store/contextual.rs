@@ -47,6 +47,18 @@ impl StoreApi for ContextualStore {
     fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
         self.inner.fsync_in(&self.context, path, datasync)
     }
+    fn get_xattr(&self, p: &str, n: &[u8]) -> Result<Vec<u8>, StoreError> {
+        self.inner.get_xattr_in(&self.context, p, n)
+    }
+    fn list_xattr(&self, p: &str) -> Result<Vec<u8>, StoreError> {
+        self.inner.list_xattr_in(&self.context, p)
+    }
+    fn set_xattr(&self, p: &str, n: &[u8], v: &[u8], f: i32) -> Result<(), StoreError> {
+        self.inner.set_xattr_in(&self.context, p, n, v, f)
+    }
+    fn remove_xattr(&self, p: &str, n: &[u8]) -> Result<(), StoreError> {
+        self.inner.remove_xattr_in(&self.context, p, n)
+    }
     fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
         self.inner.setattr_in(&self.context, path, changes)
     }

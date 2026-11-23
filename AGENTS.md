@@ -1,5 +1,17 @@
 # Agent instructions
 
+## Test placement
+
+- Prefer tests in the blackbox, functional, integration, and smoke suites over
+  tests embedded in implementation files.
+- Cover each behavior in blackbox, integration, and at least one of functional
+  or smoke where those layers can exercise it. Do not count a test that only
+  exercises a reference filesystem as punkfs coverage.
+- Put a test in the same file as implementation code only when the relevant
+  method or behavior cannot be tested adequately through those suite layers;
+  explain the limitation when it is not obvious. Keep desired-behavior tests
+  honest, including visible failures and explicit environment-dependent skips.
+
 ## Logging and operation correlation
 
 These are requirements for the telemetry system and future implementation

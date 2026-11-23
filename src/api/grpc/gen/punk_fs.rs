@@ -34,8 +34,7 @@ pub struct PublishCreateRequest {
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PublishCreateResponse {}
-/// Seconds-resolution timestamps. Nanoseconds are reserved for a later
-/// revision rather than guessed at now.
+/// Timestamps use signed seconds plus nonnegative nanoseconds.
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileTimes {
@@ -47,6 +46,14 @@ pub struct FileTimes {
     pub changed_unix: i64,
     #[prost(int64, tag = "4")]
     pub created_unix: i64,
+    #[prost(uint32, tag = "5")]
+    pub accessed_nanos: u32,
+    #[prost(uint32, tag = "6")]
+    pub modified_nanos: u32,
+    #[prost(uint32, tag = "7")]
+    pub changed_nanos: u32,
+    #[prost(uint32, tag = "8")]
+    pub created_nanos: u32,
 }
 /// Ownership and permission bits.
 #[allow(clippy::all)]
@@ -195,18 +202,38 @@ pub struct SetAttrRequest {
     pub accessed_unix: ::core::option::Option<i64>,
     #[prost(int64, optional, tag = "5")]
     pub modified_unix: ::core::option::Option<i64>,
-    /// Ownership changes are refused by the local backend for now; the
-    /// fields exist so the refusal is explicit rather than a silent drop.
     #[prost(uint32, optional, tag = "6")]
     pub uid: ::core::option::Option<u32>,
     #[prost(uint32, optional, tag = "7")]
     pub gid: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "8")]
+    pub accessed_nanos: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "9")]
+    pub modified_nanos: ::core::option::Option<u32>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetAttrResponse {
     #[prost(message, optional, tag = "1")]
     pub attr: ::core::option::Option<FileAttr>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct XattrRequest {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub name: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub value: ::prost::alloc::vec::Vec<u8>,
+    #[prost(int32, tag = "4")]
+    pub flags: i32,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct XattrResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub value: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -278,6 +305,10 @@ pub enum FileKind {
     File = 1,
     Directory = 2,
     Symlink = 3,
+    Fifo = 4,
+    Socket = 5,
+    BlockDevice = 6,
+    CharDevice = 7,
 }
 impl FileKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -290,6 +321,10 @@ impl FileKind {
             Self::File => "FILE_KIND_FILE",
             Self::Directory => "FILE_KIND_DIRECTORY",
             Self::Symlink => "FILE_KIND_SYMLINK",
+            Self::Fifo => "FILE_KIND_FIFO",
+            Self::Socket => "FILE_KIND_SOCKET",
+            Self::BlockDevice => "FILE_KIND_BLOCK_DEVICE",
+            Self::CharDevice => "FILE_KIND_CHAR_DEVICE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -299,6 +334,10 @@ impl FileKind {
             "FILE_KIND_FILE" => Some(Self::File),
             "FILE_KIND_DIRECTORY" => Some(Self::Directory),
             "FILE_KIND_SYMLINK" => Some(Self::Symlink),
+            "FILE_KIND_FIFO" => Some(Self::Fifo),
+            "FILE_KIND_SOCKET" => Some(Self::Socket),
+            "FILE_KIND_BLOCK_DEVICE" => Some(Self::BlockDevice),
+            "FILE_KIND_CHAR_DEVICE" => Some(Self::CharDevice),
             _ => None,
         }
     }
@@ -565,6 +604,81 @@ pub mod punk_fs_client {
             req.extensions_mut().insert(GrpcMethod::new("punk_fs.PunkFs", "SetAttr"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_xattr(
+            &mut self,
+            request: impl tonic::IntoRequest<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/punk_fs.PunkFs/GetXattr");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("punk_fs.PunkFs", "GetXattr"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_xattr(
+            &mut self,
+            request: impl tonic::IntoRequest<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/punk_fs.PunkFs/ListXattr");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("punk_fs.PunkFs", "ListXattr"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn set_xattr(
+            &mut self,
+            request: impl tonic::IntoRequest<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/punk_fs.PunkFs/SetXattr");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("punk_fs.PunkFs", "SetXattr"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn remove_xattr(
+            &mut self,
+            request: impl tonic::IntoRequest<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/punk_fs.PunkFs/RemoveXattr",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("punk_fs.PunkFs", "RemoveXattr"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Aggregate capacity of the backing storage.
         pub async fn stat_fs(
             &mut self,
@@ -739,6 +853,22 @@ pub mod punk_fs_server {
             &self,
             request: tonic::Request<super::SetAttrRequest>,
         ) -> std::result::Result<tonic::Response<super::SetAttrResponse>, tonic::Status>;
+        async fn get_xattr(
+            &self,
+            request: tonic::Request<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status>;
+        async fn list_xattr(
+            &self,
+            request: tonic::Request<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status>;
+        async fn set_xattr(
+            &self,
+            request: tonic::Request<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status>;
+        async fn remove_xattr(
+            &self,
+            request: tonic::Request<super::XattrRequest>,
+        ) -> std::result::Result<tonic::Response<super::XattrResponse>, tonic::Status>;
         /// Aggregate capacity of the backing storage.
         async fn stat_fs(
             &self,
@@ -1151,6 +1281,178 @@ pub mod punk_fs_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SetAttrSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/punk_fs.PunkFs/GetXattr" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetXattrSvc<T: PunkFs>(pub Arc<T>);
+                    impl<T: PunkFs> tonic::server::UnaryService<super::XattrRequest>
+                    for GetXattrSvc<T> {
+                        type Response = super::XattrResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::XattrRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PunkFs>::get_xattr(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetXattrSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/punk_fs.PunkFs/ListXattr" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListXattrSvc<T: PunkFs>(pub Arc<T>);
+                    impl<T: PunkFs> tonic::server::UnaryService<super::XattrRequest>
+                    for ListXattrSvc<T> {
+                        type Response = super::XattrResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::XattrRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PunkFs>::list_xattr(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListXattrSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/punk_fs.PunkFs/SetXattr" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetXattrSvc<T: PunkFs>(pub Arc<T>);
+                    impl<T: PunkFs> tonic::server::UnaryService<super::XattrRequest>
+                    for SetXattrSvc<T> {
+                        type Response = super::XattrResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::XattrRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PunkFs>::set_xattr(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetXattrSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/punk_fs.PunkFs/RemoveXattr" => {
+                    #[allow(non_camel_case_types)]
+                    struct RemoveXattrSvc<T: PunkFs>(pub Arc<T>);
+                    impl<T: PunkFs> tonic::server::UnaryService<super::XattrRequest>
+                    for RemoveXattrSvc<T> {
+                        type Response = super::XattrResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::XattrRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PunkFs>::remove_xattr(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RemoveXattrSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -195,6 +195,56 @@ fn functional_readlink_preserves_correlation() {
     assert!(ids.iter().all(|id| id == &context.id().to_string()));
 }
 
+#[test]
+fn functional_setattr_and_xattrs_preserve_correlation() {
+    let server = ObservedServer::new();
+    let store = Store::new(
+        &server.url,
+        FsNode {
+            node_id: "node".into(),
+        },
+    )
+    .unwrap();
+    let context = OperationContext::new();
+    store
+        .setattr_in(
+            &context,
+            "/hello.txt",
+            punkfs::SetattrChanges {
+                mode: Some(0o600),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    if let Err(err) = store.set_xattr_in(&context, "/hello.txt", b"user.correlation", b"test", 0) {
+        if matches!(
+            err,
+            punkfs::StoreError::Local(libc::EOPNOTSUPP) | punkfs::StoreError::Local(libc::EPERM)
+        ) {
+            eprintln!("skipping xattr correlation: backing does not support user xattrs");
+        } else {
+            panic!("set xattr: {err:?}");
+        }
+    } else {
+        assert_eq!(
+            store
+                .get_xattr_in(&context, "/hello.txt", b"user.correlation")
+                .unwrap(),
+            b"test"
+        );
+        store.list_xattr_in(&context, "/hello.txt").unwrap();
+        store
+            .remove_xattr_in(&context, "/hello.txt", b"user.correlation")
+            .unwrap();
+    }
+    let ids = server.ids();
+    assert!(ids.len() >= 2);
+    assert!(
+        ids.iter().all(|id| id == &context.id().to_string()),
+        "context lost: {ids:?}"
+    );
+}
+
 /// Concurrent store operations keep their ids separate — no leak, no reuse.
 #[test]
 fn functional_concurrent_store_operations_keep_separate_ids() {

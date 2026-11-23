@@ -2,26 +2,14 @@
 //! that turns a catalog entry into the `FileAttr` the kernel sees.
 use std::ffi::OsStr;
 use std::path::Path;
-use std::time::SystemTime;
 
 use fuser::FileAttr;
 use fuser::FileType;
 use fuser::INodeNo;
 
 use super::error::{OpError, OpResult};
-use crate::store::db::attributes::{FileAttrData, FsEntryKind};
 use crate::store::StoreApi;
-
-/// Sentinel for "the server did not tell us" on a timestamp. Entry times
-/// are stored as whole seconds since the epoch, so the epoch itself is the
-/// only value that can be treated as absent.
-fn time_or_now(secs: SystemTime) -> SystemTime {
-    if secs == SystemTime::UNIX_EPOCH {
-        SystemTime::now()
-    } else {
-        secs
-    }
-}
+use crate::store::db::attributes::{FileAttrData, FsEntryKind};
 
 /// Convert catalog kind to the `FileType` the kernel is told.
 ///
@@ -32,30 +20,19 @@ pub(crate) fn file_type(kind: FsEntryKind) -> FileType {
     match kind {
         FsEntryKind::Directory => FileType::Directory,
         FsEntryKind::Link => FileType::Symlink,
+        FsEntryKind::Fifo => FileType::NamedPipe,
+        FsEntryKind::Socket => FileType::Socket,
+        FsEntryKind::BlockDevice => FileType::BlockDevice,
+        FsEntryKind::CharDevice => FileType::CharDevice,
         FsEntryKind::Unknown | FsEntryKind::File => FileType::RegularFile,
     }
 }
 
 /// Build the attr we serve for an entry.
 ///
-/// Stored values win; anything the catalog has not told us is synthesized
-/// so an entry never looks unusable (a mode of 0000 would make files
-/// unopenable):
-///
-/// | field | source | fallback |
-/// |---|---|---|
-/// | size, blocks, flags | `stat` | kept as stored (0 is meaningful) |
-/// | perm | `access.mode` | 0o777 |
-/// | uid/gid | `access` | the *caller's* ids |
-/// | nlink | `stat.nlink` | 2 for dirs (self + `..`), else 1 |
-/// | times | `times` | now |
-/// | block_size/rdev | `stat` | 512 / 0 |
-pub(crate) fn attr_from(
-    inode: u64,
-    attr: &FileAttrData,
-    uid: u32,
-    gid: u32,
-) -> FileAttr {
+/// Zero permission bits, user/group IDs, and epoch timestamps are real
+/// values, not sentinels. The backing attributes are therefore preserved.
+pub(crate) fn attr_from(inode: u64, attr: &FileAttrData, _uid: u32, _gid: u32) -> FileAttr {
     let kind = file_type(attr.kind);
     let nlink = match attr.stat.nlink {
         0 if kind == FileType::Directory => 2,
@@ -67,28 +44,16 @@ pub(crate) fn attr_from(
         ino: INodeNo(inode),
         size: attr.stat.size,
         blocks: attr.stat.blocks as u64,
-        atime: time_or_now(attr.times.accessed),
-        mtime: time_or_now(attr.times.modified),
-        ctime: time_or_now(attr.times.changed),
-        crtime: time_or_now(attr.times.created),
+        atime: attr.times.accessed,
+        mtime: attr.times.modified,
+        ctime: attr.times.changed,
+        crtime: attr.times.created,
         kind,
-        perm: if attr.access.mode == 0 {
-            0o777
-        } else {
-            attr.access.mode
-        },
+        perm: attr.access.mode,
         nlink,
-        uid: if attr.access.uid == 0 {
-            uid
-        } else {
-            attr.access.uid
-        },
-        gid: if attr.access.gid == 0 {
-            gid
-        } else {
-            attr.access.gid
-        },
-        rdev: attr.stat.rdev as u32,
+        uid: attr.access.uid,
+        gid: attr.access.gid,
+        rdev: attr.stat.rdev,
         blksize: if attr.stat.block_size == 0 {
             512
         } else {
@@ -140,7 +105,10 @@ pub(crate) fn child_path(parent: &str, name: &OsStr) -> OpResult<String> {
     }
 
     let joined = Path::new(parent).join(name);
-    joined.to_str().map(str::to_owned).ok_or(OpError::InvalidInput)
+    joined
+        .to_str()
+        .map(str::to_owned)
+        .ok_or(OpError::InvalidInput)
 }
 
 #[cfg(test)]
@@ -183,8 +151,6 @@ mod tests {
         let defaults = attr_from(7, &attr_data(FsEntryKind::File), 1000, 1001);
         assert_eq!(defaults.ino, INodeNo(7));
         assert_eq!(defaults.kind, FileType::RegularFile);
-        assert_eq!(defaults.perm, 0o777);
-        assert_eq!((defaults.uid, defaults.gid), (1000, 1001));
         assert_eq!(defaults.nlink, 1);
         assert_eq!(defaults.blksize, 512);
 
@@ -216,17 +182,13 @@ mod tests {
         assert_eq!(file_type(FsEntryKind::File), FileType::RegularFile);
     }
 
-    /// A directory defaults to two links and epoch times become "now", so
-    /// nothing the server left unset shows up as 1970.
+    /// A directory without an explicit link count defaults to two links.
     #[test]
-    fn defaults_for_dirs_and_epoch_times() {
+    fn defaults_for_dirs_and_stored_times() {
         assert_eq!(
             attr_from(1, &attr_data(FsEntryKind::Directory), 0, 0).nlink,
             2
         );
-        let attr = attr_from(1, &attr_data(FsEntryKind::File), 0, 0);
-        assert!(attr.mtime > UNIX_EPOCH + Duration::from_secs(1_000_000));
-
         let mut data = attr_data(FsEntryKind::File);
         data.times = FileTimes::from_secs(1, 2, 3, 4);
         let carried = attr_from(1, &data, 0, 0);

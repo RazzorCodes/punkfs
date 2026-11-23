@@ -87,6 +87,26 @@ fn smoke_remove_drops_the_subtree_only() {
     assert!(cache.get_inode("/").is_some(), "root is untouched");
 }
 
+#[test]
+fn smoke_exchange_swaps_cached_subtrees_and_keeps_inodes() {
+    let mut cache = MetadataCache::new();
+    cache.insert_root("/", "root", FsEntryKind::Directory);
+    cache.upsert_entry(dir("/docs", "docs"));
+    cache.upsert_entry(dir("/docs/sub", "sub"));
+    cache.upsert_entry(file("/docs/sub/b", "b"));
+    cache.upsert_entry(dir("/other", "other"));
+    cache.upsert_entry(file("/other/file", "other-file"));
+    let docs = cache.get_inode("/docs").unwrap();
+    let nested = cache.get_inode("/docs/sub/b").unwrap();
+    let other = cache.get_inode("/other").unwrap();
+    let other_file = cache.get_inode("/other/file").unwrap();
+    cache.exchange_entries("/docs", "/other");
+    assert_eq!(cache.get_inode("/other"), Some(docs));
+    assert_eq!(cache.get_inode("/other/sub/b"), Some(nested));
+    assert_eq!(cache.get_inode("/docs"), Some(other));
+    assert_eq!(cache.get_inode("/docs/file"), Some(other_file));
+}
+
 /// `FsEntryKind` maps to the attr shapes: a directory vs file vs link are
 /// distinct kinds that the attr translation later turns into kernel types.
 #[test]
@@ -122,8 +142,14 @@ fn smoke_answered_node_only_drops_its_own_stale_entries() {
     cache.reconcile_from(
         "/",
         vec![
-            ("node-a".to_owned(), ListingOutcome::Answered(vec![owned("/a.txt", "node-a")])),
-            ("node-b".to_owned(), ListingOutcome::Answered(vec![owned("/b.txt", "node-b")])),
+            (
+                "node-a".to_owned(),
+                ListingOutcome::Answered(vec![owned("/a.txt", "node-a")]),
+            ),
+            (
+                "node-b".to_owned(),
+                ListingOutcome::Answered(vec![owned("/b.txt", "node-b")]),
+            ),
         ],
     );
 
@@ -132,8 +158,14 @@ fn smoke_answered_node_only_drops_its_own_stale_entries() {
         "/",
         vec![("node-b".to_owned(), ListingOutcome::Answered(vec![]))],
     );
-    assert!(cache.get_inode("/b.txt").is_none(), "node-b's stale entry is gone");
-    assert!(cache.get_inode("/a.txt").is_some(), "node-a's entry must survive node-b's listing");
+    assert!(
+        cache.get_inode("/b.txt").is_none(),
+        "node-b's stale entry is gone"
+    );
+    assert!(
+        cache.get_inode("/a.txt").is_some(),
+        "node-a's entry must survive node-b's listing"
+    );
 }
 
 /// An unreachable node's entries are kept and marked impossible to read, so

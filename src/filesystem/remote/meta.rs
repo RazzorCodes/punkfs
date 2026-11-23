@@ -1,18 +1,8 @@
 //! Metadata and namespace-mutating operations: setattr, unlink, rmdir,
 //! rename, statfs.
 //!
-//! Deliberately absent this iteration:
-//!
-//! - **Remote creation** — local creation is handled by the passthrough
-//!   layer, not the remote backing store.
-//! - **Ownership changes** — refused by the backend rather than silently
-//!   ignored.
-//!
-//! `setattr` is *refused* for now: it is not that punkfs will never apply
-//! metadata changes, but until write-through metadata semantics are
-//! settled, answering with a recoverable `ENOSYS` is better than
-//! pretending a truncate or chmod took effect. The backend rpc exists and
-//! is tested; only this layer declines to use it.
+//! Namespace creation is handled by the local passthrough layer. Attribute
+//! changes are routed to the owning backing store.
 use std::ffi::OsStr;
 use std::time::SystemTime;
 
@@ -34,9 +24,8 @@ use crate::store::db::attributes::FsEntryKind;
 use crate::store::{StatFs, StoreApi};
 
 /// Apply the requested attribute changes to `ino`; returns the new attrs.
-///
-/// `fh` is present for `ftruncate`; it is ignored because content rpcs are
-/// positional and the server keys by path.
+/// Handle-based identity guarantees, including `ftruncate` after rename or
+/// unlink, remain deferred.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn setattr_decision(
     store: &dyn StoreApi,
@@ -55,16 +44,75 @@ pub(crate) fn setattr_decision(
     bkuptime: Option<SystemTime>,
     flags: Option<BsdFileFlags>,
 ) -> OpResult<FileAttr> {
-    let _path = helpers::path_of(store, ino)?;
-
-    // Refused wholesale for now, so every field is unused on purpose. A
-    // caller sees ENOSYS and knows the change did not happen, which beats a
-    // silent no-op that looks like success.
-    let _ = (
-        mode, uid_change, gid_change, size, atime, mtime, ctime, crtime, chgtime, bkuptime, flags,
-        store, uid, gid,
+    let path = helpers::path_of(store, ino)?;
+    if ctime.is_some()
+        || crtime.is_some()
+        || chgtime.is_some()
+        || bkuptime.is_some()
+        || flags.is_some()
+    {
+        return Err(OpError::Unsupported);
+    }
+    let split_time = |time: Option<TimeOrNow>| -> OpResult<(Option<i64>, Option<u32>)> {
+        let Some(time) = time else {
+            return Ok((None, None));
+        };
+        let time = match time {
+            TimeOrNow::SpecificTime(t) => t,
+            TimeOrNow::Now => SystemTime::now(),
+        };
+        // fuser 0.18 decodes a negative timespec as epoch - (|sec| +
+        // nsec), instead of epoch + sec + nsec. Invert that conversion
+        // here; remove this workaround when upgrading to fuser >= 0.19.
+        if let Err(e) = time.duration_since(SystemTime::UNIX_EPOCH) {
+            let d = e.duration();
+            let secs = i64::try_from(d.as_secs()).map_err(|_| OpError::InvalidInput)?;
+            return Ok((Some(-secs), Some(d.subsec_nanos())));
+        }
+        let d = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("negative time handled above");
+        Ok((
+            Some(i64::try_from(d.as_secs()).map_err(|_| OpError::InvalidInput)?),
+            Some(d.subsec_nanos()),
+        ))
+    };
+    let (accessed_unix, accessed_nanos) = split_time(atime)?;
+    let (modified_unix, modified_nanos) = split_time(mtime)?;
+    let result = store.setattr(
+        &path,
+        crate::store::SetattrChanges {
+            mode,
+            uid: uid_change,
+            gid: gid_change,
+            size,
+            accessed_unix,
+            modified_unix,
+            accessed_nanos,
+            modified_nanos,
+        },
     );
-    Err(OpError::Unsupported)
+    if let (Some(ctx), Some(logger)) = (store.operation_context(), crate::telemetry::global()) {
+        let severity = if result.is_ok() {
+            crate::telemetry::Severity::Debug
+        } else {
+            crate::telemetry::Severity::Warning
+        };
+        if logger.enabled(severity) {
+            let mut event = crate::telemetry::Event::new(
+                severity,
+                "filesystem.remote",
+                "attribute operation completed",
+            );
+            event.operation = Some("setattr".into());
+            event.fields.insert(
+                "outcome".into(),
+                serde_json::json!(if result.is_ok() { "ok" } else { "error" }),
+            );
+            logger.emit_in(ctx, event);
+        }
+    }
+    Ok(helpers::attr_from(ino, &result?, uid, gid))
 }
 
 /// Remove the file `parent`/`name`.
@@ -122,13 +170,21 @@ pub(crate) fn rename_decision(
     let inode = store.get_inode(&old_path).ok_or(OpError::NotFound)?;
     let source = store.get_entry(inode).ok_or(OpError::NotFound)?;
 
-    if source.kind != FsEntryKind::Directory {
-        let _ = store.ensure_listed(&new_parent);
+    if source.kind != FsEntryKind::Directory || flags.contains(RenameFlags::RENAME_EXCHANGE) {
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            store.ensure_listed(&new_parent)?;
+            if store.has_conflict(&old_path) || store.has_conflict(&new_path) {
+                return Err(OpError::Local(libc::EIO));
+            }
+        } else {
+            let _ = store.ensure_listed(&new_parent);
+        }
         let owner = store.owner_of(&old_path).ok_or(OpError::NotFound)?;
         match store.owner_of(&new_path) {
             // Renaming in place on the same node.
             Some(dest_owner) if dest_owner == owner => {}
             // The destination is new: it is created on the source's node.
+            None if flags.contains(RenameFlags::RENAME_EXCHANGE) => return Err(OpError::NotFound),
             None => {}
             Some(_) => return Err(OpError::CrossDevice),
         }
@@ -252,45 +308,6 @@ mod tests {
         store
     }
 
-    /// Every setattr is deliberately refused right now (write-through
-    /// metadata is unsettled), and a refused request must never reach the
-    /// backend.
-    #[test]
-    fn setattr_is_refused_and_never_reaches_the_backend() {
-        let store = seeded();
-        let err = setattr_decision(
-            &store, 5, 6, 3, Some(0o600), None, None, None, None, None, None, None, None, None,
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(err, OpError::Unsupported);
-        assert_eq!(err.errno(), fuser::Errno::ENOSYS);
-        assert!(store.calls().setattr.is_empty());
-
-        // Truncation and ownership changes are refused the same way, and a
-        // missing inode is still reported as not-found before the refusal.
-        for (mode, ownership, size) in [
-            (None, None, Some(10u64)),
-            (None, Some(1000u32), None),
-        ] {
-            let err = setattr_decision(
-                &store, 0, 0, 3, mode, ownership, None, size, None, None, None, None, None, None,
-                None,
-            )
-            .unwrap_err();
-            assert_eq!(err, OpError::Unsupported);
-        }
-        assert!(store.calls().setattr.is_empty());
-        assert_eq!(
-            setattr_decision(
-                &store, 0, 0, 99, Some(0o600), None, None, None, None, None, None, None, None,
-                None, None,
-            )
-            .unwrap_err(),
-            OpError::NotFound
-        );
-    }
-
     /// unlink/rmdir join parent+name into a path and delegate to the store;
     /// a non-empty directory is refused locally before the store is asked.
     #[test]
@@ -330,13 +347,24 @@ mod tests {
         .unwrap();
         assert_eq!(
             store.calls().rename,
-            vec![("/docs/a.txt".to_string(), "/b.txt".to_string(), RenameFlags::empty())]
+            vec![(
+                "/docs/a.txt".to_string(),
+                "/b.txt".to_string(),
+                RenameFlags::empty()
+            )]
         );
 
         let flags = RenameFlags::RENAME_NOREPLACE;
         let passthrough = seeded();
-        rename_decision(&passthrough, 2, OsStr::new("a.txt"), 2, OsStr::new("b"), flags)
-            .unwrap();
+        rename_decision(
+            &passthrough,
+            2,
+            OsStr::new("a.txt"),
+            2,
+            OsStr::new("b"),
+            flags,
+        )
+        .unwrap();
         assert_eq!(passthrough.calls().rename[0].2, flags);
     }
 

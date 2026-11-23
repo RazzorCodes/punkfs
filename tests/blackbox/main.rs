@@ -195,6 +195,8 @@ posix_contracts! {
     blackbox_remote_truncate => truncate;
     blackbox_remote_chmod => mode;
     blackbox_remote_nanosecond_timestamps => timestamps;
+    blackbox_remote_epoch_timestamp_is_preserved => epoch_timestamp;
+    blackbox_remote_pre_epoch_timestamp_and_omit => timestamp_before_epoch_and_omit;
     blackbox_open_handle_after_unlink => open_handle_unlink;
     blackbox_open_handle_after_rename => open_handle_rename;
     blackbox_open_handle_after_destination_replacement => open_handle_replaced_destination;
@@ -205,7 +207,9 @@ posix_contracts! {
     blackbox_hard_links_share_identity => hard_link;
     blackbox_local_hard_links_share_identity => local_hard_link;
     blackbox_fifo_is_a_fifo => fifo;
+    blackbox_fifo_transfers_bytes => fifo_exchange;
     blackbox_user_extended_attributes_round_trip => xattr;
+    blackbox_xattr_flags_and_buffers_match_linux => xattr_flags_and_buffers;
     blackbox_list_extended_attributes => xattr_list;
     blackbox_posix_acl_round_trips => acl_roundtrip;
     blackbox_non_utf8_filename_round_trips => byte_filename;
@@ -219,6 +223,133 @@ posix_contracts! {
     blackbox_rename_nonempty_directory_preserves_both => rename_nonempty;
     blackbox_rename_noreplace_preserves_existing_file => rename_noreplace;
     blackbox_rename_exchange_swaps_files => rename_exchange;
+}
+
+#[test]
+fn blackbox_cross_owner_exchange_is_refused_without_data_loss() {
+    use std::os::unix::ffi::OsStrExt;
+    if !require_fuse() {
+        return;
+    }
+    let addrs = addresses(2);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("remote"), b"remote").unwrap();
+    std::fs::write(second.path().join("local"), b"local").unwrap();
+    let mut a = Node::start("a", first, addrs[0], &[("b".into(), addrs[1])]);
+    let mut b = Node::start("b", second, addrs[1], &[("a".into(), addrs[0])]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(b.path().join("remote")).is_err() {
+        assert!(Instant::now() < deadline, "remote file not visible");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let local = std::ffi::CString::new(b.path().join("local").as_os_str().as_bytes()).unwrap();
+    let remote = std::ffi::CString::new(b.path().join("remote").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                local.as_ptr(),
+                libc::AT_FDCWD,
+                remote.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EXDEV)
+    );
+    assert_eq!(std::fs::read(b.path().join("local")).unwrap(), b"local");
+    assert_eq!(std::fs::read(a.path().join("remote")).unwrap(), b"remote");
+    b.stop();
+    a.stop();
+}
+
+#[test]
+fn blackbox_remote_exchange_directories_keeps_subtree_inodes() {
+    if !require_fuse() {
+        return;
+    }
+    let addrs = addresses(2);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for (name, value) in [
+        ("exchange-left", b"left".as_slice()),
+        ("exchange-right", b"right".as_slice()),
+    ] {
+        let path = first.path().join(name).join("nested");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("file"), value).unwrap();
+    }
+    let mut a = Node::start("a", first, addrs[0], &[("b".into(), addrs[1])]);
+    let mut b = Node::start("b", second, addrs[1], &[("a".into(), addrs[0])]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(b.path().join("exchange-left/nested/file")).is_err() {
+        assert!(Instant::now() < deadline, "directory not visible");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    posix_contract::rename_exchange_directories(b.path());
+    b.stop();
+    a.stop();
+}
+
+#[test]
+fn blackbox_remote_fifo_receives_owner_backing_bytes() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    if !require_fuse() {
+        return;
+    }
+    let addrs = addresses(2);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let path = first.path().join("preseeded-fifo");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    // Pin the owner's original backing directory before its node covers it.
+    let backing = std::fs::File::open(first.path()).unwrap();
+    let mut a = Node::start("a", first, addrs[0], &[("b".into(), addrs[1])]);
+    let mut b = Node::start("b", second, addrs[1], &[("a".into(), addrs[0])]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::symlink_metadata(b.path().join("preseeded-fifo")).is_err() {
+        assert!(Instant::now() < deadline, "FIFO not published");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let owner = std::thread::spawn(move || {
+        let path = format!("/proc/self/fd/{}/preseeded-fifo", backing.as_raw_fd());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(mut writer) => {
+                    writer.write_all(b"message").unwrap();
+                    break true;
+                }
+                Err(err)
+                    if err.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => break false,
+            }
+        }
+    });
+    let result = std::panic::catch_unwind(|| posix_contract::fifo_read_preseeded(b.path()));
+    let wrote = owner.join().unwrap();
+    b.stop();
+    a.stop();
+    result.unwrap();
+    assert!(
+        wrote,
+        "owner's backing writer must connect to remote reader"
+    );
 }
 
 #[test]

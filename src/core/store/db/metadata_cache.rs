@@ -387,6 +387,23 @@ impl MetadataCache {
         moved
     }
 
+    /// Exchange two cached subtrees without changing their inode identities.
+    pub fn exchange_entries(&mut self, old: &str, new: &str) {
+        let old_prefix = format!("{}/", old.trim_end_matches('/'));
+        let new_prefix = format!("{}/", new.trim_end_matches('/'));
+        for entry in &mut self.entries {
+            if entry.path == old {
+                entry.path = new.to_owned();
+            } else if entry.path == new {
+                entry.path = old.to_owned();
+            } else if let Some(rest) = entry.path.strip_prefix(&old_prefix) {
+                entry.path = format!("{}/{rest}", new.trim_end_matches('/'));
+            } else if let Some(rest) = entry.path.strip_prefix(&new_prefix) {
+                entry.path = format!("{}/{rest}", old.trim_end_matches('/'));
+            }
+        }
+    }
+
     /// Forget everything cached below `path`, keeping `path` itself.
     ///
     /// Called after a mutation so the next `readdir` refetches instead of

@@ -40,7 +40,7 @@ impl FileTimes {
 /// Ownership and permission bits (`chmod`/`chown` territory).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Access {
-    /// Permission bits, e.g. `0o755`. Zero means "unknown", not "no access".
+    /// Permission bits, e.g. `0o755`. Zero is a valid mode.
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
@@ -53,7 +53,7 @@ pub struct Stat {
     pub blocks: u32,
     pub block_size: u16,
     /// Device number, only meaningful for device nodes.
-    pub rdev: u16,
+    pub rdev: u32,
     pub nlink: u32,
     /// BSD-style file flags.
     pub flags: u32,
@@ -81,6 +81,10 @@ pub enum FsEntryKind {
     Directory,
     File,
     Link,
+    Fifo,
+    Socket,
+    BlockDevice,
+    CharDevice,
 }
 
 /// Stat-shaped metadata for any entry kind, despite the `FileAttrData` name.

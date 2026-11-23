@@ -168,6 +168,58 @@ impl Local {
         result
     }
 
+    pub(crate) fn create_special(
+        &self,
+        store: &dyn StoreApi,
+        ctx: &OperationContext,
+        path: &str,
+        mode: u32,
+        rdev: u32,
+    ) -> Result<u64, StoreError> {
+        use std::os::unix::ffi::OsStrExt;
+        let result = (|| {
+            let _guard = self.mutation.lock().unwrap();
+            let parent = path
+                .rsplit_once('/')
+                .map(|(p, _)| if p.is_empty() { "/" } else { p })
+                .unwrap_or("/");
+            self.refresh_listing(store, ctx, parent)?;
+            if store.get_inode(path).is_some() {
+                return Err(StoreError::Local(libc::EEXIST));
+            }
+            self.ensure_parents(path)?;
+            let real = self.backing.entry_path(path).map_err(error)?;
+            let name = std::ffi::CString::new(real.as_os_str().as_bytes())
+                .map_err(|_| StoreError::Local(libc::EINVAL))?;
+            if unsafe { libc::mknod(name.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t) } != 0
+            {
+                return Err(error(io::Error::last_os_error()));
+            }
+            match self
+                .entry(path)
+                .and_then(|entry| store.upsert_local_in(ctx, entry))
+            {
+                Ok(inode) => {
+                    if let Some(publisher) = self.publisher.lock().unwrap().as_ref() {
+                        publisher.created(ctx, path);
+                    }
+                    Ok(inode)
+                }
+                Err(err) => {
+                    let rollback = fs::remove_file(&real).map_err(error);
+                    self.log(ctx, "mknod_rollback", &rollback);
+                    Err(err)
+                }
+            }
+        })();
+        self.log(
+            ctx,
+            "mknod",
+            &result.as_ref().map(|_| ()).map_err(Clone::clone),
+        );
+        result
+    }
+
     pub(crate) fn create(
         &self,
         store: &dyn StoreApi,
@@ -334,6 +386,58 @@ impl StoreApi for RoutedStore {
         let result = self.local.backing.fsync(p, datasync).map_err(error);
         self.result("fsync", result)
     }
+    fn get_xattr(&self, p: &str, n: &[u8]) -> Result<Vec<u8>, StoreError> {
+        self.check_conflict(p)?;
+        if !self.local(p) {
+            return self.inner.get_xattr_in(&self.ctx, p, n);
+        }
+        let result = self
+            .local
+            .backing
+            .entry_path(p)
+            .map_err(error)
+            .and_then(|path| crate::core::xattr::get(&path, n).map_err(error));
+        self.result("getxattr", result)
+    }
+    fn list_xattr(&self, p: &str) -> Result<Vec<u8>, StoreError> {
+        self.check_conflict(p)?;
+        if !self.local(p) {
+            return self.inner.list_xattr_in(&self.ctx, p);
+        }
+        let result = self
+            .local
+            .backing
+            .entry_path(p)
+            .map_err(error)
+            .and_then(|path| crate::core::xattr::list(&path).map_err(error));
+        self.result("listxattr", result)
+    }
+    fn set_xattr(&self, p: &str, n: &[u8], v: &[u8], f: i32) -> Result<(), StoreError> {
+        self.check_conflict(p)?;
+        if !self.local(p) {
+            return self.inner.set_xattr_in(&self.ctx, p, n, v, f);
+        }
+        let result = self
+            .local
+            .backing
+            .entry_path(p)
+            .map_err(error)
+            .and_then(|path| crate::core::xattr::set(&path, n, v, f).map_err(error));
+        self.result("setxattr", result)
+    }
+    fn remove_xattr(&self, p: &str, n: &[u8]) -> Result<(), StoreError> {
+        self.check_conflict(p)?;
+        if !self.local(p) {
+            return self.inner.remove_xattr_in(&self.ctx, p, n);
+        }
+        let result = self
+            .local
+            .backing
+            .entry_path(p)
+            .map_err(error)
+            .and_then(|path| crate::core::xattr::remove(&path, n).map_err(error));
+        self.result("removexattr", result)
+    }
     fn setattr(
         &self,
         p: &str,
@@ -420,14 +524,6 @@ impl StoreApi for RoutedStore {
         {
             return self.result("rename", Err(StoreError::Local(libc::EXDEV)));
         }
-        if flags.contains(fuser::RenameFlags::RENAME_EXCHANGE) {
-            return self.result(
-                "rename",
-                Err(StoreError::Unsupported(
-                    "local exchange rename is not supported".into(),
-                )),
-            );
-        }
         let result = (|| {
             let _guard = self.local.mutation.lock().unwrap();
             self.local.ensure_parents(new)?;
@@ -436,7 +532,11 @@ impl StoreApi for RoutedStore {
                 &self.local.backing.entry_path(new).map_err(error)?,
                 flags,
             )?;
-            self.inner.rename_local_in(&self.ctx, old, new)
+            if flags.contains(fuser::RenameFlags::RENAME_EXCHANGE) {
+                self.inner.exchange_local_in(&self.ctx, old, new)
+            } else {
+                self.inner.rename_local_in(&self.ctx, old, new)
+            }
         })();
         self.result("rename", result)
     }

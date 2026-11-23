@@ -67,6 +67,66 @@ pub fn timestamps(root: &Path) {
     );
 }
 
+pub fn timestamp_before_epoch_and_omit(root: &Path) {
+    let path = cpath(&root.join("data"));
+    let initial = [
+        libc::timespec {
+            tv_sec: 100,
+            tv_nsec: 123_456_789,
+        },
+        libc::timespec {
+            tv_sec: 200,
+            tv_nsec: 987_654_321,
+        },
+    ];
+    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), initial.as_ptr(), 0) } != 0 {
+        last_error("set initial timestamps");
+    }
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: -2,
+            tv_nsec: 750_000_000,
+        },
+    ];
+    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0 {
+        last_error("set pre-epoch mtime");
+    }
+    let meta = fs::metadata(root.join("data")).unwrap();
+    assert_eq!(
+        (meta.atime(), meta.atime_nsec()),
+        (100, 123_456_789),
+        "omitted atime must be preserved"
+    );
+    assert_eq!(
+        (meta.mtime(), meta.mtime_nsec()),
+        (-2, 750_000_000),
+        "pre-epoch mtime must retain nanoseconds"
+    );
+}
+
+pub fn epoch_timestamp(root: &Path) {
+    let path = cpath(&root.join("data"));
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    ];
+    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0 {
+        last_error("set epoch timestamps");
+    }
+    let meta = fs::metadata(root.join("data")).unwrap();
+    assert_eq!((meta.mtime(), meta.mtime_nsec()), (0, 0));
+}
+
 pub fn open_handle_unlink(root: &Path) {
     let path = root.join("data");
     let mut file = OpenOptions::new()
@@ -286,6 +346,67 @@ pub fn seed_xattr(path: &Path) -> std::io::Result<()> {
     }
 }
 
+pub fn fifo_exchange(root: &Path) {
+    // Nonblocking open and poll keep a broken implementation bounded instead
+    // of hanging the FUSE daemon or the entire test suite.
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = root.join("fifo-stream");
+    let c = cpath(&path);
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+        last_error("create FIFO");
+    }
+    let mut reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .expect("open FIFO reader");
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .expect("open FIFO writer with reader");
+    writer.write_all(b"message").expect("write to FIFO");
+    let mut pfd = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut pfd, 1, 1000) },
+        1,
+        "FIFO must become readable"
+    );
+    let mut data = [0u8; 7];
+    reader.read_exact(&mut data).expect("read FIFO bytes");
+    assert_eq!(&data, b"message");
+}
+
+pub fn fifo_read_preseeded(root: &Path) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(root.join("preseeded-fifo"))
+        .expect("open remote FIFO reader");
+    let mut pfd = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&mut pfd, 1, 1500) },
+        1,
+        "remote FIFO must deliver backing writer data"
+    );
+    let mut data = [0u8; 7];
+    reader
+        .read_exact(&mut data)
+        .expect("read FIFO bytes written on the owner");
+    assert_eq!(&data, b"message");
+}
+
 pub fn fifo(root: &Path) {
     let path = root.join("fifo");
     let c = cpath(&path);
@@ -351,6 +472,81 @@ pub fn xattr(root: &Path) {
     if unsafe { libc::removexattr(path.as_ptr(), c"user.punkfs_test".as_ptr()) } != 0 {
         last_error("removexattr");
     }
+}
+
+pub fn xattr_flags_and_buffers(root: &Path) {
+    let probe = tempfile::tempdir().unwrap();
+    let p = probe.path().join("file");
+    fs::write(&p, b"").unwrap();
+    if let Err(error) = set_xattr(&p, b"probe") {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::EPERM)
+        ) {
+            eprintln!("skipping xattr flags contract: backing filesystem unsupported ({error})");
+            return;
+        }
+        panic!("xattr capability probe failed: {error}");
+    }
+    let path = cpath(&root.join("data"));
+    let name = c"user.flags_test";
+    let set = |value: &[u8], flags| unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            flags,
+        )
+    };
+    assert_eq!(set(b"", libc::XATTR_REPLACE), -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENODATA)
+    );
+    assert_eq!(set(b"hello", libc::XATTR_CREATE), 0);
+    assert_eq!(set(b"again", libc::XATTR_CREATE), -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EEXIST)
+    );
+    assert_eq!(
+        unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+        5
+    );
+    let mut tiny = [0u8; 1];
+    assert_eq!(
+        unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                tiny.as_mut_ptr().cast(),
+                tiny.len(),
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ERANGE)
+    );
+    assert_eq!(set(b"", libc::XATTR_REPLACE), 0);
+    assert_eq!(
+        unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENODATA)
+    );
 }
 
 pub fn xattr_list(root: &Path) {
@@ -599,6 +795,41 @@ pub fn rename_exchange(root: &Path) {
     }
     assert_eq!(fs::read(root.join("data")).unwrap(), b"other");
     assert_eq!(fs::read(root.join("other")).unwrap(), b"abcdef");
+}
+
+pub fn rename_exchange_directories(root: &Path) {
+    let left = root.join("exchange-left");
+    let right = root.join("exchange-right");
+    let left_ino = fs::metadata(&left).unwrap().ino();
+    let right_ino = fs::metadata(&right).unwrap().ino();
+    let left_file = fs::metadata(left.join("nested/file")).unwrap().ino();
+    let right_file = fs::metadata(right.join("nested/file")).unwrap().ino();
+    let left_c = cpath(&left);
+    let right_c = cpath(&right);
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            left_c.as_ptr(),
+            libc::AT_FDCWD,
+            right_c.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc != 0 {
+        last_error("exchange directories");
+    }
+    assert_eq!(fs::read(left.join("nested/file")).unwrap(), b"right");
+    assert_eq!(fs::read(right.join("nested/file")).unwrap(), b"left");
+    assert_eq!(fs::metadata(&left).unwrap().ino(), right_ino);
+    assert_eq!(fs::metadata(&right).unwrap().ino(), left_ino);
+    assert_eq!(
+        fs::metadata(left.join("nested/file")).unwrap().ino(),
+        right_file
+    );
+    assert_eq!(
+        fs::metadata(right.join("nested/file")).unwrap().ino(),
+        left_file
+    );
 }
 
 pub fn concurrent_create_exclusive(root: &Path) {

@@ -36,6 +36,10 @@ service PunkFs {
 
   // Apply attribute changes. Fields left unset are not modified.
   rpc SetAttr(SetAttrRequest) returns (SetAttrResponse);
+  rpc GetXattr(XattrRequest) returns (XattrResponse);
+  rpc ListXattr(XattrRequest) returns (XattrResponse);
+  rpc SetXattr(XattrRequest) returns (XattrResponse);
+  rpc RemoveXattr(XattrRequest) returns (XattrResponse);
 
   // Aggregate capacity of the backing storage.
   rpc StatFs(StatFsRequest) returns (StatFsResponse);
@@ -87,15 +91,22 @@ enum FileKind {
   FILE_KIND_FILE = 1;
   FILE_KIND_DIRECTORY = 2;
   FILE_KIND_SYMLINK = 3;
+  FILE_KIND_FIFO = 4;
+  FILE_KIND_SOCKET = 5;
+  FILE_KIND_BLOCK_DEVICE = 6;
+  FILE_KIND_CHAR_DEVICE = 7;
 }
 
-// Seconds-resolution timestamps. Nanoseconds are reserved for a later
-// revision rather than guessed at now.
+// Timestamps use signed seconds plus nonnegative nanoseconds.
 message FileTimes {
   int64 accessed_unix = 1;
   int64 modified_unix = 2;
   int64 changed_unix = 3;
   int64 created_unix = 4;
+  uint32 accessed_nanos = 5;
+  uint32 modified_nanos = 6;
+  uint32 changed_nanos = 7;
+  uint32 created_nanos = 8;
 }
 
 // Ownership and permission bits.
@@ -204,15 +215,23 @@ message SetAttrRequest {
   optional uint64 size = 3;
   optional int64 accessed_unix = 4;
   optional int64 modified_unix = 5;
-  // Ownership changes are refused by the local backend for now; the
-  // fields exist so the refusal is explicit rather than a silent drop.
   optional uint32 uid = 6;
   optional uint32 gid = 7;
+  optional uint32 accessed_nanos = 8;
+  optional uint32 modified_nanos = 9;
 }
 
 message SetAttrResponse {
   FileAttr attr = 1;
 }
+
+message XattrRequest {
+  string path = 1;
+  bytes name = 2;
+  bytes value = 3;
+  int32 flags = 4;
+}
+message XattrResponse { bytes value = 1; }
 
 // --- StatFs ----------------------------------------------------------------
 

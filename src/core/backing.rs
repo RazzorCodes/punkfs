@@ -6,7 +6,7 @@ use crate::store::db::attributes::{Access, FileAttrData, FileTimes, FsEntryKind,
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -274,6 +274,14 @@ impl Backing {
             FsEntryKind::Link
         } else if file_type.is_dir() {
             FsEntryKind::Directory
+        } else if file_type.is_fifo() {
+            FsEntryKind::Fifo
+        } else if file_type.is_socket() {
+            FsEntryKind::Socket
+        } else if file_type.is_block_device() {
+            FsEntryKind::BlockDevice
+        } else if file_type.is_char_device() {
+            FsEntryKind::CharDevice
         } else {
             FsEntryKind::File
         };
@@ -284,7 +292,16 @@ impl Backing {
             times: FileTimes {
                 accessed: meta.accessed().unwrap_or(UNIX_EPOCH),
                 modified: meta.modified().unwrap_or(UNIX_EPOCH),
-                changed: UNIX_EPOCH + Duration::from_secs(meta.ctime().max(0) as u64),
+                changed: {
+                    let secs = meta.ctime();
+                    let base = if secs >= 0 {
+                        UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
+                    } else {
+                        UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+                    };
+                    base.and_then(|t| t.checked_add(Duration::from_nanos(meta.ctime_nsec() as u64)))
+                        .unwrap_or(UNIX_EPOCH)
+                },
                 created: meta.created().unwrap_or(UNIX_EPOCH),
             },
             access: Access {
@@ -296,7 +313,7 @@ impl Backing {
                 size: meta.len(),
                 blocks: meta.blocks() as u32,
                 block_size: meta.blksize() as u16,
-                rdev: meta.rdev() as u16,
+                rdev: meta.rdev() as u32,
                 nlink: meta.nlink() as u32,
                 flags: 0,
             },

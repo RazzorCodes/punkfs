@@ -8,6 +8,25 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 pub(super) fn setattr(path: &Path, changes: SetattrChanges) -> Result<(), StoreError> {
+    if changes.accessed_nanos.is_some_and(|n| n >= 1_000_000_000)
+        || changes.modified_nanos.is_some_and(|n| n >= 1_000_000_000)
+    {
+        return Err(StoreError::Local(libc::EINVAL));
+    }
+    if changes.uid.is_some() || changes.gid.is_some() {
+        let raw = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| StoreError::Local(libc::EINVAL))?;
+        if unsafe {
+            libc::chown(
+                raw.as_ptr(),
+                changes.uid.unwrap_or(u32::MAX),
+                changes.gid.unwrap_or(u32::MAX),
+            )
+        } != 0
+        {
+            return Err(error(io::Error::last_os_error()));
+        }
+    }
     if let Some(mode) = changes.mode {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(error)?;
     }
@@ -22,11 +41,18 @@ pub(super) fn setattr(path: &Path, changes: SetattrChanges) -> Result<(), StoreE
     if changes.accessed_unix.is_some() || changes.modified_unix.is_some() {
         let raw = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| StoreError::Local(libc::EINVAL))?;
-        let time = |value: Option<i64>| libc::timespec {
+        let time = |value: Option<i64>, nanos: Option<u32>| libc::timespec {
             tv_sec: value.unwrap_or(0) as libc::time_t,
-            tv_nsec: if value.is_some() { 0 } else { libc::UTIME_OMIT },
+            tv_nsec: if value.is_some() {
+                nanos.unwrap_or(0) as libc::c_long
+            } else {
+                libc::UTIME_OMIT
+            },
         };
-        let times = [time(changes.accessed_unix), time(changes.modified_unix)];
+        let times = [
+            time(changes.accessed_unix, changes.accessed_nanos),
+            time(changes.modified_unix, changes.modified_nanos),
+        ];
         if unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) } != 0 {
             return Err(error(io::Error::last_os_error()));
         }
