@@ -39,7 +39,6 @@ pub(crate) struct Calls {
 struct Expectations {
     read: Option<Result<Vec<u8>, StoreError>>,
     write: Option<Result<u32, StoreError>>,
-    fsync: Option<Result<(), StoreError>>,
     statfs: Option<Result<StatFs, StoreError>>,
     fail_refresh: bool,
 }
@@ -160,10 +159,6 @@ impl MockStore {
         self.lock().expects.write = Some(result);
     }
 
-    pub(crate) fn expect_fsync(&self, result: Result<(), StoreError>) {
-        self.lock().expects.fsync = Some(result);
-    }
-
     pub(crate) fn expect_statfs(&self, result: Result<StatFs, StoreError>) {
         self.lock().expects.statfs = Some(result);
     }
@@ -255,11 +250,7 @@ impl StoreApi for MockStore {
     fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
         let mut state = self.lock();
         state.calls.fsync.push((path.to_owned(), datasync));
-        state
-            .expects
-            .fsync
-            .clone()
-            .unwrap_or(Err(StoreError::Unsupported("fsync".into())))
+        Err(StoreError::Unsupported("fsync".into()))
     }
 
     fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {

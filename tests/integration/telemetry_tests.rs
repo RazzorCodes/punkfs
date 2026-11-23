@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use punkfs::grpc::service::PunkFsService;
-use punkfs::punk_fs::ListDirectoryRequest;
-use punkfs::punk_fs::punk_fs_client::PunkFsClient;
 use punkfs::punk_fs::punk_fs_server::PunkFsServer;
 use punkfs::telemetry::{
     self, CORRELATION_HEADER, Config, Destination, OperationContext, Severity,
@@ -90,126 +88,6 @@ impl Drop for ObservedServer {
     }
 }
 
-#[test]
-fn grpc_ingress_validates_and_preserves_correlation() {
-    let server = ObservedServer::new();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let mut client = PunkFsClient::connect(server.url.clone()).await.unwrap();
-        let context = OperationContext::new();
-        let response = client
-            .list_directory(context.request(ListDirectoryRequest { path: "/".into() }))
-            .await
-            .unwrap();
-        assert_eq!(
-            response
-                .metadata()
-                .get(CORRELATION_HEADER)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            context.id().to_string()
-        );
-        let response = client
-            .list_directory(ListDirectoryRequest { path: "/".into() })
-            .await
-            .unwrap();
-        let generated = response
-            .metadata()
-            .get(CORRELATION_HEADER)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(uuid::Uuid::parse_str(generated).is_ok());
-        assert_ne!(generated, context.id().to_string());
-        let mut bad = Request::new(ListDirectoryRequest { path: "/".into() });
-        bad.metadata_mut()
-            .insert(CORRELATION_HEADER, "not-a-uuid".parse().unwrap());
-        assert_eq!(
-            client.list_directory(bad).await.unwrap_err().code(),
-            tonic::Code::InvalidArgument
-        );
-        let mut duplicate = context.request(ListDirectoryRequest { path: "/".into() });
-        duplicate.metadata_mut().append(
-            CORRELATION_HEADER,
-            context.id().to_string().parse().unwrap(),
-        );
-        assert_eq!(
-            client.list_directory(duplicate).await.unwrap_err().code(),
-            tonic::Code::InvalidArgument
-        );
-    });
-}
-
-#[test]
-fn store_reuses_context_for_probe_and_read() {
-    let server = ObservedServer::new();
-    let store = Store::new(
-        &server.url,
-        FsNode {
-            node_id: "node".into(),
-        },
-    )
-    .unwrap();
-    let context = OperationContext::new();
-    assert_eq!(
-        store.read_in(&context, "/hello.txt", 0, 5).unwrap(),
-        b"hello"
-    );
-    let ids = server.ids();
-    assert!(
-        ids.len() >= 2,
-        "expected reachability probe and read: {ids:?}"
-    );
-    assert!(
-        ids.iter().all(|id| id == &context.id().to_string()),
-        "all calls must retain the original ID: {ids:?}"
-    );
-}
-
-#[test]
-fn concurrent_store_operations_keep_separate_ids() {
-    let server = ObservedServer::new();
-    let store = Arc::new(
-        Store::new(
-            &server.url,
-            FsNode {
-                node_id: "node".into(),
-            },
-        )
-        .unwrap(),
-    );
-    let left = OperationContext::new();
-    let right = OperationContext::new();
-    let expected = [left.id().to_string(), right.id().to_string()];
-    let barrier = Arc::new(std::sync::Barrier::new(3));
-    let handles: Vec<_> = [left, right]
-        .into_iter()
-        .map(|ctx| {
-            let store = store.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                assert_eq!(store.read_in(&ctx, "/hello.txt", 0, 5).unwrap(), b"hello");
-            })
-        })
-        .collect();
-    barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
-    let ids = server.ids();
-    assert!(
-        expected.iter().all(|id| ids.contains(id)),
-        "each operation must reach the server with its own ID: {ids:?}"
-    );
-    assert!(
-        ids.iter().all(|id| expected.contains(id)),
-        "no request may invent or leak a different ID: {ids:?}"
-    );
-}
-
-/// Isolated so the global logger does not affect other parallel tests.
 #[test]
 fn metadata_cache_correlation_child() {
     let Some(log_path) = std::env::var_os("PUNKFS_CACHE_TEST_LOG") else {

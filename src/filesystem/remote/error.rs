@@ -72,40 +72,26 @@ pub(crate) type OpResult<T> = Result<T, OpError>;
 mod tests {
     use super::*;
 
+    /// Store-level failures map to the syscall errno the kernel expects,
+    /// and an unreachable node is a distinct, actionable EHOSTDOWN rather
+    /// than a generic EIO.
     #[test]
-    fn store_errors_map_to_syscall_errors() {
-        assert_eq!(OpError::from(StoreError::NotFound), OpError::NotFound);
-        assert_eq!(
-            OpError::from(StoreError::NotPermitted),
-            OpError::NotPermitted
-        );
-        assert_eq!(
-            OpError::from(StoreError::Unsupported("nope".into())),
-            OpError::Unsupported
-        );
-        assert_eq!(
-            OpError::from(StoreError::Io("down".into())),
-            OpError::Io("down".into())
-        );
-    }
-
-    #[test]
-    fn an_unreachable_node_is_ehostdown_not_eio() {
-        assert_eq!(
-            OpError::from(StoreError::Inaccessible("node-a".into())).errno(),
-            Errno::EHOSTDOWN
-        );
-    }
-
-    #[test]
-    fn errnos_cover_every_variant() {
-        assert_eq!(OpError::NotFound.errno(), Errno::ENOENT);
-        assert_eq!(OpError::NotEmpty.errno(), Errno::ENOTEMPTY);
-        assert_eq!(OpError::NotPermitted.errno(), Errno::EPERM);
-        assert_eq!(OpError::InvalidInput.errno(), Errno::EINVAL);
-        assert_eq!(OpError::Unsupported.errno(), Errno::ENOSYS);
-        assert_eq!(OpError::Inaccessible.errno(), Errno::EHOSTDOWN);
-        assert_eq!(OpError::CrossDevice.errno(), Errno::EXDEV);
-        assert_eq!(OpError::Io("x".into()).errno(), Errno::EIO);
+    fn store_errors_map_to_distinct_syscall_errnos() {
+        let cases = [
+            (OpError::from(StoreError::NotFound), Errno::ENOENT),
+            (OpError::from(StoreError::NotPermitted), Errno::EPERM),
+            (OpError::from(StoreError::Unsupported("n".into())), Errno::ENOSYS),
+            (
+                OpError::from(StoreError::Inaccessible("node-a".into())),
+                Errno::EHOSTDOWN,
+            ),
+            (OpError::from(StoreError::Io("down".into())), Errno::EIO),
+            (OpError::NotEmpty, Errno::ENOTEMPTY),
+            (OpError::InvalidInput, Errno::EINVAL),
+            (OpError::CrossDevice, Errno::EXDEV),
+        ];
+        for (op, errno) in cases {
+            assert_eq!(op.errno(), errno);
+        }
     }
 }

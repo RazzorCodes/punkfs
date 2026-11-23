@@ -140,64 +140,47 @@ mod tests {
             .collect()
     }
 
+    /// A listing always opens with `.`/`..`, then the real children with
+    /// their real kinds; offset skips already-consumed entries and an
+    /// unknown inode is ENOENT.
     #[test]
-    fn readdir_starts_with_dot_and_dotdot_then_children() {
+    fn readdir_lists_children_with_kinds_and_offset() {
         let store = seeded();
         let items = readdir_decision(&store, 2, 0).unwrap();
         let mut names = names(&items);
-        assert_eq!(names.drain(..2).collect::<Vec<_>>(), vec![".", ".."]);
+        assert_eq!(
+            names.drain(..2).collect::<Vec<_>>(),
+            vec![".", ".."]
+        );
         names.sort();
         assert_eq!(names, vec!["a.txt", "link", "sub"]);
-    }
 
-    #[test]
-    fn readdir_reports_real_kinds() {
-        let store = seeded();
-        let items = readdir_decision(&store, 2, 0).unwrap();
-        let by_name = items
+        let by_name: std::collections::HashMap<_, _> = items
             .iter()
             .map(|i| (i.name.to_string_lossy().into_owned(), i.kind))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect();
         assert_eq!(by_name["a.txt"], FileType::RegularFile);
         assert_eq!(by_name["sub"], FileType::Directory);
         assert_eq!(by_name["link"], FileType::Symlink);
-    }
-
-    #[test]
-    fn readdir_applies_offset() {
-        let store = seeded();
-        let all = readdir_decision(&store, 2, 0).unwrap();
 
         let rest = readdir_decision(&store, 2, 2).unwrap();
-        assert_eq!(rest, all[2..].to_vec());
-        assert!(names(&rest).iter().all(|n| n != "." && n != ".."));
-
-        // Past the end: empty batch, which tells the kernel we are done.
+        assert_eq!(rest, items[2..].to_vec());
         assert!(readdir_decision(&store, 2, 99).unwrap().is_empty());
-    }
-
-    #[test]
-    fn readdir_unknown_inode_is_not_found() {
-        let store = seeded();
         assert_eq!(
             readdir_decision(&store, 77, 0).unwrap_err(),
             super::super::error::OpError::NotFound
         );
     }
 
+    /// An offline server yields the cached listing (here: dot entries only)
+    /// rather than failing the whole directory browse.
     #[test]
     fn readdir_serves_cached_children_when_server_is_down() {
         let store = seeded();
         store.fail_get_children();
-        let items = readdir_decision(&store, 2, 0).unwrap();
-        assert_eq!(names(&items), vec![".", ".."]);
-    }
-
-    #[test]
-    fn readdir_lists_empty_directories() {
-        let store = MockStore::new();
-        store.insert("/", 1, FsEntryKind::Directory);
-        let items = readdir_decision(&store, 1, 0).unwrap();
-        assert_eq!(names(&items), vec![".", ".."]);
+        assert_eq!(
+            names(&readdir_decision(&store, 2, 0).unwrap()),
+            vec![".", ".."]
+        );
     }
 }

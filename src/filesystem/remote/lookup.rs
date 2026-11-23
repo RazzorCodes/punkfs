@@ -120,7 +120,6 @@ pub(crate) fn getattr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::StoreError;
     use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
@@ -132,69 +131,71 @@ mod tests {
         store
     }
 
+    /// Name resolution walks parent path -> listing -> inode and back to
+    /// attrs, and `.`/`..` resolve arithmetically without a server round
+    /// trip.
     #[test]
-    fn lookup_resolves_child_and_lists_parent() {
+    fn lookup_resolves_and_dot_names_skip_the_network() {
         let store = seeded();
-        let (ino, attr) = lookup_decision(&store, 7, 8, 2, OsStr::new("readme")).unwrap();
+        let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new("readme")).unwrap();
         assert_eq!(ino, 3);
-        assert_eq!(attr.ino, INodeNo(3));
         assert_eq!(store.listed(), vec!["/docs".to_string()]);
+
+        assert_eq!(
+            lookup_decision(&store, 7, 8, 2, OsStr::new(".")).unwrap().0,
+            2
+        );
+        assert_eq!(
+            lookup_decision(&store, 7, 8, 2, OsStr::new("..")).unwrap().0,
+            1
+        );
+        assert!(
+            store.listed().iter().filter(|d| **d == "/docs").count() == 1,
+            "dot names must not trigger another listing"
+        );
     }
 
-    #[test]
-    fn lookup_unknown_name_is_not_found() {
-        let store = seeded();
-        let err = lookup_decision(&store, 7, 8, 2, OsStr::new("nope")).unwrap_err();
-        assert_eq!(err, OpError::NotFound);
-    }
-
-    #[test]
-    fn lookup_unknown_parent_is_not_found() {
-        let store = seeded();
-        let err = lookup_decision(&store, 7, 8, 99, OsStr::new("readme")).unwrap_err();
-        assert_eq!(err, OpError::NotFound);
-    }
-
-    #[test]
-    fn lookup_dot_and_dotdot_self_resolve() {
-        let store = seeded();
-        let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new(".")).unwrap();
-        assert_eq!(ino, 2);
-        let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new("..")).unwrap();
-        assert_eq!(ino, 1);
-        // No server round trip for dot names.
-        assert!(store.listed().is_empty());
-    }
-
+    /// Browse must survive a momentary outage: a failed listing is swallowed
+    /// and the cached answer is served.
     #[test]
     fn lookup_offline_failure_is_swallowed() {
         let store = seeded();
-        store.fail_ensure_listed(StoreError::Io("down".into()));
+        store.fail_ensure_listed(crate::store::StoreError::Io("down".into()));
         let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new("readme")).unwrap();
         assert_eq!(ino, 3);
     }
 
+    /// Unknown names and parents report ENOENT; a refresh that fails still
+    /// serves the cached metadata.
     #[test]
-    fn getattr_unknown_inode_is_not_found() {
+    fn missing_or_unreadable_entries_report_not_found() {
         let store = seeded();
+        assert_eq!(
+            lookup_decision(&store, 7, 8, 2, OsStr::new("nope")).unwrap_err(),
+            OpError::NotFound
+        );
+        assert_eq!(
+            lookup_decision(&store, 7, 8, 99, OsStr::new("readme")).unwrap_err(),
+            OpError::NotFound
+        );
         assert_eq!(
             getattr_decision(&store, 7, 8, 42).unwrap_err(),
             OpError::NotFound
         );
     }
 
+    /// getattr keeps answering from the cache when refresh fails, but serves
+    /// freshly refreshed metadata (size/mode/owner) when it succeeds.
     #[test]
-    fn getattr_serves_cached_data_when_refresh_fails() {
-        let store = seeded();
-        store.fail_refresh();
-        let attr = getattr_decision(&store, 7, 8, 3).unwrap();
-        assert_eq!(attr.ino, INodeNo(3));
-    }
-
-    #[test]
-    fn getattr_reports_refreshed_metadata() {
+    fn getattr_refreshes_or_falls_back_to_the_cache() {
         use crate::store::db::attributes::{Access, FileAttrData, Stat};
+
+        let offline = seeded();
+        offline.fail_refresh();
+        assert_eq!(getattr_decision(&offline, 7, 8, 3).unwrap().ino, INodeNo(3));
+
         let store = MockStore::new();
+        store.insert("/", 1, FsEntryKind::Directory);
         store.insert_with(
             "/f",
             5,

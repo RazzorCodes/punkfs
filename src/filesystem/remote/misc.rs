@@ -131,41 +131,19 @@ mod tests {
         store
     }
 
+    /// Special files, symlinks and hard links are refused after resolving
+    /// their inodes, so a missing target reports ENOENT rather than a
+    /// misleading policy refusal.
     #[test]
-    fn readlink_existing_inode_is_refused() {
+    fn creation_ops_are_refused_after_resolving_inodes() {
         let store = seeded();
-        assert_eq!(
-            readlink_decision(&store, 3).unwrap_err(),
-            OpError::NotPermitted
-        );
-    }
 
-    #[test]
-    fn readlink_unknown_inode_is_not_found() {
-        let store = seeded();
-        assert_eq!(
-            readlink_decision(&store, 99).unwrap_err(),
-            OpError::NotFound
-        );
-    }
-
-    #[test]
-    fn mknod_refuses_after_resolving_parent() {
-        let store = seeded();
+        // Each creation-like op resolves its inodes first, then refuses.
+        assert_eq!(readlink_decision(&store, 3).unwrap_err(), OpError::NotPermitted);
         assert_eq!(
             mknod_decision(&store, 2, OsStr::new("dev")).unwrap_err(),
             OpError::NotPermitted
         );
-        // A missing parent is reported as such, not as a policy refusal.
-        assert_eq!(
-            mknod_decision(&store, 99, OsStr::new("dev")).unwrap_err(),
-            OpError::NotFound
-        );
-    }
-
-    #[test]
-    fn symlink_and_link_are_refused() {
-        let store = seeded();
         assert_eq!(
             symlink_decision(&store, 2, OsStr::new("l"), Path::new("/x")).unwrap_err(),
             OpError::NotPermitted
@@ -174,11 +152,16 @@ mod tests {
             link_decision(&store, 3, 2, OsStr::new("hard")).unwrap_err(),
             OpError::NotPermitted
         );
-    }
 
-    #[test]
-    fn link_unknown_source_is_not_found() {
-        let store = seeded();
+        // A nonexistent inode / parent is reported as not-found first.
+        assert_eq!(
+            readlink_decision(&store, 99).unwrap_err(),
+            OpError::NotFound
+        );
+        assert_eq!(
+            mknod_decision(&store, 99, OsStr::new("dev")).unwrap_err(),
+            OpError::NotFound
+        );
         assert_eq!(
             link_decision(&store, 99, 2, OsStr::new("hard")).unwrap_err(),
             OpError::NotFound

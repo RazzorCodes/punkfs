@@ -1,5 +1,11 @@
-//! Shared harness for the integration tests.
+//! Shared harness for the integration and functional test crates.
 //!
+//! Only the pieces each crate actually needs are exercised; the FUSE-mount
+//! helpers (`Mount`, `MultiMount`, `require_fuse`) are used by integration
+//! only, so allow dead code rather than force every consumer to touch all of
+//! the harness.
+#![allow(dead_code)]
+
 //! Two layers of tests use this:
 //!
 //! - **Contract tests** assert what a mounted punkfs *must* do to be usable

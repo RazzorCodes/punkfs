@@ -1,15 +1,12 @@
 //! Integration test entry point.
 //!
-//! The suite is organised by the question each layer answers:
+//! A real FUSE mount over a real backing directory: the fixture must act
+//! like our mocks. These tests assert POSIX behaviour through actual
+//! syscalls on a mounted punkfs (`*_conformance`, `handle_conformance`, and
+//! the FUSE portions of `node_tests`/`telemetry_tests`).
 //!
-//! 1. **Contract / conformance** (`*_conformance`) — does a mounted punkfs
-//!    behave like a filesystem? Written against POSIX expectations, not
-//!    against current behaviour, so a failure names a real gap. Tests
-//!    expected to fail today are marked **Known gap** in their doc comment.
-//! 2. **Store level** (`store_tests`) — the client `Store` against a live
-//!    server over real grpc, no FUSE.
-//! 3. **Harness** (`harness_tests`) — the guards that keep the suite from
-//!    leaking processes or mounts.
+//! The store-level and in-process server tests that do **not** need a FUSE
+//! mount live in `tests/functional/`.
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -17,13 +14,11 @@ mod common;
 mod cli_conformance;
 mod handle_conformance;
 mod local_passthrough_tests;
-mod metadata_cache_tests;
 mod metadata_conformance;
 mod multinode_conformance;
 mod node_tests;
 mod mutation_conformance;
 mod read_conformance;
-mod store_tests;
 mod telemetry_tests;
 mod write_conformance;
 

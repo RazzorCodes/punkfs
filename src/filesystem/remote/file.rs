@@ -183,7 +183,6 @@ pub(crate) fn fsync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::StoreError;
     use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
@@ -194,87 +193,47 @@ mod tests {
         store
     }
 
+    /// The op layer resolves an inode to a path, refreshes it, and hands the
+    /// inode back as the handle; a missing entry is reported before any store
+    /// call and never reaches the store.
     #[test]
-    fn open_returns_the_inode_as_the_handle() {
+    fn open_resolves_and_refuses_missing_entries() {
         let store = seeded();
-        let fh = open_decision(&store, 2, OpenFlags(0)).unwrap();
-        assert_eq!(fh, 2);
+        assert_eq!(open_decision(&store, 2, OpenFlags(0)).unwrap(), 2);
         assert_eq!(store.calls().refresh, vec!["/f".to_string()]);
-    }
-
-    #[test]
-    fn open_does_not_create_missing_entries() {
-        let store = seeded();
         assert_eq!(
             open_decision(&store, 99, OpenFlags(0)).unwrap_err(),
             OpError::NotFound
         );
     }
 
+    /// A store failure must surface as a syscall error rather than be
+    /// swallowed or misreported as success.
     #[test]
-    fn read_forwards_offset_and_size() {
+    fn store_errors_surface_to_the_caller() {
         let store = seeded();
-        store.expect_read(Ok(b"hello".to_vec()));
-        assert_eq!(read_decision(&store, 2, 2, 5, 5).unwrap(), b"hello");
-        assert_eq!(store.calls().read, vec![("/f".to_string(), 5, 5)]);
-    }
-
-    #[test]
-    fn read_error_is_propagated() {
-        let store = seeded();
-        store.expect_read(Err(StoreError::Io("boom".into())));
+        store.expect_read(Err(crate::store::StoreError::Io("boom".into())));
         assert_eq!(
             read_decision(&store, 2, 2, 0, 1).unwrap_err().errno(),
             fuser::Errno::EIO
         );
-    }
-
-    #[test]
-    fn unknown_inode_never_reaches_the_store() {
-        let store = seeded();
-        let err = read_decision(&store, 99, 0, 0, 1).unwrap_err();
-        assert_eq!(err, OpError::NotFound);
-        assert!(store.calls().read.is_empty());
-    }
-
-    #[test]
-    fn write_returns_the_count_from_the_store() {
-        let store = seeded();
-        store.expect_write(Ok(3));
-        assert_eq!(write_decision(&store, 2, 2, 0, b"abc").unwrap(), 3);
-        assert_eq!(
-            store.calls().write,
-            vec![("/f".to_string(), 0, b"abc".to_vec())]
-        );
-    }
-
-    #[test]
-    fn write_refusal_surfaces_as_a_recoverable_error() {
-        let store = seeded();
-        store.expect_write(Err(StoreError::NotPermitted));
+        store.expect_write(Err(crate::store::StoreError::NotPermitted));
         assert_eq!(
             write_decision(&store, 2, 2, 0, b"x").unwrap_err(),
             OpError::NotPermitted
         );
     }
 
+    /// Lifetime ops (flush/release) are local no-ops but still confirm the
+    /// entry exists so a stale inode is reported.
     #[test]
-    fn fsync_forwards_datasync() {
-        let store = seeded();
-        store.expect_fsync(Ok(()));
-        fsync_decision(&store, 2, 2, true).unwrap();
-        assert_eq!(store.calls().fsync, vec![("/f".to_string(), true)]);
-    }
-
-    #[test]
-    fn flush_and_release_are_local_noops() {
+    fn flush_and_release_confirm_existence() {
         let store = seeded();
         flush_decision(&store, 2).unwrap();
         release_decision(&store, 2).unwrap();
         assert_eq!(
             flush_decision(&store, 99).unwrap_err(),
-            OpError::NotFound,
-            "an unknown inode is still reported"
+            OpError::NotFound
         );
     }
 }

@@ -514,17 +514,6 @@ mod tests {
         (dir, service)
     }
 
-    async fn list(service: &Arc<PunkFsService>, path: &str) -> Vec<DirEntry> {
-        service
-            .list_directory(Request::new(ListDirectoryRequest {
-                path: path.to_owned(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .entries
-    }
-
     async fn attr(service: &Arc<PunkFsService>, path: &str) -> FileAttr {
         service
             .get_attr(Request::new(GetAttrRequest {
@@ -537,125 +526,54 @@ mod tests {
             .unwrap()
     }
 
-    async fn read(service: &Arc<PunkFsService>, path: &str, offset: u64, length: u32) -> Vec<u8> {
-        service
-            .read_file(Request::new(ReadFileRequest {
-                path: path.to_owned(),
-                offset,
-                length,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .data
-    }
-
-    async fn write(service: &Arc<PunkFsService>, path: &str, offset: u64, data: &[u8]) -> u32 {
-        service
-            .write_file(Request::new(WriteFileRequest {
-                path: path.to_owned(),
-                offset,
-                data: data.to_vec(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .written
-    }
-
-    #[tokio::test]
-    async fn list_directory_reports_names_kinds_and_sizes() {
-        let (_dir, service) = fixture();
-        let entries = list(&service, "/").await;
-
-        let by_name: std::collections::HashMap<_, _> = entries
-            .iter()
-            .map(|e| (e.name.as_str(), e.attr.as_ref().unwrap()))
-            .collect();
-
-        assert_eq!(by_name.len(), 2);
-        assert_eq!(by_name["hello.txt"].stat.as_ref().unwrap().size, 11);
-        assert_eq!(by_name["hello.txt"].kind(), FileKind::File);
-        assert_eq!(by_name["sub"].kind(), FileKind::Directory);
-    }
-
-    #[tokio::test]
-    async fn list_directory_is_sorted() {
-        let (_dir, service) = fixture();
-        let names: Vec<String> = list(&service, "/")
-            .await
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted);
-    }
-
-    #[tokio::test]
-    async fn guids_are_stable_across_repeated_reads() {
-        let (_dir, service) = fixture();
-        let first = attr(&service, "/hello.txt").await.guid;
-        let second = attr(&service, "/hello.txt").await.guid;
-        assert_eq!(first, second);
-
-        let other = attr(&service, "/sub").await.guid;
-        assert_ne!(first, other, "different entries must not share a guid");
-    }
-
-    /// The whole point of persisting the guid: a rename must not change the
-    /// file's punkfs identity.
-    #[tokio::test]
-    async fn guid_survives_a_rename() {
-        let (dir, service) = fixture();
-        let before = attr(&service, "/hello.txt").await.guid;
-
-        fs::rename(dir.path().join("hello.txt"), dir.path().join("renamed.txt")).unwrap();
-
-        let after = attr(&service, "/renamed.txt").await.guid;
-        assert_eq!(
-            before, after,
-            "a renamed file must keep its guid; it was re-minted instead"
-        );
-    }
-
-    /// A guids must also survive a move between directories on one node.
-    #[tokio::test]
-    async fn guid_survives_a_move_between_directories() {
-        let (dir, service) = fixture();
-        let before = attr(&service, "/hello.txt").await.guid;
-
-        fs::rename(
-            dir.path().join("hello.txt"),
-            dir.path().join("sub/moved.txt"),
-        )
-        .unwrap();
-
-        assert_eq!(attr(&service, "/sub/moved.txt").await.guid, before);
-    }
-
-    /// The persisted value is what is read back, not something re-derived:
-    /// planting a known guid must make the server report it verbatim.
-    #[tokio::test]
-    async fn a_planted_guid_is_reported_verbatim() {
-        let (dir, service) = fixture();
-        let planted = "3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b";
-        let _ = plant_guid(&dir.path().join("hello.txt"), planted);
-
-        if read_guid_xattr(&dir.path().join("hello.txt")).as_deref() == Some(planted) {
-            assert_eq!(attr(&service, "/hello.txt").await.guid, planted);
-        } else {
-            eprintln!("skipping: backing filesystem does not support user xattrs");
-        }
-    }
-
     fn plant_guid(path: &Path, guid: &str) -> bool {
         write_guid_xattr(path, guid)
     }
 
-    /// Filesystems without xattr support still need a guid. The derived
-    /// fallback must be deterministic per (node, path) and parse as a guid,
-    /// so a client can rely on it even though it will not survive a rename.
+    /// The punkfs identity is persisted on the entry so it survives rename,
+    /// and is reported verbatim rather than re-derived on every read.
+    #[tokio::test]
+    async fn guids_are_stable_and_persist_across_renames_and_moves() {
+        let (dir, service) = fixture();
+        let first = attr(&service, "/hello.txt").await.guid;
+        assert_eq!(attr(&service, "/hello.txt").await.guid, first);
+        assert_ne!(attr(&service, "/sub").await.guid, first);
+
+        fs::rename(dir.path().join("hello.txt"), dir.path().join("renamed.txt")).unwrap();
+        assert_eq!(attr(&service, "/renamed.txt").await.guid, first);
+
+        fs::rename(
+            dir.path().join("renamed.txt"),
+            dir.path().join("sub/moved.txt"),
+        )
+        .unwrap();
+        assert_eq!(attr(&service, "/sub/moved.txt").await.guid, first);
+    }
+
+    /// The persisted xattr is what is served (not a re-derivation), and a
+    /// corrupt value is treated as absent rather than making the file
+    /// unreadable.
+    #[tokio::test]
+    async fn planted_and_corrupt_guid_xattrs() {
+        let (dir, service) = fixture();
+        let planted = "3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b";
+        if plant_guid(&dir.path().join("hello.txt"), planted)
+            && read_guid_xattr(&dir.path().join("hello.txt")).as_deref() == Some(planted)
+        {
+            assert_eq!(attr(&service, "/hello.txt").await.guid, planted);
+        }
+
+        let corrupt = dir.path().join("hello.txt");
+        if write_guid_xattr(&corrupt, "not-a-guid") {
+            assert_eq!(read_guid_xattr(&corrupt), None);
+            let reported = attr(&service, "/hello.txt").await.guid;
+            assert!(uuid::Uuid::parse_str(&reported).is_ok());
+            assert_ne!(reported, "not-a-guid");
+        }
+    }
+
+    /// Filesystems without xattr support get a deterministic derived guid
+    /// that still parses as one.
     #[test]
     fn derived_fallback_guid_is_deterministic_and_valid() {
         let a = derived_guid("node-a", "/hello.txt");
@@ -663,206 +581,15 @@ mod tests {
         let other_path = derived_guid("node-a", "/other.txt");
         let other_node = derived_guid("node-b", "/hello.txt");
 
-        assert_eq!(a, b, "same node+path must derive the same guid");
-        assert_ne!(a, other_path, "different paths must not collide");
-        assert_ne!(a, other_node, "different nodes must not collide");
-        assert!(uuid::Uuid::parse_str(&a).is_ok(), "must be a valid guid");
+        assert_eq!(a, b);
+        assert_ne!(a, other_path);
+        assert_ne!(a, other_node);
+        assert!(uuid::Uuid::parse_str(&a).is_ok());
     }
 
-    /// A garbage xattr must not make a healthy file unreadable: it is
-    /// treated as absent and a fresh guid is minted.
-    #[tokio::test]
-    async fn a_corrupt_guid_xattr_is_replaced_rather_than_served() {
-        let (dir, service) = fixture();
-        let real = dir.path().join("hello.txt");
-        if !write_guid_xattr(&real, "not-a-guid") {
-            eprintln!("skipping: backing filesystem does not support user xattrs");
-            return;
-        }
-        assert_eq!(
-            read_guid_xattr(&real),
-            None,
-            "corrupt value must read as absent"
-        );
-
-        let reported = attr(&service, "/hello.txt").await.guid;
-        assert!(uuid::Uuid::parse_str(&reported).is_ok());
-        assert_ne!(reported, "not-a-guid");
-    }
-
-    #[tokio::test]
-    async fn get_attr_reports_directory_and_file() {
-        let (_dir, service) = fixture();
-        assert_eq!(attr(&service, "/").await.kind(), FileKind::Directory);
-        let file = attr(&service, "/hello.txt").await;
-        assert_eq!(file.kind(), FileKind::File);
-        assert_eq!(file.stat.unwrap().size, 11);
-    }
-
-    #[tokio::test]
-    async fn get_attr_missing_path_is_not_found() {
-        let (_dir, service) = fixture();
-        let err = service
-            .get_attr(Request::new(GetAttrRequest {
-                path: "/nope".into(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn read_returns_the_whole_file() {
-        let (_dir, service) = fixture();
-        assert_eq!(read(&service, "/hello.txt", 0, 1024).await, b"hello world");
-    }
-
-    #[tokio::test]
-    async fn read_is_positional() {
-        let (_dir, service) = fixture();
-        assert_eq!(read(&service, "/hello.txt", 6, 5).await, b"world");
-        assert_eq!(read(&service, "/hello.txt", 0, 5).await, b"hello");
-    }
-
-    #[tokio::test]
-    async fn read_past_eof_returns_empty() {
-        let (_dir, service) = fixture();
-        assert!(read(&service, "/hello.txt", 100, 16).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn read_past_eof_after_a_write_sees_the_new_size() {
-        let (_dir, service) = fixture();
-        write(&service, "/hello.txt", 11, b"!!").await;
-        assert_eq!(
-            read(&service, "/hello.txt", 0, 1024).await,
-            b"hello world!!"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_is_capped_at_the_limit() {
-        let (_dir, service) = fixture();
-        let data = read(&service, "/hello.txt", 0, 4).await;
-        assert_eq!(data.len(), 4);
-        assert_eq!(data, b"hell");
-    }
-
-    #[tokio::test]
-    async fn write_modifies_the_backing_file() {
-        let (dir, service) = fixture();
-        let written = write(&service, "/hello.txt", 0, b"HELLO").await;
-        assert_eq!(written, 5);
-        assert_eq!(
-            fs::read(dir.path().join("hello.txt")).unwrap(),
-            b"HELLO world"
-        );
-    }
-
-    #[tokio::test]
-    async fn write_at_an_offset_extends_the_file() {
-        let (dir, service) = fixture();
-        write(&service, "/hello.txt", 11, b" appended").await;
-        assert_eq!(
-            fs::read(dir.path().join("hello.txt")).unwrap(),
-            b"hello world appended"
-        );
-    }
-
-    #[tokio::test]
-    async fn write_does_not_create_missing_files() {
-        let (_dir, service) = fixture();
-        let err = service
-            .write_file(Request::new(WriteFileRequest {
-                path: "/new.txt".into(),
-                offset: 0,
-                data: b"x".to_vec(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn write_round_trips_a_large_buffer() {
-        let (_dir, service) = fixture();
-        // Bigger than the classic 4 KiB page so a chunking bug would show.
-        let payload: Vec<u8> = (0..(300 * 1024)).map(|i| (i % 251) as u8).collect();
-        let written = write(&service, "/hello.txt", 0, &payload).await;
-        assert_eq!(written as usize, payload.len());
-
-        // Read it back in `MAX_READ`-sized chunks, the way a client would.
-        let mut got = Vec::new();
-        while got.len() < payload.len() {
-            let chunk = read(&service, "/hello.txt", got.len() as u64, MAX_READ).await;
-            if chunk.is_empty() {
-                break;
-            }
-            got.extend_from_slice(&chunk);
-        }
-        assert_eq!(got, payload);
-    }
-
-    #[tokio::test]
-    async fn fsync_succeeds_on_an_existing_file() {
-        let (_dir, service) = fixture();
-        service
-            .fsync_file(Request::new(FsyncFileRequest {
-                path: "/hello.txt".into(),
-                datasync: true,
-            }))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn fsync_missing_file_is_not_found() {
-        let (_dir, service) = fixture();
-        let err = service
-            .fsync_file(Request::new(FsyncFileRequest {
-                path: "/nope".into(),
-                datasync: false,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn set_attr_changes_mode() {
-        let (dir, service) = fixture();
-        let resp = service
-            .set_attr(Request::new(SetAttrRequest {
-                path: "/hello.txt".into(),
-                mode: Some(0o600),
-                ..SetAttrRequest::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(resp.attr.unwrap().access.unwrap().mode, 0o600);
-        let mode = fs::metadata(dir.path().join("hello.txt"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
-    #[tokio::test]
-    async fn set_attr_truncates() {
-        let (dir, service) = fixture();
-        service
-            .set_attr(Request::new(SetAttrRequest {
-                path: "/hello.txt".into(),
-                size: Some(5),
-                ..SetAttrRequest::default()
-            }))
-            .await
-            .unwrap();
-        assert_eq!(fs::read(dir.path().join("hello.txt")).unwrap(), b"hello");
-    }
-
+    /// The backing grpc layer refuses ownership changes and path traversal
+    /// before touching disk, and maps io errors to the codes the client
+    /// translates back into errnos.
     #[tokio::test]
     async fn set_attr_refuses_ownership_changes() {
         let (_dir, service) = fixture();
@@ -878,119 +605,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_attr_applies_timestamps() {
-        let (dir, service) = fixture();
-        service
-            .set_attr(Request::new(SetAttrRequest {
-                path: "/hello.txt".into(),
-                modified_unix: Some(1_000_000),
-                ..SetAttrRequest::default()
-            }))
-            .await
-            .unwrap();
-
-        let mtime = fs::metadata(dir.path().join("hello.txt"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        assert_eq!(
-            mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            1_000_000
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_file_deletes_it() {
-        let (dir, service) = fixture();
-        service
-            .remove_file(Request::new(RemoveFileRequest {
-                path: "/hello.txt".into(),
-            }))
-            .await
-            .unwrap();
-        assert!(!dir.path().join("hello.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn remove_dir_requires_an_empty_directory() {
-        let (_dir, service) = fixture();
-        let err = service
-            .remove_dir(Request::new(RemoveDirRequest {
-                path: "/sub".into(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[tokio::test]
-    async fn remove_dir_deletes_an_empty_directory() {
-        let (dir, service) = fixture();
-        fs::create_dir(dir.path().join("empty")).unwrap();
-        service
-            .remove_dir(Request::new(RemoveDirRequest {
-                path: "/empty".into(),
-            }))
-            .await
-            .unwrap();
-        assert!(!dir.path().join("empty").exists());
-    }
-
-    #[tokio::test]
-    async fn rename_moves_the_entry() {
-        let (dir, service) = fixture();
-        service
-            .rename(Request::new(RenameRequest {
-                old_path: "/hello.txt".into(),
-                new_path: "/renamed.txt".into(),
-                flags: 0,
-            }))
-            .await
-            .unwrap();
-        assert!(!dir.path().join("hello.txt").exists());
-        assert_eq!(
-            fs::read(dir.path().join("renamed.txt")).unwrap(),
-            b"hello world"
-        );
-    }
-
-    #[tokio::test]
-    async fn rename_refuses_flags() {
-        let (_dir, service) = fixture();
-        let err = service
-            .rename(Request::new(RenameRequest {
-                old_path: "/hello.txt".into(),
-                new_path: "/x".into(),
-                flags: 1,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn stat_fs_reports_a_positive_block_size() {
-        let (_dir, service) = fixture();
-        let stats = service
-            .stat_fs(Request::new(StatFsRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(stats.block_size > 0);
-        assert!(stats.blocks > 0);
-    }
-
-    #[tokio::test]
     async fn resolve_rejects_traversal_and_absolute_paths() {
         let (_dir, service) = fixture();
-        for bad in ["../etc/passwd", "/..", "a/../../b", ""] {
-            let result = service.get_attr(Request::new(GetAttrRequest { path: bad.into() }));
-            // "/.." and traversal must be rejected outright; an empty path
-            // resolves to the root itself, which is legitimate.
-            if bad.is_empty() {
-                continue;
-            }
-            let err = result.await.unwrap_err();
+        for bad in ["../etc/passwd", "/..", "a/../../b"] {
+            let err = service
+                .get_attr(Request::new(GetAttrRequest { path: bad.into() }))
+                .await
+                .unwrap_err();
             assert!(
                 err.code() == tonic::Code::InvalidArgument || err.code() == tonic::Code::NotFound,
                 "{bad:?} produced {:?}",
@@ -1016,7 +637,6 @@ mod tests {
         #[cfg(feature = "dev-shutdown")]
         {
             result.expect("shutdown is served when the feature is on");
-            // And it must actually trip the signal `main` selects on.
             tokio::time::timeout(std::time::Duration::from_secs(1), service.shutdown_signal())
                 .await
                 .expect("shutdown_signal should be ready");

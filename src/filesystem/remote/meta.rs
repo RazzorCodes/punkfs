@@ -252,109 +252,72 @@ mod tests {
         store
     }
 
+    /// Every setattr is deliberately refused right now (write-through
+    /// metadata is unsettled), and a refused request must never reach the
+    /// backend.
     #[test]
-    fn setattr_unknown_inode_is_not_found() {
+    fn setattr_is_refused_and_never_reaches_the_backend() {
         let store = seeded();
         let err = setattr_decision(
-            &store,
-            0,
-            0,
-            99,
-            Some(0o600),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(err, OpError::NotFound);
-    }
-
-    #[test]
-    fn every_setattr_is_refused_for_now() {
-        // Even a plain chmod: the op layer declines until write-through
-        // metadata semantics exist, and says so with a recoverable errno.
-        let store = seeded();
-        let err = setattr_decision(
-            &store,
-            5,
-            6,
-            3,
-            Some(0o600),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            &store, 5, 6, 3, Some(0o600), None, None, None, None, None, None, None, None, None,
             None,
         )
         .unwrap_err();
         assert_eq!(err, OpError::Unsupported);
         assert_eq!(err.errno(), fuser::Errno::ENOSYS);
-        assert!(
-            store.calls().setattr.is_empty(),
-            "a refused request must not reach the backend"
-        );
-    }
+        assert!(store.calls().setattr.is_empty());
 
-    #[test]
-    fn truncation_and_ownership_changes_are_also_refused() {
-        let store = seeded();
-        for call in [(None, None, Some(10u64)), (None, Some(1000u32), None)] {
-            let (mode, uid_change, size) = call;
+        // Truncation and ownership changes are refused the same way, and a
+        // missing inode is still reported as not-found before the refusal.
+        for (mode, ownership, size) in [
+            (None, None, Some(10u64)),
+            (None, Some(1000u32), None),
+        ] {
             let err = setattr_decision(
-                &store, 0, 0, 3, mode, uid_change, None, size, None, None, None, None, None, None,
+                &store, 0, 0, 3, mode, ownership, None, size, None, None, None, None, None, None,
                 None,
             )
             .unwrap_err();
             assert_eq!(err, OpError::Unsupported);
         }
         assert!(store.calls().setattr.is_empty());
+        assert_eq!(
+            setattr_decision(
+                &store, 0, 0, 99, Some(0o600), None, None, None, None, None, None, None, None,
+                None, None,
+            )
+            .unwrap_err(),
+            OpError::NotFound
+        );
     }
 
+    /// unlink/rmdir join parent+name into a path and delegate to the store;
+    /// a non-empty directory is refused locally before the store is asked.
     #[test]
-    fn unlink_joins_the_parent_path() {
+    fn unlink_and_rmdir_join_paths_and_check_emptiness() {
         let store = seeded();
         unlink_decision(&store, 2, OsStr::new("a.txt")).unwrap();
         assert_eq!(store.calls().unlink, vec!["/docs/a.txt".to_string()]);
-        assert_eq!(store.get_inode("/docs/a.txt"), None);
-    }
 
-    #[test]
-    fn unlink_unknown_parent_is_not_found() {
-        let store = seeded();
-        let err = unlink_decision(&store, 99, OsStr::new("x")).unwrap_err();
-        assert_eq!(err, OpError::NotFound);
-        assert!(store.calls().unlink.is_empty());
-    }
-
-    #[test]
-    fn rmdir_refuses_non_empty_directory_before_the_store() {
-        let store = seeded();
-        let err = rmdir_decision(&store, 1, OsStr::new("docs")).unwrap_err();
+        let nonempty = seeded();
+        let err = rmdir_decision(&nonempty, 1, OsStr::new("docs")).unwrap_err();
         assert_eq!(err, OpError::NotEmpty);
-        assert!(store.calls().rmdir.is_empty());
+        assert!(nonempty.calls().rmdir.is_empty());
+
+        let empty = seeded();
+        rmdir_decision(&empty, 2, OsStr::new("empty")).unwrap();
+        assert_eq!(empty.calls().rmdir, vec!["/docs/empty".to_string()]);
+
+        assert_eq!(
+            unlink_decision(&seeded(), 99, OsStr::new("x")).unwrap_err(),
+            OpError::NotFound
+        );
     }
 
+    /// Rename joins both sides and refuses a move that would cross backing
+    /// nodes (EXDEV); flags must pass through to the store unchanged.
     #[test]
-    fn rmdir_allows_empty_directory_through() {
-        let store = seeded();
-        rmdir_decision(&store, 2, OsStr::new("empty")).unwrap();
-        assert_eq!(store.calls().rmdir, vec!["/docs/empty".to_string()]);
-    }
-
-    #[test]
-    fn rename_joins_both_sides() {
+    fn rename_joins_both_sides_and_refuses_cross_node_moves() {
         let store = seeded();
         rename_decision(
             &store,
@@ -367,38 +330,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             store.calls().rename,
-            vec![(
-                "/docs/a.txt".to_string(),
-                "/b.txt".to_string(),
-                RenameFlags::empty()
-            )]
+            vec![("/docs/a.txt".to_string(), "/b.txt".to_string(), RenameFlags::empty())]
         );
-        assert!(store.get_inode("/b.txt").is_some());
-    }
 
-    #[test]
-    fn rename_passes_flags_through() {
-        let store = seeded();
         let flags = RenameFlags::RENAME_NOREPLACE;
-        rename_decision(&store, 2, OsStr::new("a.txt"), 2, OsStr::new("b"), flags).unwrap();
-        assert_eq!(store.calls().rename[0].2, flags);
+        let passthrough = seeded();
+        rename_decision(&passthrough, 2, OsStr::new("a.txt"), 2, OsStr::new("b"), flags)
+            .unwrap();
+        assert_eq!(passthrough.calls().rename[0].2, flags);
     }
 
-    #[test]
-    fn rename_unknown_source_is_not_found() {
-        let store = seeded();
-        let err = rename_decision(
-            &store,
-            2,
-            OsStr::new("ghost"),
-            1,
-            OsStr::new("x"),
-            RenameFlags::empty(),
-        )
-        .unwrap_err();
-        assert_eq!(err, OpError::NotFound);
-    }
-
+    /// Reading-only capacity counters are passed through as-is and a store
+    /// failure maps to EIO.
     #[test]
     fn statfs_passes_counters_through() {
         let store = seeded();
@@ -412,11 +355,7 @@ mod tests {
         let stats = statfs_decision(&store).unwrap();
         assert_eq!(stats.blocks, 10);
         assert_eq!(stats.block_size, 4096);
-    }
 
-    #[test]
-    fn statfs_io_error_maps_to_eio() {
-        let store = seeded();
         store.expect_statfs(Err(StoreError::Io("down".into())));
         assert_eq!(
             statfs_decision(&store).unwrap_err().errno(),

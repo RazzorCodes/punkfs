@@ -157,18 +157,16 @@ mod tests {
         }
     }
 
+    /// Path joining must resolve `.`/`..` arithmetically and reject
+    /// non-UTF8 names, so the same helper is safe to feed kernel names.
     #[test]
-    fn child_path_joins_and_resolves_dots() {
+    fn child_path_joins_resolves_dots_and_rejects_non_utf8() {
         assert_eq!(child_path("/a", OsStr::new("b")).unwrap(), "/a/b");
         assert_eq!(child_path("/", OsStr::new("b")).unwrap(), "/b");
         assert_eq!(child_path("/a/b", OsStr::new(".")).unwrap(), "/a/b");
         assert_eq!(child_path("/a/b", OsStr::new("..")).unwrap(), "/a");
         assert_eq!(child_path("/a", OsStr::new("..")).unwrap(), "/");
         assert_eq!(child_path("/", OsStr::new("..")).unwrap(), "/");
-    }
-
-    #[test]
-    fn child_path_rejects_non_utf8() {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -177,19 +175,19 @@ mod tests {
         }
     }
 
+    /// Catalog entries translate into kernel attrs: stored metadata wins,
+    /// unknown fields get usable defaults, and every entry kind maps to a
+    /// real `FileType`.
     #[test]
-    fn unknown_metadata_gets_usable_defaults() {
-        let attr = attr_from(7, &attr_data(FsEntryKind::File), 1000, 1001);
-        assert_eq!(attr.ino, INodeNo(7));
-        assert_eq!(attr.kind, FileType::RegularFile);
-        assert_eq!(attr.perm, 0o777);
-        assert_eq!((attr.uid, attr.gid), (1000, 1001));
-        assert_eq!(attr.nlink, 1);
-        assert_eq!(attr.blksize, 512);
-    }
+    fn attr_from_translates_kinds_and_defaults_or_stored_values() {
+        let defaults = attr_from(7, &attr_data(FsEntryKind::File), 1000, 1001);
+        assert_eq!(defaults.ino, INodeNo(7));
+        assert_eq!(defaults.kind, FileType::RegularFile);
+        assert_eq!(defaults.perm, 0o777);
+        assert_eq!((defaults.uid, defaults.gid), (1000, 1001));
+        assert_eq!(defaults.nlink, 1);
+        assert_eq!(defaults.blksize, 512);
 
-    #[test]
-    fn stored_metadata_wins() {
         let mut data = attr_data(FsEntryKind::Directory);
         data.access = Access {
             mode: 0o750,
@@ -204,43 +202,37 @@ mod tests {
         };
         data.times.accessed = UNIX_EPOCH + Duration::from_secs(100);
 
-        let attr = attr_from(2, &data, 1000, 1001);
-        assert_eq!(attr.kind, FileType::Directory);
-        assert_eq!(attr.perm, 0o750);
-        assert_eq!((attr.uid, attr.gid), (33, 44));
-        assert_eq!(attr.nlink, 5);
-        assert_eq!(attr.size, 4096);
-        assert_eq!(attr.blksize, 4096);
-        assert_eq!(attr.atime, UNIX_EPOCH + Duration::from_secs(100));
-    }
+        let stored = attr_from(2, &data, 1000, 1001);
+        assert_eq!(stored.kind, FileType::Directory);
+        assert_eq!(stored.perm, 0o750);
+        assert_eq!((stored.uid, stored.gid), (33, 44));
+        assert_eq!(stored.nlink, 5);
+        assert_eq!(stored.size, 4096);
+        assert_eq!(stored.blksize, 4096);
+        assert_eq!(stored.atime, UNIX_EPOCH + Duration::from_secs(100));
 
-    #[test]
-    fn directories_default_to_two_links() {
-        let attr = attr_from(1, &attr_data(FsEntryKind::Directory), 0, 0);
-        assert_eq!(attr.nlink, 2);
-    }
-
-    #[test]
-    fn zero_times_become_now_rather_than_the_epoch() {
-        let attr = attr_from(1, &attr_data(FsEntryKind::File), 0, 0);
-        assert!(attr.mtime > UNIX_EPOCH + Duration::from_secs(1_000_000));
-    }
-
-    #[test]
-    fn links_present_as_symlinks() {
         assert_eq!(file_type(FsEntryKind::Link), FileType::Symlink);
         assert_eq!(file_type(FsEntryKind::Unknown), FileType::RegularFile);
         assert_eq!(file_type(FsEntryKind::File), FileType::RegularFile);
     }
 
+    /// A directory defaults to two links and epoch times become "now", so
+    /// nothing the server left unset shows up as 1970.
     #[test]
-    fn file_times_are_carried_through() {
+    fn defaults_for_dirs_and_epoch_times() {
+        assert_eq!(
+            attr_from(1, &attr_data(FsEntryKind::Directory), 0, 0).nlink,
+            2
+        );
+        let attr = attr_from(1, &attr_data(FsEntryKind::File), 0, 0);
+        assert!(attr.mtime > UNIX_EPOCH + Duration::from_secs(1_000_000));
+
         let mut data = attr_data(FsEntryKind::File);
         data.times = FileTimes::from_secs(1, 2, 3, 4);
-        let attr = attr_from(1, &data, 0, 0);
-        assert_eq!(attr.atime, UNIX_EPOCH + Duration::from_secs(1));
-        assert_eq!(attr.mtime, UNIX_EPOCH + Duration::from_secs(2));
-        assert_eq!(attr.ctime, UNIX_EPOCH + Duration::from_secs(3));
-        assert_eq!(attr.crtime, UNIX_EPOCH + Duration::from_secs(4));
+        let carried = attr_from(1, &data, 0, 0);
+        assert_eq!(carried.atime, UNIX_EPOCH + Duration::from_secs(1));
+        assert_eq!(carried.mtime, UNIX_EPOCH + Duration::from_secs(2));
+        assert_eq!(carried.ctime, UNIX_EPOCH + Duration::from_secs(3));
+        assert_eq!(carried.crtime, UNIX_EPOCH + Duration::from_secs(4));
     }
 }
