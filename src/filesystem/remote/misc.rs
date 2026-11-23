@@ -1,10 +1,9 @@
 //! Filesystem ops that fit none of the other categories: readlink,
 //! mknod, symlink, link.
 //!
-//! punkfs rejects special files and links outright: `EPERM` ("operation
-//! not permitted" — the caller sees an explicit refusal) rather than
-//! `ENOSYS`, matching fuser's own defaults for symlink/link. Local regular
-//! file and directory creation is handled by the passthrough layer.
+//! Remote symlink targets are read from their owning backend. Local symlink
+//! creation is handled by the passthrough layer; the client-only mount still
+//! refuses creation. Special files and hard links are not implemented.
 //!
 //! Each decision still resolves its inodes through the store first, so an
 //! op on a nonexistent parent reports `ENOENT` rather than a misleading
@@ -22,11 +21,13 @@ use super::helpers;
 use crate::core::punkfs::Fs;
 use crate::store::StoreApi;
 
-/// Read a symlink target; punkfs stores no symlinks, so always `EPERM`
-/// after confirming the inode exists.
+/// Return the target bytes of a symlink from its owning backend.
 pub(crate) fn readlink_decision(store: &dyn StoreApi, ino: u64) -> OpResult<Vec<u8>> {
-    let _ = helpers::path_of(store, ino)?;
-    Err(OpError::NotPermitted)
+    let path = helpers::path_of(store, ino)?;
+    if store.has_conflict(&path) {
+        return Err(OpError::Local(libc::EIO));
+    }
+    Ok(store.readlink(&path)?)
 }
 
 /// Create a device node / fifo / socket: always refused.
@@ -131,15 +132,13 @@ mod tests {
         store
     }
 
-    /// Special files, symlinks and hard links are refused after resolving
-    /// their inodes, so a missing target reports ENOENT rather than a
-    /// misleading policy refusal.
+    /// Unsupported creation resolves inodes first, so a missing parent or
+    /// target reports ENOENT rather than a misleading policy refusal.
     #[test]
     fn creation_ops_are_refused_after_resolving_inodes() {
         let store = seeded();
 
         // Each creation-like op resolves its inodes first, then refuses.
-        assert_eq!(readlink_decision(&store, 3).unwrap_err(), OpError::NotPermitted);
         assert_eq!(
             mknod_decision(&store, 2, OsStr::new("dev")).unwrap_err(),
             OpError::NotPermitted

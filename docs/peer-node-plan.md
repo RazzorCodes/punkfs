@@ -1,11 +1,13 @@
 # Bidirectional punkfs nodes: implementation plan
 
-Status: process integration is in progress. The combined process, shared
-pre-mount backing descriptor, deadlines, and three-node playground are
-implemented. Descriptor-relative path confinement and shared runtime ownership
-are not yet implemented; see `docs/node.md` for the current limitations. Peer
-handshake and periodic metadata publication remain future milestones. None of
-these stages replicates file contents or changes where new files are placed.
+Status: this is a historical roadmap, not a current implementation report.
+The combined process, shared pre-mount backing descriptor, deadlines, and
+three-node playground are implemented. Descriptor-relative no-follow path
+resolution exists but needs further hardening; runtime ownership is still
+split. An initial inventory handshake and best-effort create announcements
+exist, but the stronger handshake and periodic publication described below do
+not. See `docs/node.md` for current limitations. None of these stages replicates
+file contents or changes where new files are placed.
 
 ## Contract
 
@@ -204,7 +206,8 @@ peer/cache diagnostics. Put logs outside all mounts/exports used by punkfs.
 
 The current baseline is 114 unit tests passing and 126 integration tests
 passing with 16 known conformance failures. Track the named failures, not only
-the count. Process integration does not fix remote truncate/chmod, symlinks,
-open handles after unlink, or other unrelated POSIX gaps. Catalog persistence,
+the count. Process integration does not fix remote truncate/chmod, open handles
+after unlink, or other unrelated POSIX gaps. Symlink support has since been
+added; see `docs/node.md` for its remaining limitations. Catalog persistence,
 crash-safe mutation recovery, indexed conflict rename, full inventory scans,
 replication, peer discovery and authentication are separate milestones.

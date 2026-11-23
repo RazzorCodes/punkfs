@@ -712,27 +712,6 @@ impl Filesystem for Fs {
     fn readlink(&self, req: &Request, ino: INodeNo, reply: fuser::ReplyData) {
         let operation = self.for_operation();
         operation.log_route("readlink", ino.0);
-        if let Some(local) = &operation.local
-            && let Some(entry) = operation.store.get_entry(ino.0)
-        {
-            if operation.store.has_conflict(&entry.path) {
-                reply.error(fuser::Errno::EIO);
-                return;
-            }
-            if entry.node_id == operation.store.node_id() {
-                let ctx = operation
-                    .store
-                    .operation_context()
-                    .expect("operation context");
-                match local.readlink(&entry.path, ctx) {
-                    Ok(target) => reply.data(&target),
-                    Err(error) => {
-                        reply.error(crate::filesystem::remote::error::OpError::from(error).errno())
-                    }
-                }
-                return;
-            }
-        }
         misc::readlink(&operation, req, ino, reply);
     }
 
@@ -763,7 +742,39 @@ impl Filesystem for Fs {
         reply: fuser::ReplyEntry,
     ) {
         let operation = self.for_operation();
-        misc::symlink(&operation, req, parent, link_name, target, reply);
+        let Some(local) = &operation.local else {
+            misc::symlink(&operation, req, parent, link_name, target, reply);
+            return;
+        };
+        let result = (|| {
+            let parent_path =
+                crate::filesystem::remote::helpers::path_of(operation.store.as_ref(), parent.0)?;
+            let path = helpers_for_create::path(&operation, parent.0, link_name)?;
+            operation
+                .store
+                .ensure_listed(&parent_path)
+                .map_err(crate::filesystem::remote::error::OpError::from)?;
+            let ctx = operation
+                .store
+                .operation_context()
+                .expect("operation context");
+            let inode = local
+                .create_symlink(self.store.as_ref(), ctx, &path, target)
+                .map_err(crate::filesystem::remote::error::OpError::from)?;
+            crate::filesystem::remote::helpers::attr_or_not_found(
+                operation.store.as_ref(),
+                inode,
+                req.uid(),
+                req.gid(),
+            )
+        })();
+        match result {
+            Ok(attr) => {
+                operation.log_route("symlink", attr.ino.0);
+                reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0));
+            }
+            Err(error) => reply.error(error.errno()),
+        }
     }
 
     /// Create a hard link `newparent/newname` referring to `ino`.

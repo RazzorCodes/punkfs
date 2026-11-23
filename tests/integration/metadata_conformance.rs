@@ -98,9 +98,7 @@ fn symlinks_are_reported_as_symlinks_by_lstat() {
     );
 }
 
-/// **Known gap.** punkfs refuses `readlink` outright (`EPERM`) instead of
-/// exposing the target. Any symlink in the backing store is therefore
-/// unusable through the mount, and tools that follow links break.
+/// The returned target is the link's stored target, not its resolved path.
 #[test]
 fn readlink_returns_the_symlink_target() {
     if !common::require_fuse() {
@@ -114,13 +112,13 @@ fn readlink_returns_the_symlink_target() {
 
     assert!(
         result.is_ok(),
-        "CONTRACT VIOLATED\n  contract: readlink(2) on a symlink must return its target\n  got:      {:?}\n  cause:    readlink is refused with EPERM",
+        "CONTRACT VIOLATED\n  contract: readlink(2) on a symlink must return its target\n  got:      {:?}\n  expected: the stored link target",
         result.unwrap_err()
     );
     assert_eq!(result.unwrap(), std::path::Path::new("target.txt"));
 }
 
-/// **Known gap.** Following a symlink requires `readlink` to work.
+/// Following a link must resolve its target through the mounted namespace.
 #[test]
 fn opening_a_symlink_reads_through_to_the_target() {
     if !common::require_fuse() {
@@ -178,10 +176,8 @@ fn chmod_changes_the_mode_on_the_backing_file() {
     )
     .unwrap();
 
-    let result = std::fs::set_permissions(
-        mount.at("c.txt"),
-        std::fs::Permissions::from_mode(0o600),
-    );
+    let result =
+        std::fs::set_permissions(mount.at("c.txt"), std::fs::Permissions::from_mode(0o600));
 
     assert!(
         result.is_ok(),
@@ -220,7 +216,10 @@ fn utime_sets_the_backing_mtime() {
         .modified()
         .unwrap();
     assert_eq!(
-        mtime.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
         1_000_000
     );
 }

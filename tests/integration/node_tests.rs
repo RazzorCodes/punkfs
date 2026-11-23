@@ -125,6 +125,61 @@ impl Drop for Node {
 }
 
 #[test]
+fn startup_handshake_includes_existing_symlinks() {
+    if !require_fuse() {
+        return;
+    }
+    let addrs = addresses(2);
+    let mut a = Node::start("a", addrs[0], &[("b", addrs[1])], "a.txt");
+    std::os::unix::fs::symlink("a.txt", a.raw("existing-link")).unwrap();
+    let mut b = Node::start("b", addrs[1], &[("a", addrs[0])], "b.txt");
+    let _ = wait_event(&b, "handshake", "peer handshake completed");
+    assert!(a.stop().success());
+    let metadata = fs::symlink_metadata(b.path().join("existing-link")).unwrap();
+    assert!(metadata.file_type().is_symlink());
+    assert!(b.stop().success());
+}
+
+#[test]
+fn symlink_creation_publishes_and_cross_node_targets_resolve() {
+    if !require_fuse() {
+        return;
+    }
+    let addrs = addresses(2);
+    let mut a = Node::start("a", addrs[0], &[("b", addrs[1])], "a.txt");
+    let mut b = Node::start("b", addrs[1], &[("a", addrs[0])], "b.txt");
+    let _ = wait_event(&a, "handshake", "peer handshake completed");
+    let _ = wait_event(&b, "handshake", "peer handshake completed");
+    std::os::unix::fs::symlink("b.txt", a.path().join("link")).unwrap();
+    let sent = wait_event(&a, "publish_create", "creation metadata published");
+    let accepted = wait_event(&b, "publish_create", "creation metadata accepted");
+    assert_eq!(sent["correlation_id"], accepted["correlation_id"]);
+    assert_eq!(
+        fs::read_link(b.path().join("link")).unwrap(),
+        Path::new("b.txt")
+    );
+    assert_eq!(fs::read(b.path().join("link")).unwrap(), b"b");
+    let client_context = fs::read_to_string(b.logs.path().join("node.jsonl")).unwrap();
+    let server_logs = fs::read_to_string(a.logs.path().join("node.jsonl")).unwrap();
+    let client = client_context
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["component"] == "grpc.backing" && event["operation"] == "readlink");
+    assert!(
+        client.is_none(),
+        "reader should not serve the owner's symlink"
+    );
+    let served = server_logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["component"] == "grpc.backing" && event["operation"] == "readlink")
+        .expect("owner logs remote readlink");
+    assert!(served["correlation_id"].as_str().is_some());
+    assert!(a.stop().success());
+    assert!(b.stop().success());
+}
+
+#[test]
 fn nodes_serve_only_their_own_backing_and_mount_bidirectionally() {
     if !require_fuse() {
         return;

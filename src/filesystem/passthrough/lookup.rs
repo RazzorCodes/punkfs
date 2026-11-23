@@ -6,7 +6,7 @@ use crate::store::db::metadata_cache::{Availability, FsEntry};
 pub(super) fn entry(local: &Local, path: &str) -> Result<FsEntry, StoreError> {
     let attr = local
         .backing
-        .attr_for(path, &local.real(path)?)
+        .attr_for(path, &local.backing.entry_path(path).map_err(super::error)?)
         .map_err(super::error)?;
     Ok(FsEntry {
         inode: 0,

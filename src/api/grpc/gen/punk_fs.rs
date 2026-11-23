@@ -125,6 +125,18 @@ pub struct GetAttrResponse {
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadLinkRequest {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadLinkResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub target: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadFileRequest {
     #[prost(string, tag = "1")]
     pub path: ::prost::alloc::string::String,
@@ -312,9 +324,8 @@ pub mod punk_fs_client {
     /// every `FileAttr`.
     ///
     /// This iteration serves the read/write path against a single backing
-    /// folder on one machine. Namespace creation (new files, new directories,
-    /// symlinks) is deliberately absent: entries are created by the machine
-    /// that owns the storage, not through the merged mount.
+    /// folder on one machine. Remote namespace creation is absent: combined
+    /// nodes create entries on the node whose merged mount receives the request.
     #[derive(Debug, Clone)]
     pub struct PunkFsClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -420,7 +431,7 @@ pub mod punk_fs_client {
                 .insert(GrpcMethod::new("punk_fs.PunkFs", "ListDirectory"));
             self.inner.unary(req, path, codec).await
         }
-        /// Attributes of one path.
+        /// Attributes of one path, without following the final symlink.
         pub async fn get_attr(
             &mut self,
             request: impl tonic::IntoRequest<super::GetAttrRequest>,
@@ -440,6 +451,28 @@ pub mod punk_fs_client {
             let path = http::uri::PathAndQuery::from_static("/punk_fs.PunkFs/GetAttr");
             let mut req = request.into_request();
             req.extensions_mut().insert(GrpcMethod::new("punk_fs.PunkFs", "GetAttr"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Return the exact target bytes of a symlink without following it.
+        pub async fn read_link(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReadLinkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReadLinkResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/punk_fs.PunkFs/ReadLink");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("punk_fs.PunkFs", "ReadLink"));
             self.inner.unary(req, path, codec).await
         }
         /// Positional read. A response shorter than `length` means end of file;
@@ -662,11 +695,19 @@ pub mod punk_fs_server {
             tonic::Response<super::ListDirectoryResponse>,
             tonic::Status,
         >;
-        /// Attributes of one path.
+        /// Attributes of one path, without following the final symlink.
         async fn get_attr(
             &self,
             request: tonic::Request<super::GetAttrRequest>,
         ) -> std::result::Result<tonic::Response<super::GetAttrResponse>, tonic::Status>;
+        /// Return the exact target bytes of a symlink without following it.
+        async fn read_link(
+            &self,
+            request: tonic::Request<super::ReadLinkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReadLinkResponse>,
+            tonic::Status,
+        >;
         /// Positional read. A response shorter than `length` means end of file;
         /// an empty response means the offset is at or past EOF.
         async fn read_file(
@@ -744,9 +785,8 @@ pub mod punk_fs_server {
     /// every `FileAttr`.
     ///
     /// This iteration serves the read/write path against a single backing
-    /// folder on one machine. Namespace creation (new files, new directories,
-    /// symlinks) is deliberately absent: entries are created by the machine
-    /// that owns the storage, not through the merged mount.
+    /// folder on one machine. Remote namespace creation is absent: combined
+    /// nodes create entries on the node whose merged mount receives the request.
     #[derive(Debug)]
     pub struct PunkFsServer<T> {
         inner: Arc<T>,
@@ -896,6 +936,49 @@ pub mod punk_fs_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetAttrSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/punk_fs.PunkFs/ReadLink" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadLinkSvc<T: PunkFs>(pub Arc<T>);
+                    impl<T: PunkFs> tonic::server::UnaryService<super::ReadLinkRequest>
+                    for ReadLinkSvc<T> {
+                        type Response = super::ReadLinkResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReadLinkRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PunkFs>::read_link(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadLinkSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -1455,7 +1538,7 @@ pub mod peer_metadata_client {
                 .insert(GrpcMethod::new("punk_fs.PeerMetadata", "Handshake"));
             self.inner.unary(req, path, codec).await
         }
-        /// Announce a newly created regular file (and needed parent directories).
+        /// Announce a newly created regular file or symlink (and needed parents).
         pub async fn publish_create(
             &mut self,
             request: impl tonic::IntoRequest<super::PublishCreateRequest>,
@@ -1503,7 +1586,7 @@ pub mod peer_metadata_server {
             tonic::Response<super::HandshakeResponse>,
             tonic::Status,
         >;
-        /// Announce a newly created regular file (and needed parent directories).
+        /// Announce a newly created regular file or symlink (and needed parents).
         async fn publish_create(
             &self,
             request: tonic::Request<super::PublishCreateRequest>,

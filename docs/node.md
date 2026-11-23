@@ -50,19 +50,22 @@ mutation may have succeeded at its owner and is not automatically retried.
 
 This remains an experimental trusted-environment prototype, not a safe sole
 copy of data. There is **no peer authentication or authorization**. More
-importantly, lexical path checks do **not** confine symlink traversal beneath
-the export: a symlink in a backing tree can lead outside it, including through
-the inbound service. Use only trusted backing trees and peers, keep the
-listener off untrusted networks, and do not serve secrets or unrelated files.
-Descriptor-relative confinement remains necessary before considering this a
-secure or generally safe export boundary.
+importantly, backing path confinement has not been comprehensively hardened
+or audited against concurrent changes. Use only trusted backing trees and
+peers, keep the listener off untrusted networks, and do not serve secrets or
+unrelated files. Existing symlinks are exposed as links, and combined-node mounts can create
+them locally; client-only mounts still refuse symlink creation. The calling
+kernel resolves stored targets in the caller's namespace.
+Backing content operations do not intentionally follow symlinks.
 
-There is no handshake or verification that a peer address still belongs to its
-configured node ID. Do not reuse peer addresses for different exports while
-nodes are running. Reassigning an address can route writes to the wrong node.
-There is no periodic metadata publication yet: changes are discovered during
-on-demand listing. The in-memory catalog does not remember nodes that have
-never answered after restart. Conflict recovery and reliable backing-disk
+An initial inventory handshake checks the claimed configured node ID, but
+subsequent data operations are not bound to a verified process or export. Do
+not reuse peer addresses for different exports while nodes are running.
+Regular-file and symlink creates are published best-effort; other changes are
+discovered during on-demand listing. There is no periodic publication. The in-memory catalog does not remember nodes that have
+never answered after restart. Symlink GUIDs may be derived from their path
+because Linux filesystems often disallow user xattrs on symlinks; identity may
+therefore change after an out-of-band rename or restart. Conflict recovery and reliable backing-disk
 identity checks remain unfinished. The current implementation also keeps a
 separate small Tokio runtime for the synchronous client store; consolidating
 runtime ownership is future work. See `docs/peer-node-plan.md` for the next

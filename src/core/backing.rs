@@ -53,32 +53,6 @@ impl Backing {
         &self.node_id
     }
 
-    pub(crate) fn log_skipped_symlinks(
-        &self,
-        ctx: &crate::telemetry::OperationContext,
-        count: usize,
-    ) {
-        use crate::telemetry::{self, Event, Severity};
-        if count == 0 {
-            return;
-        }
-        let Some(logger) = telemetry::global() else {
-            return;
-        };
-        if !logger.enabled(Severity::Debug) {
-            return;
-        }
-        let mut event = Event::new(Severity::Debug, "backing", "unsupported symlinks omitted");
-        event.operation = Some("list".into());
-        event
-            .fields
-            .insert("node_id".into(), serde_json::json!(self.node_id));
-        event
-            .fields
-            .insert("count".into(), serde_json::json!(count));
-        logger.emit_in(ctx, event);
-    }
-
     /// Refuse to serve a directory already covered by a FUSE filesystem. This
     /// also rejects other FUSE backings until mount identity can be verified.
     pub(crate) fn reject_fuse_mount(&self) -> io::Result<()> {
@@ -155,9 +129,9 @@ impl Backing {
         })
     }
 
-    /// Pin a name's parent. The final name may not exist, but a symlink is
-    /// rejected. The guard keeps the parent stable for the operation.
-    pub(crate) fn path(&self, logical: &str) -> io::Result<SafePath> {
+    /// Pin a name's parent. The final component is never followed by this
+    /// resolver; callers must use an appropriate no-follow operation.
+    pub(crate) fn entry_path(&self, logical: &str) -> io::Result<SafePath> {
         let relative = Self::relative(logical)?;
         let (parent, leaf) = match relative.file_name() {
             Some(leaf) => (relative.parent().unwrap_or(Path::new("")), leaf),
@@ -165,18 +139,29 @@ impl Backing {
         };
         let descriptor = self.open_relative(parent, libc::O_PATH | libc::O_DIRECTORY)?;
         let path = PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd())).join(leaf);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(io::Error::from_raw_os_error(libc::ELOOP));
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
         Ok(SafePath {
             _descriptor: descriptor,
             path,
         })
+    }
+
+    /// Resolve a name for callers that do not support final symlinks.
+    pub(crate) fn path(&self, logical: &str) -> io::Result<SafePath> {
+        let path = self.entry_path(logical)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                Err(io::Error::from_raw_os_error(libc::ELOOP))
+            }
+            Ok(_) => Ok(path),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(path),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) fn readlink(&self, logical: &str) -> io::Result<Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::read_link(self.entry_path(logical)?)
+            .map(|target| target.as_os_str().as_bytes().to_vec())
     }
 
     pub(crate) fn ensure_parents(&self, logical: &str) -> io::Result<()> {
@@ -285,10 +270,9 @@ impl Backing {
         let meta = std::fs::symlink_metadata(real)?;
         let file_type = meta.file_type();
 
-        if file_type.is_symlink() {
-            return Err(io::Error::from_raw_os_error(libc::ELOOP));
-        }
-        let kind = if file_type.is_dir() {
+        let kind = if file_type.is_symlink() {
+            FsEntryKind::Link
+        } else if file_type.is_dir() {
             FsEntryKind::Directory
         } else {
             FsEntryKind::File

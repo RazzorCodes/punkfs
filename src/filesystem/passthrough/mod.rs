@@ -110,10 +110,59 @@ impl Local {
         path: &str,
         ctx: &OperationContext,
     ) -> Result<Vec<u8>, StoreError> {
-        let result = misc::readlink(&self.real(path)?);
+        let result = self
+            .backing
+            .entry_path(path)
+            .map_err(error)
+            .and_then(|real| misc::readlink(&real));
         self.log(
             ctx,
             "readlink",
+            &result.as_ref().map(|_| ()).map_err(Clone::clone),
+        );
+        result
+    }
+
+    pub(crate) fn create_symlink(
+        &self,
+        store: &dyn StoreApi,
+        ctx: &OperationContext,
+        path: &str,
+        target: &Path,
+    ) -> Result<u64, StoreError> {
+        let result = (|| {
+            let _guard = self.mutation.lock().unwrap();
+            let parent = path
+                .rsplit_once('/')
+                .map(|(p, _)| if p.is_empty() { "/" } else { p })
+                .unwrap_or("/");
+            self.refresh_listing(store, ctx, parent)?;
+            if store.get_inode(path).is_some() {
+                return Err(StoreError::Local(libc::EEXIST));
+            }
+            self.ensure_parents(path)?;
+            let real = self.backing.entry_path(path).map_err(error)?;
+            std::os::unix::fs::symlink(target, &real).map_err(error)?;
+            match self
+                .entry(path)
+                .and_then(|entry| store.upsert_local_in(ctx, entry))
+            {
+                Ok(inode) => {
+                    if let Some(publisher) = self.publisher.lock().unwrap().as_ref() {
+                        publisher.created(ctx, path);
+                    }
+                    Ok(inode)
+                }
+                Err(err) => {
+                    let rollback = fs::remove_file(&real).map_err(error);
+                    self.log(ctx, "symlink_rollback", &rollback);
+                    Err(err)
+                }
+            }
+        })();
+        self.log(
+            ctx,
+            "symlink",
             &result.as_ref().map(|_| ()).map_err(Clone::clone),
         );
         result
@@ -253,6 +302,14 @@ impl StoreApi for RoutedStore {
         let _ = self.ensure_listed(p);
         self.inner.cached_children(p)
     }
+    fn readlink(&self, p: &str) -> Result<Vec<u8>, StoreError> {
+        self.check_conflict(p)?;
+        if self.local(p) {
+            self.local.readlink(p, &self.ctx)
+        } else {
+            self.inner.readlink_in(&self.ctx, p)
+        }
+    }
     fn read(&self, p: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
         self.check_conflict(p)?;
         if !self.local(p) {
@@ -315,14 +372,21 @@ impl StoreApi for RoutedStore {
     fn unlink(&self, p: &str) -> Result<(), StoreError> {
         self.check_conflict(p)?;
         if !self.local(p) {
-            // Removing a remote name followed by a local create (notably
-            // cp -f) would destroy the remote file before recreation can
-            // succeed. Refuse until replacement is transactional.
+            // Regular-file replacement needs transactional handling. A symlink
+            // can be removed directly without touching its target.
+            let symlink = self
+                .inner
+                .get_inode(p)
+                .and_then(|ino| self.inner.get_entry(ino))
+                .is_some_and(|entry| entry.kind == crate::store::db::attributes::FsEntryKind::Link);
+            if symlink {
+                return self.inner.unlink_in(&self.ctx, p);
+            }
             return self.result("unlink", Err(StoreError::NotPermitted));
         }
         let result = (|| {
             let _guard = self.local.mutation.lock().unwrap();
-            fs::remove_file(self.local.real(p)?).map_err(error)?;
+            fs::remove_file(self.local.backing.entry_path(p).map_err(error)?).map_err(error)?;
             self.inner.remove_local_in(&self.ctx, p)
         })();
         self.result("unlink", result)
@@ -367,7 +431,11 @@ impl StoreApi for RoutedStore {
         let result = (|| {
             let _guard = self.local.mutation.lock().unwrap();
             self.local.ensure_parents(new)?;
-            meta::rename(&self.local.real(old)?, &self.local.real(new)?, flags)?;
+            meta::rename(
+                &self.local.backing.entry_path(old).map_err(error)?,
+                &self.local.backing.entry_path(new).map_err(error)?,
+                flags,
+            )?;
             self.inner.rename_local_in(&self.ctx, old, new)
         })();
         self.result("rename", result)

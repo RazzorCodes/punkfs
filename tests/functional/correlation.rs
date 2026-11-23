@@ -30,6 +30,7 @@ impl ObservedServer {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("hello.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("hello.txt", root.path().join("link")).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -174,6 +175,24 @@ fn functional_store_reuses_context_for_probe_and_read() {
         ids.iter().all(|id| id == &context.id().to_string()),
         "all calls must retain the original ID: {ids:?}"
     );
+}
+
+/// A remote readlink carries its operation context over the wire unchanged.
+#[test]
+fn functional_readlink_preserves_correlation() {
+    let server = ObservedServer::new();
+    let store = Store::new(
+        &server.url,
+        FsNode {
+            node_id: "node".into(),
+        },
+    )
+    .unwrap();
+    let context = OperationContext::new();
+    assert_eq!(store.readlink_in(&context, "/link").unwrap(), b"hello.txt");
+    let ids = server.ids();
+    assert!(!ids.is_empty());
+    assert!(ids.iter().all(|id| id == &context.id().to_string()));
 }
 
 /// Concurrent store operations keep their ids separate — no leak, no reuse.

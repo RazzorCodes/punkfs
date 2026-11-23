@@ -1,4 +1,4 @@
-//! Startup inventory exchange and best-effort publication of new files.
+//! Startup inventory exchange and best-effort publication of new files and symlinks.
 //!
 //! Inventories only add known contributions; they are never deletion scans.
 //! Connections are statically configured and are not authenticated.
@@ -99,7 +99,7 @@ fn validate(entries: &[PublishedEntry], create: bool) -> Result<(), Status> {
             Ok(FileKind::Directory) => {
                 names.insert(entry.path.as_str(), true);
             }
-            Ok(FileKind::File) => {
+            Ok(FileKind::File | FileKind::Symlink) => {
                 files += 1;
                 names.insert(entry.path.as_str(), false);
             }
@@ -108,7 +108,7 @@ fn validate(entries: &[PublishedEntry], create: bool) -> Result<(), Status> {
     }
     if create && files != 1 {
         return Err(Status::invalid_argument(
-            "create publication must contain one file",
+            "create publication must contain one file or symlink",
         ));
     }
     for entry in entries {
@@ -128,12 +128,11 @@ fn validate(entries: &[PublishedEntry], create: bool) -> Result<(), Status> {
         let file = entries
             .iter()
             .find(|entry| {
-                entry
-                    .attr
-                    .as_ref()
-                    .is_some_and(|attr| attr.kind == FileKind::File as i32)
+                entry.attr.as_ref().is_some_and(|attr| {
+                    attr.kind == FileKind::File as i32 || attr.kind == FileKind::Symlink as i32
+                })
             })
-            .expect("one file");
+            .expect("one file or symlink");
         if entries
             .iter()
             .any(|entry| entry.path != file.path && !Path::new(&file.path).starts_with(&entry.path))
@@ -159,7 +158,7 @@ fn apply(
 }
 
 fn published(backing: &Backing, path: &str) -> io::Result<PublishedEntry> {
-    let real = backing.path(path)?;
+    let real = backing.entry_path(path)?;
     let attr = backing.attr_for(path, &real)?;
     Ok(PublishedEntry {
         path: path.into(),
@@ -169,19 +168,14 @@ fn published(backing: &Backing, path: &str) -> io::Result<PublishedEntry> {
 
 /// Scan only the local backing descriptor. Failure means no complete inventory;
 /// callers must not translate it into an empty snapshot or a deletion.
-fn inventory(backing: &Backing, ctx: &OperationContext) -> io::Result<Vec<PublishedEntry>> {
+fn inventory(backing: &Backing, _ctx: &OperationContext) -> io::Result<Vec<PublishedEntry>> {
     let mut queue = VecDeque::from(["/".to_owned()]);
-    let mut skipped = 0;
     let mut entries = Vec::new();
     let mut bytes = 0usize;
     while let Some(directory) = queue.pop_front() {
         let real = backing.existing(&directory)?;
         for item in std::fs::read_dir(&real)? {
             let item = item?;
-            if item.file_type()?.is_symlink() {
-                skipped += 1;
-                continue;
-            }
             let name = item
                 .file_name()
                 .into_string()
@@ -212,7 +206,6 @@ fn inventory(backing: &Backing, ctx: &OperationContext) -> io::Result<Vec<Publis
             }
         }
     }
-    backing.log_skipped_symlinks(ctx, skipped);
     Ok(entries)
 }
 

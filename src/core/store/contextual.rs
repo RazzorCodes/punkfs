@@ -35,6 +35,9 @@ impl StoreApi for ContextualStore {
     fn get_children(&self, path: &str) -> Vec<StoreChild> {
         self.inner.get_children_in(&self.context, path)
     }
+    fn readlink(&self, path: &str) -> Result<Vec<u8>, StoreError> {
+        self.inner.readlink_in(&self.context, path)
+    }
     fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
         self.inner.read_in(&self.context, path, offset, size)
     }

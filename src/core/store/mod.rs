@@ -20,8 +20,8 @@ use self::db::attributes::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use self::db::metadata_cache::{Availability, FsEntry, FsNode, ListingOutcome, MetadataCache};
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
-    self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, SetAttrRequest,
-    StatFsRequest, WriteFileRequest,
+    self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, ReadLinkRequest,
+    SetAttrRequest, StatFsRequest, WriteFileRequest,
 };
 use crate::telemetry::OperationContext;
 pub(crate) mod contextual;
@@ -140,6 +140,10 @@ pub trait StoreApi: Send + Sync {
     }
 
     // --- content -------------------------------------------------------
+    /// Return a symlink's target bytes without following it.
+    fn readlink(&self, _path: &str) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Unsupported("readlink".into()))
+    }
     /// Read at most `size` bytes at `offset`; a short read means EOF.
     fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError>;
     /// Write `data` at `offset`; returns how many bytes were taken.
@@ -172,6 +176,9 @@ pub trait StoreApi: Send + Sync {
     }
     fn get_children_in(&self, _ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
         self.get_children(path)
+    }
+    fn readlink_in(&self, _ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
+        self.readlink(path)
     }
     fn read_in(
         &self,
@@ -818,6 +825,31 @@ impl StoreApi for Store {
                 kind: e.kind,
             })
             .collect()
+    }
+
+    fn readlink(&self, path: &str) -> Result<Vec<u8>, StoreError> {
+        self.readlink_in(&OperationContext::new(), path)
+    }
+
+    fn readlink_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
+        self.require_reachable(ctx, path)?;
+        let (node_id, mut client) = self.client_for(path)?;
+        let response = self
+            .rt
+            .block_on(client.read_link(ctx.request(ReadLinkRequest {
+                path: path.to_owned(),
+            })))
+            .map_err(|status| {
+                if status.code() == tonic::Code::InvalidArgument
+                    && status.message() == "not a symlink"
+                {
+                    StoreError::Local(libc::EINVAL)
+                } else {
+                    StoreError::from(status)
+                }
+            })?;
+        self.conn_for(&node_id)?.touch();
+        Ok(response.into_inner().target)
     }
 
     fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {

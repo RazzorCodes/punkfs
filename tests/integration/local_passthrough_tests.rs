@@ -24,8 +24,11 @@ fn local_entries_and_creates_operate_on_the_covered_directory() {
         fs::read(root.path().join("existing")).unwrap(),
         b"local-data"
     );
-    assert!(fs::read_link(root.path().join("link")).is_err(), "symlinks are rejected");
-    assert!(fs::read(root.path().join("link")).is_err(), "symlinks are rejected");
+    assert_eq!(
+        fs::read_link(root.path().join("link")).unwrap(),
+        std::path::Path::new("existing")
+    );
+    assert_eq!(fs::read(root.path().join("link")).unwrap(), b"local-data");
     fs::write(root.path().join("existing"), b"short").unwrap();
     fs::set_permissions(
         root.path().join("existing"),

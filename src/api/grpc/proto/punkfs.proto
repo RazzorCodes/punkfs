@@ -11,15 +11,17 @@ package punk_fs;
 // every `FileAttr`.
 //
 // This iteration serves the read/write path against a single backing
-// folder on one machine. Namespace creation (new files, new directories,
-// symlinks) is deliberately absent: entries are created by the machine
-// that owns the storage, not through the merged mount.
+// folder on one machine. Remote namespace creation is absent: combined
+// nodes create entries on the node whose merged mount receives the request.
 service PunkFs {
   // Directory contents, including the guid/attrs of each child.
   rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
 
-  // Attributes of one path.
+  // Attributes of one path, without following the final symlink.
   rpc GetAttr(GetAttrRequest) returns (GetAttrResponse);
+
+  // Return the exact target bytes of a symlink without following it.
+  rpc ReadLink(ReadLinkRequest) returns (ReadLinkResponse);
 
   // Positional read. A response shorter than `length` means end of file;
   // an empty response means the offset is at or past EOF.
@@ -56,7 +58,7 @@ service PunkFs {
 service PeerMetadata {
   // Exchange the two local inventories once when a peer comes online.
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
-  // Announce a newly created regular file (and needed parent directories).
+  // Announce a newly created regular file or symlink (and needed parents).
   rpc PublishCreate(PublishCreateRequest) returns (PublishCreateResponse);
 }
 
@@ -145,6 +147,16 @@ message GetAttrRequest {
 
 message GetAttrResponse {
   FileAttr attr = 1;
+}
+
+// --- ReadLink --------------------------------------------------------------
+
+message ReadLinkRequest {
+  string path = 1;
+}
+
+message ReadLinkResponse {
+  bytes target = 1;
 }
 
 // --- ReadFile --------------------------------------------------------------

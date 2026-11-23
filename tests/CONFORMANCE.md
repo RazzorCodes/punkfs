@@ -11,8 +11,9 @@ Run it with:
 cargo test --test integration
 ```
 
-Current state: **98 passing, 16 failing**. Every failing test names a real
-gap in the FUSE/grpc implementation, listed below in the order they matter.
+A full run on the symlink implementation reported **109 passing, 14 failing**
+in integration, plus one blackbox failure for remote truncate. Counts may
+change as contract tests are added. Each failing test names a real gap.
 
 ## 1. `setattr` is refused, which breaks truncation and metadata (9 tests)
 
@@ -56,16 +57,15 @@ content rpcs).
 Related, and currently *passing* by accident: `reading_a_file_removed_mid_stream_reports_cleanly`
 accepts either the correct behaviour or a clean error.
 
-## 3. `readlink` is refused (2 tests)
+## 3. Symlinks
 
-`src/filesystem/misc.rs` returns `EPERM` for `readlink`, so no symlink in the
-backing store is usable through the mount:
-
-- `metadata_conformance::readlink_returns_the_symlink_target`
-- `metadata_conformance::opening_a_symlink_reads_through_to_the_target`
-
-`lstat` already reports the symlink correctly, which makes this worse: the
-entry is visible and looks like a link, then cannot be followed.
+Existing local and remote symlinks are listed, reported by `lstat`, and
+resolved by the kernel using the stored target. Combined nodes can create
+symlinks locally; client-only mounts still refuse creation. The conformance
+tests cover relative and absolute targets, links crossing backend ownership,
+dangling links, loops, byte-preserving targets, and link removal/rename.
+Symlink GUIDs can fall back to a path-derived identity, which does not survive
+an out-of-band rename; hardening concurrent namespace mutations remains open.
 
 ## 4. `rename` of a directory onto a non-empty directory (1 test)
 
@@ -129,9 +129,9 @@ FUSE layer does not surface them yet.
 These are product decisions, and the tests assert the refusal so a silent
 change would be caught:
 
-- Creating entries through the mount is refused (`create`, `mkdir`, `mknod`,
-  `symlink`, `link`). Entries are created by the machine that owns the
-  storage.
+- Client-only mounts refuse entry creation. Combined-node mounts create regular
+  files, directories, and symlinks locally; hard links and special files remain
+  unsupported.
 - Ownership changes (`chown`) are refused.
 - Cross-node moves are refused with `EXDEV`. A rename that would move a file
   between backing nodes is a copy, not a rename. Directory moves are

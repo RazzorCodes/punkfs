@@ -1,5 +1,5 @@
 //! Store-level peer behaviour: the client `Store` over several live
-//! `punkfs-server` processes, and the grpc backing's symlink rejection.
+//! `punkfs-server` processes, and the grpc backing's symlink handling.
 //! Whole operations exercised against the out-of-process mock system, no
 //! FUSE mount.
 
@@ -55,13 +55,16 @@ fn functional_unresponsive_peers_do_not_block_a_healthy_listing() {
     );
 }
 
-/// The grpc backing service refuses symlinks without touching their targets,
-/// protecting the pinned root from escape.
+/// The backing service exposes link metadata but never follows a link into
+/// another directory when servicing content operations.
 #[test]
-fn functional_grpc_backing_rejects_symlinks_without_touching_targets() {
+fn functional_grpc_backing_exposes_symlinks_without_following_them() {
     use punkfs::grpc::service::PunkFsService;
     use punkfs::punk_fs::punk_fs_server::PunkFs as _;
-    use punkfs::punk_fs::{GetAttrRequest, ListDirectoryRequest, ReadFileRequest, SetAttrRequest, WriteFileRequest};
+    use punkfs::punk_fs::{
+        FileKind, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, ReadLinkRequest,
+        SetAttrRequest, WriteFileRequest,
+    };
 
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -78,14 +81,40 @@ fn functional_grpc_backing_rejects_symlinks_without_touching_targets() {
             .await
             .unwrap()
             .into_inner();
-        assert!(list.entries.iter().all(|entry| entry.name != "escape" && entry.name != "link"));
+        for name in ["escape", "link"] {
+            assert_eq!(
+                list.entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap()
+                    .attr
+                    .as_ref()
+                    .unwrap()
+                    .kind,
+                FileKind::Symlink as i32
+            );
+        }
+        let attr = service
+            .get_attr(tonic::Request::new(GetAttrRequest {
+                path: "/link".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .attr
+            .unwrap();
+        assert_eq!(attr.kind, FileKind::Symlink as i32);
+        use std::os::unix::ffi::OsStrExt;
+        let link = service
+            .read_link(tonic::Request::new(ReadLinkRequest {
+                path: "/link".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(
-            service
-                .get_attr(tonic::Request::new(GetAttrRequest { path: "/link".into() }))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
+            link.target,
+            outside.path().join("private").as_os_str().as_bytes()
         );
         assert_eq!(
             service
@@ -134,5 +163,8 @@ fn functional_grpc_backing_rejects_symlinks_without_touching_targets() {
             tonic::Code::PermissionDenied
         );
     });
-    assert_eq!(fs::read(outside.path().join("private")).unwrap(), b"unchanged");
+    assert_eq!(
+        fs::read(outside.path().join("private")).unwrap(),
+        b"unchanged"
+    );
 }

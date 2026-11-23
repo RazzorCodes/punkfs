@@ -5,10 +5,8 @@
 //! an ephemeral port.
 //!
 //! Scope: this iteration serves content read/write, attributes, and removal
-//! for a *single* backing folder on the local machine. Creating namespace
-//! entries (new files, new directories, symlinks) is deliberately absent —
-//! entries are created by the machine that owns the storage, not through
-//! the merged mount.
+//! for a *single* backing folder on the local machine. Remote creation is
+//! absent; combined nodes create entries on their local backing through FUSE.
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -26,10 +24,10 @@ use crate::punk_fs::punk_fs_server::PunkFs;
 use crate::punk_fs::{
     Access as PbAccess, DirEntry, FileAttr, FileKind, FileTimes as PbFileTimes, FsyncFileRequest,
     FsyncFileResponse, GetAttrRequest, GetAttrResponse, ListDirectoryRequest,
-    ListDirectoryResponse, ReadFileRequest, ReadFileResponse, RemoveDirRequest, RemoveDirResponse,
-    RemoveFileRequest, RemoveFileResponse, RenameRequest, RenameResponse, SetAttrRequest,
-    SetAttrResponse, Stat as PbStat, StatFsRequest, StatFsResponse, StatFsResponse as PbStatFs,
-    WriteFileRequest, WriteFileResponse,
+    ListDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkRequest, ReadLinkResponse,
+    RemoveDirRequest, RemoveDirResponse, RemoveFileRequest, RemoveFileResponse, RenameRequest,
+    RenameResponse, SetAttrRequest, SetAttrResponse, Stat as PbStat, StatFsRequest, StatFsResponse,
+    StatFsResponse as PbStatFs, WriteFileRequest, WriteFileResponse,
 };
 use crate::store::db::attributes::{FileAttrData, FsEntryKind};
 
@@ -195,13 +193,8 @@ impl PunkFs for PunkFsService {
 
         let mut rd = tokio::fs::read_dir(&dir).await.map_err(io_status)?;
         let mut entries = Vec::new();
-        let mut skipped = 0;
 
         while let Some(entry) = rd.next_entry().await.map_err(io_status)? {
-            if entry.file_type().await.map_err(io_status)?.is_symlink() {
-                skipped += 1;
-                continue;
-            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_logical = if logical == "/" || logical.is_empty() {
                 format!("/{name}")
@@ -218,7 +211,6 @@ impl PunkFs for PunkFsService {
             });
         }
 
-        self.backing.log_skipped_symlinks(&context, skipped);
         // Stable order so listings are reproducible and diffable.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(context.response(ListDirectoryResponse { entries }))
@@ -230,11 +222,34 @@ impl PunkFs for PunkFsService {
     ) -> Result<Response<GetAttrResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let logical = request.get_ref().path.clone();
-        let real = self.resolve(&logical)?;
+        let real = self.backing.entry_path(&logical).map_err(io_status)?;
         let attr = self.backing.attr_for(&logical, &real).map_err(io_status)?;
         Ok(context.response(GetAttrResponse {
             attr: Some(to_proto_attr(&attr)),
         }))
+    }
+
+    async fn read_link(
+        &self,
+        request: Request<ReadLinkRequest>,
+    ) -> Result<Response<ReadLinkResponse>, Status> {
+        let context = crate::telemetry::OperationContext::from_request(&request)?;
+        let logical = request.into_inner().path;
+        let backing = self.backing.clone();
+        let result = tokio::task::spawn_blocking(move || backing.readlink(&logical))
+            .await
+            .map_err(|_| Status::internal("readlink worker failed"))
+            .and_then(|result| {
+                result.map_err(|err| {
+                    if err.raw_os_error() == Some(libc::EINVAL) {
+                        Status::invalid_argument("not a symlink")
+                    } else {
+                        io_status(err)
+                    }
+                })
+            });
+        self.log_io(&context, "readlink", &result);
+        Ok(context.response(ReadLinkResponse { target: result? }))
     }
 
     async fn read_file(
@@ -369,7 +384,10 @@ impl PunkFs for PunkFsService {
         request: Request<RemoveFileRequest>,
     ) -> Result<Response<RemoveFileResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
-        let real = self.resolve(&request.get_ref().path)?;
+        let real = self
+            .backing
+            .entry_path(&request.get_ref().path)
+            .map_err(io_status)?;
         tokio::fs::remove_file(&real).await.map_err(io_status)?;
         Ok(context.response(RemoveFileResponse {}))
     }
@@ -398,8 +416,8 @@ impl PunkFs for PunkFsService {
             ));
         }
 
-        let from = self.resolve(&req.old_path)?;
-        let to = self.resolve(&req.new_path)?;
+        let from = self.backing.entry_path(&req.old_path).map_err(io_status)?;
+        let to = self.backing.entry_path(&req.new_path).map_err(io_status)?;
         tokio::fs::rename(&from, &to).await.map_err(io_status)?;
         Ok(context.response(RenameResponse {}))
     }

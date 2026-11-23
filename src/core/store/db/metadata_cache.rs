@@ -523,7 +523,18 @@ impl MetadataCache {
                         .entries
                         .iter()
                         .filter(|e| e.node_id == node_id && direct_child(&e.path))
-                        .filter(|e| !reported.contains(&e.guid.as_str()))
+                        // A link's GUID can fall back to its path (Linux
+                        // commonly disallows user xattrs on symlinks). A
+                        // rename performed through this mount already moved
+                        // the cached inode; keep it when the new path is
+                        // observed with its new fallback GUID.
+                        .filter(|e| {
+                            !(reported.contains(&e.guid.as_str())
+                                || e.kind == FsEntryKind::Link
+                                    && children.iter().any(|child| {
+                                        child.path == e.path && child.kind == FsEntryKind::Link
+                                    }))
+                        })
                         .map(|e| e.path.clone())
                         .collect();
                     let before = self.entries.len();
