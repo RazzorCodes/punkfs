@@ -10,8 +10,8 @@
 //! entries are created by the machine that owns the storage, not through
 //! the merged mount.
 use std::io;
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, UNIX_EPOCH};
@@ -19,7 +19,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
-use crate::store::db::attributes::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
+use crate::core::backing::{Backing, SafePath};
+#[cfg(test)]
+use crate::core::backing::{derived_guid, read_guid_xattr, write_guid_xattr};
 use crate::punk_fs::punk_fs_server::PunkFs;
 use crate::punk_fs::{
     Access as PbAccess, DirEntry, FileAttr, FileKind, FileTimes as PbFileTimes, FsyncFileRequest,
@@ -29,36 +31,41 @@ use crate::punk_fs::{
     SetAttrResponse, Stat as PbStat, StatFsRequest, StatFsResponse, StatFsResponse as PbStatFs,
     WriteFileRequest, WriteFileResponse,
 };
+use crate::store::db::attributes::{FileAttrData, FsEntryKind};
 
 /// Upper bound on a single `ReadFile` answer. The FUSE layer asks for
 /// whatever the kernel wants (commonly 128 KiB); this keeps one malicious
 /// request from asking for a gigabyte.
 pub const MAX_READ: u32 = 1024 * 1024;
 
-/// GUID namespace for the deterministic fallback guid. Fixed forever:
-/// changing it renames every entry in the system.
-const GUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x6ba7b810_9dad_11d1_80b4_00c04fd430c8);
-
-/// xattr holding an entry's persisted punkfs identity.
-///
-/// Namespaced under `user.` so an unprivileged server can write it, and
-/// attached to the inode so `rename(2)` carries it to the new path.
-const GUID_XATTR: &str = "user.punkfs.guid";
-
 /// A served folder, plus the hooks `main` needs to run and stop it.
 pub struct PunkFsService {
-    root: PathBuf,
-    node_id: String,
+    backing: Arc<Backing>,
+    allow_shutdown: bool,
     /// Set by the `Shutdown` rpc (only served with `dev-shutdown`).
     shutdown: Arc<Notify>,
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PunkFsService {
+    /// Construct a standalone service, panicking if the backing cannot be
+    /// opened. Prefer `try_new` when the root comes from configuration.
     pub fn new(root: impl Into<PathBuf>, node_id: impl Into<String>) -> Arc<Self> {
+        Self::try_new(root, node_id).expect("open backing directory")
+    }
+
+    /// Construct a standalone service over an existing directory.
+    pub fn try_new(root: impl Into<PathBuf>, node_id: impl Into<String>) -> io::Result<Arc<Self>> {
+        let root = root.into();
+        let node_id = node_id.into();
+        let backing = Arc::new(Backing::open(&root, &node_id)?);
+        Ok(Self::from_backing(backing, true))
+    }
+
+    pub(crate) fn from_backing(backing: Arc<Backing>, allow_shutdown: bool) -> Arc<Self> {
         Arc::new(PunkFsService {
-            root: root.into(),
-            node_id: node_id.into(),
+            backing,
+            allow_shutdown,
             shutdown: Arc::new(Notify::new()),
             shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -71,161 +78,44 @@ impl PunkFsService {
         }
     }
 
-    /// Turn a client-supplied logical path into a real path under `root`,
-    /// rejecting anything that could escape it.
-    ///
-    /// Only plain names are allowed: no `..`, no absolute prefix, no
-    /// embedded separator tricks. This is the single confinement point for
-    /// every rpc.
-    fn resolve(&self, rel: &str) -> Result<PathBuf, Status> {
-        let trimmed = rel.trim_start_matches('/');
-        let path = Path::new(trimmed);
-        for component in path.components() {
-            match component {
-                Component::Normal(_) => {}
-                // "." is harmless; "..", root and prefixes are not.
-                Component::CurDir => {}
-                _ => return Err(Status::invalid_argument("invalid path")),
-            }
-        }
-        Ok(self.root.join(path))
+    fn resolve(&self, rel: &str) -> Result<SafePath, Status> {
+        self.backing.path(rel).map_err(io_status)
     }
 
-    /// punkfs identity for a logical path, **persisted on the entry** so it
-    /// survives a rename.
-    ///
-    /// The identity lives in the `user.punkfs.guid` xattr, which the kernel
-    /// carries across `rename(2)` for free because it belongs to the inode,
-    /// not the path. Minting is therefore a one-time event per file:
-    ///
-    /// 1. Read the xattr; if present, that is the identity.
-    /// 2. Otherwise mint a fresh v4 guid and try to store it.
-    /// 3. If the filesystem refuses xattrs (`EPERM`/`ENOTSUP`, e.g. a
-    ///    network mount), fall back to a v5 derived from `(node, path)`.
-    ///    Stable per path but *not* across renames — the pre-persistence
-    ///    behaviour, kept so such a backing store still works at all.
-    ///
-    /// Concurrent first-views of the same file may mint different guids and
-    /// one write wins; that is acceptable because the loser is only ever
-    /// observed before a client has cached it.
-    fn guid_for(&self, logical: &str, real: &Path) -> String {
-        if let Some(guid) = read_guid_xattr(real) {
-            return guid;
-        }
-
-        let minted = uuid::Uuid::new_v4().to_string();
-        if write_guid_xattr(real, &minted) {
-            return minted;
-        }
-
-        // No xattr support: fall back to the deterministic form.
-        derived_guid(&self.node_id, logical)
-    }
-
-    /// Read a path's attributes without following a final symlink.
-    pub(crate) fn attr_for(&self, logical: &str, real: &Path) -> io::Result<FileAttrData> {
-        let meta = std::fs::symlink_metadata(real)?;
-        let file_type = meta.file_type();
-
-        let kind = if file_type.is_symlink() {
-            FsEntryKind::Link
-        } else if file_type.is_dir() {
-            FsEntryKind::Directory
-        } else {
-            FsEntryKind::File
+    fn log_io<T>(
+        &self,
+        context: &crate::telemetry::OperationContext,
+        operation: &str,
+        result: &Result<T, Status>,
+    ) {
+        use crate::telemetry::{self, Event, Severity};
+        let Some(logger) = telemetry::global() else {
+            return;
         };
-
-        Ok(FileAttrData {
-            guid: self.guid_for(logical, real),
-            kind,
-            times: FileTimes {
-                accessed: meta.accessed().unwrap_or(UNIX_EPOCH),
-                modified: meta.modified().unwrap_or(UNIX_EPOCH),
-                changed: UNIX_EPOCH + Duration::from_secs(meta.ctime().max(0) as u64),
-                created: meta.created().unwrap_or(UNIX_EPOCH),
-            },
-            access: Access {
-                mode: meta.permissions().mode() as u16 & 0o7777,
-                uid: meta.uid(),
-                gid: meta.gid(),
-            },
-            stat: Stat {
-                size: meta.len(),
-                blocks: meta.blocks() as u32,
-                block_size: meta.blksize() as u16,
-                rdev: meta.rdev() as u16,
-                nlink: meta.nlink() as u32,
-                flags: 0,
-            },
-        })
-    }
-}
-
-/// The deterministic guid used when the backing filesystem cannot store an
-/// xattr.
-///
-/// Stable for a given `(node, path)` but **not** across renames — that is
-/// the documented cost of running without xattr support.
-fn derived_guid(node_id: &str, logical: &str) -> String {
-    uuid::Uuid::new_v5(&GUID_NAMESPACE, format!("{node_id}/{logical}").as_bytes()).to_string()
-}
-
-/// Read an entry's persisted guid, if it has a valid one.
-///
-/// A malformed or empty xattr is treated as absent rather than an error: a
-/// garbage value must not make a healthy file unreadable.
-fn read_guid_xattr(path: &Path) -> Option<String> {
-    let name = std::ffi::CString::new(GUID_XATTR).ok()?;
-    let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-
-    // lgetxattr: do not follow a final symlink, matching `attr_for`'s use of
-    // `symlink_metadata`.
-    let size = unsafe { libc::lgetxattr(cpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
-    if size <= 0 {
-        return None;
-    }
-
-    let mut buf = vec![0u8; size as usize];
-    let read = unsafe {
-        libc::lgetxattr(
-            cpath.as_ptr(),
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    if read <= 0 {
-        return None;
-    }
-    buf.truncate(read as usize);
-
-    let text = String::from_utf8(buf).ok()?;
-    let text = text.trim();
-    // Only accept something that is actually a guid.
-    uuid::Uuid::parse_str(text).ok()?;
-    Some(text.to_owned())
-}
-
-/// Persist `guid` on an entry, reporting whether it took.
-///
-/// Failure is not an error: it means the backing filesystem has no xattr
-/// support and the caller falls back to a derived guid.
-fn write_guid_xattr(path: &Path, guid: &str) -> bool {
-    let (Ok(name), Ok(cpath)) = (
-        std::ffi::CString::new(GUID_XATTR),
-        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()),
-    ) else {
-        return false;
-    };
-
-    unsafe {
-        libc::lsetxattr(
-            cpath.as_ptr(),
-            name.as_ptr(),
-            guid.as_ptr().cast(),
-            guid.len(),
-            0,
-        ) == 0
+        let severity = if result.is_ok() {
+            Severity::Debug
+        } else {
+            Severity::Warning
+        };
+        if !logger.enabled(severity) {
+            return;
+        }
+        let mut event = Event::new(severity, "grpc.backing", "backing operation completed");
+        event.operation = Some(operation.into());
+        event
+            .fields
+            .insert("node_id".into(), serde_json::json!(self.backing.node_id()));
+        event.fields.insert(
+            "outcome".into(),
+            serde_json::json!(if result.is_ok() { "ok" } else { "error" }),
+        );
+        if let Err(status) = result {
+            event.fields.insert(
+                "grpc_code".into(),
+                serde_json::json!(format!("{:?}", status.code())),
+            );
+        }
+        logger.emit_in(context, event);
     }
 }
 
@@ -237,7 +127,7 @@ fn file_kind(kind: FsEntryKind) -> FileKind {
     }
 }
 
-fn to_proto_attr(data: &FileAttrData) -> FileAttr {
+pub(crate) fn to_proto_attr(data: &FileAttrData) -> FileAttr {
     let secs = |t: std::time::SystemTime| {
         t.duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -273,6 +163,9 @@ fn to_proto_attr(data: &FileAttrData) -> FileAttr {
 /// into an errno. The mapping is deliberately narrow: anything the client
 /// cannot act on becomes `internal`.
 pub fn io_status(err: io::Error) -> Status {
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        return Status::permission_denied("symlink traversal is not supported");
+    }
     match err.kind() {
         io::ErrorKind::NotFound => Status::not_found(err.to_string()),
         io::ErrorKind::PermissionDenied => Status::permission_denied(err.to_string()),
@@ -286,26 +179,8 @@ pub fn io_status(err: io::Error) -> Status {
     }
 }
 
-/// Open a file for reading or writing at an absolute position.
-struct PositionalFile(std::fs::File);
-
-/// `std::fs::File` positional helpers, kept tiny and explicit.
-fn open_for_read(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::File::open(path)
-}
-
 fn open_for_write(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).open(path)
-}
-
-impl PositionalFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.0.read_at(buf, offset)
-    }
-
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
-        self.0.write_at(buf, offset)
-    }
 }
 
 #[tonic::async_trait]
@@ -316,12 +191,17 @@ impl PunkFs for PunkFsService {
     ) -> Result<Response<ListDirectoryResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let logical = request.get_ref().path.clone();
-        let dir = self.resolve(&logical)?;
+        let dir = self.backing.existing(&logical).map_err(io_status)?;
 
         let mut rd = tokio::fs::read_dir(&dir).await.map_err(io_status)?;
         let mut entries = Vec::new();
+        let mut skipped = 0;
 
         while let Some(entry) = rd.next_entry().await.map_err(io_status)? {
+            if entry.file_type().await.map_err(io_status)?.is_symlink() {
+                skipped += 1;
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_logical = if logical == "/" || logical.is_empty() {
                 format!("/{name}")
@@ -329,6 +209,7 @@ impl PunkFs for PunkFsService {
                 format!("{}/{name}", logical.trim_end_matches('/'))
             };
             let attr = self
+                .backing
                 .attr_for(&child_logical, &entry.path())
                 .map_err(io_status)?;
             entries.push(DirEntry {
@@ -337,6 +218,7 @@ impl PunkFs for PunkFsService {
             });
         }
 
+        self.backing.log_skipped_symlinks(&context, skipped);
         // Stable order so listings are reproducible and diffable.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(context.response(ListDirectoryResponse { entries }))
@@ -349,7 +231,7 @@ impl PunkFs for PunkFsService {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let logical = request.get_ref().path.clone();
         let real = self.resolve(&logical)?;
-        let attr = self.attr_for(&logical, &real).map_err(io_status)?;
+        let attr = self.backing.attr_for(&logical, &real).map_err(io_status)?;
         Ok(context.response(GetAttrResponse {
             attr: Some(to_proto_attr(&attr)),
         }))
@@ -361,24 +243,17 @@ impl PunkFs for PunkFsService {
     ) -> Result<Response<ReadFileResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
-        let real = self.resolve(&req.path)?;
-        let length = req.length.min(MAX_READ) as usize;
-
-        let path = real.clone();
+        let backing = self.backing.clone();
         let blocking_context = context.clone();
         let data = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
             let _context = blocking_context;
-            let file = PositionalFile(open_for_read(&path)?);
-            let mut buf = vec![0u8; length];
-            let read = file.read_at(&mut buf, req.offset)?;
-            buf.truncate(read);
-            Ok(buf)
+            backing.read(&req.path, req.offset, req.length.min(MAX_READ))
         })
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(io_status)?;
-
-        Ok(context.response(ReadFileResponse { data }))
+        .map_err(|e| Status::internal(e.to_string()))
+        .and_then(|result| result.map_err(io_status));
+        self.log_io(&context, "read", &data);
+        Ok(context.response(ReadFileResponse { data: data? }))
     }
 
     async fn write_file(
@@ -387,30 +262,17 @@ impl PunkFs for PunkFsService {
     ) -> Result<Response<WriteFileResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
-        let real = self.resolve(&req.path)?;
-
-        let path = real.clone();
+        let backing = self.backing.clone();
         let blocking_context = context.clone();
         let written = tokio::task::spawn_blocking(move || -> io::Result<u32> {
             let _context = blocking_context;
-            let file = PositionalFile(open_for_write(&path)?);
-            let mut written = 0usize;
-            // A short write is rare but legal; keep going until the buffer
-            // is drained so the client never sees a silent truncation.
-            while written < req.data.len() {
-                let n = file.write_at(&req.data[written..], req.offset + written as u64)?;
-                if n == 0 {
-                    break;
-                }
-                written += n;
-            }
-            Ok(written as u32)
+            backing.write(&req.path, req.offset, &req.data)
         })
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(io_status)?;
-
-        Ok(context.response(WriteFileResponse { written }))
+        .map_err(|e| Status::internal(e.to_string()))
+        .and_then(|result| result.map_err(io_status));
+        self.log_io(&context, "write", &written);
+        Ok(context.response(WriteFileResponse { written: written? }))
     }
 
     async fn fsync_file(
@@ -419,22 +281,17 @@ impl PunkFs for PunkFsService {
     ) -> Result<Response<FsyncFileResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
-        let real = self.resolve(&req.path)?;
-
+        let backing = self.backing.clone();
         let blocking_context = context.clone();
-        tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let _context = blocking_context;
-            let file = open_for_write(&real)?;
-            if req.datasync {
-                file.sync_data()
-            } else {
-                file.sync_all()
-            }
+            backing.fsync(&req.path, req.datasync)
         })
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(io_status)?;
-
+        .map_err(|e| Status::internal(e.to_string()))
+        .and_then(|result| result.map_err(io_status));
+        self.log_io(&context, "fsync", &result);
+        result?;
         Ok(context.response(FsyncFileResponse {}))
     }
 
@@ -451,7 +308,7 @@ impl PunkFs for PunkFsService {
             return Err(Status::unimplemented("changing ownership is not supported"));
         }
 
-        let real = self.resolve(&req.path)?;
+        let real = self.backing.existing(&req.path).map_err(io_status)?;
 
         if let Some(mode) = req.mode {
             std::fs::set_permissions(&real, std::fs::Permissions::from_mode(mode & 0o7777))
@@ -469,7 +326,11 @@ impl PunkFs for PunkFsService {
             apply_times(&real, req.accessed_unix, req.modified_unix)?;
         }
 
-        let attr = self.attr_for(&req.path, &real).map_err(io_status)?;
+        let entry = self.resolve(&req.path)?;
+        let attr = self
+            .backing
+            .attr_for(&req.path, &entry)
+            .map_err(io_status)?;
         Ok(context.response(SetAttrResponse {
             attr: Some(to_proto_attr(&attr)),
         }))
@@ -480,7 +341,7 @@ impl PunkFs for PunkFsService {
         request: Request<StatFsRequest>,
     ) -> Result<Response<StatFsResponse>, Status> {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
-        let root = self.root.clone();
+        let root = self.resolve("/")?;
         let blocking_context = context.clone();
         let stats = tokio::task::spawn_blocking(move || -> io::Result<PbStatFs> {
             let _context = blocking_context;
@@ -548,6 +409,11 @@ impl PunkFs for PunkFsService {
         request: Request<crate::punk_fs::ShutdownRequest>,
     ) -> Result<Response<crate::punk_fs::ShutdownResponse>, Status> {
         let _context = crate::telemetry::OperationContext::from_request(&request)?;
+        if !self.allow_shutdown {
+            return Err(Status::unimplemented(
+                "shutdown is unavailable in node mode",
+            ));
+        }
         #[cfg(feature = "dev-shutdown")]
         {
             self.shutdown_requested.store(true, Ordering::SeqCst);

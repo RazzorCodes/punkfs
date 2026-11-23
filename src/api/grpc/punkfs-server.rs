@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("serving {} on {addr} as {node_id}", root.display());
 
-    let service = PunkFsService::new(root, node_id);
+    let service = PunkFsService::try_new(root, node_id)?;
 
     // Select on the shutdown rpc so a test (or an operator with the
     // dev-shutdown feature) can stop the server cleanly. Without the

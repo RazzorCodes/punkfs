@@ -8,7 +8,8 @@ edition = "2024"
 fuser = "0.18.0"
 libc = "0.2"
 prost = "0.14.6"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "time", "signal"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14.9"
 tonic-prost = "0.14.9"
 uuid = { version = "1", features = ["v4", "v5"] }

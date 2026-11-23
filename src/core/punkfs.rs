@@ -278,6 +278,16 @@ impl Fs {
             return Err("remote node ids must be unique".into());
         }
         let local = Local::new(mountpoint, &node.node_id)?;
+        Self::mount_with_backing(nodes, mountpoint, node, route_console, local)
+    }
+
+    pub(crate) fn mount_with_backing(
+        nodes: &[(String, String)],
+        mountpoint: &Path,
+        node: FsNode,
+        route_console: bool,
+        local: Arc<Local>,
+    ) -> Result<(fuser::BackgroundSession, Arc<Store>), Box<dyn std::error::Error>> {
         let store = Arc::new(Store::new_with_local(nodes, node)?);
         let session = Self::spawn(
             Fs {

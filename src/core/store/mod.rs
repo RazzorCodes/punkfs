@@ -8,7 +8,7 @@
 //! Identity note: entries are identified by `guid` (the punkfs identity,
 //! assigned by the server) and addressed locally by `inode` (allocated
 //! here). The store is the layer that maps between the two.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -257,6 +257,8 @@ pub trait StoreApi: Send + Sync {
 
 pub struct Store {
     metadata_cache: Mutex<MetadataCache>,
+    // Prevent an older in-flight listing from erasing a newer peer notice.
+    peer_generation: Mutex<HashMap<String, u64>>,
     listed: Mutex<HashSet<String>>, // directories already fetched from the server
     rt: Runtime,
     /// One connection per backing node, in stable merge order.
@@ -321,7 +323,10 @@ impl Store {
         local: FsNode,
         local_node_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let rt = Runtime::new()?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
 
         // connect_lazy doesn't fail if the server is down; the first RPC
         // connects. It needs a runtime context, hence enter().
@@ -330,7 +335,10 @@ impl Store {
             nodes
                 .iter()
                 .map(|(node_id, url)| {
-                    let channel = Endpoint::from_shared(url.to_owned())?.connect_lazy();
+                    let channel = Endpoint::from_shared(url.to_owned())?
+                        .connect_timeout(Duration::from_secs(2))
+                        .timeout(Duration::from_secs(2))
+                        .connect_lazy();
                     Ok(NodeConn {
                         node_id: node_id.clone(),
                         client: PunkFsClient::new(channel),
@@ -351,6 +359,7 @@ impl Store {
 
         Ok(Store {
             metadata_cache: Mutex::new(metadata_cache),
+            peer_generation: Mutex::new(HashMap::new()),
             listed: Mutex::new(HashSet::new()),
             rt,
             nodes: conns,
@@ -358,6 +367,53 @@ impl Store {
             conflicts: Mutex::new(HashSet::new()),
             local_node_enabled,
         })
+    }
+
+    /// Merge unsolicited metadata without treating missing entries as deletion.
+    /// Conflicting contributions remain inaccessible rather than replacing a
+    /// previously known owner. Caller validates the peer and all wire data.
+    pub(crate) fn ingest_peer_entries(
+        &self,
+        ctx: &OperationContext,
+        peer: &str,
+        entries: Vec<FsEntry>,
+    ) -> usize {
+        let mut generations = self.peer_generation.lock().unwrap();
+        let generation = generations.entry(peer.to_owned()).or_default();
+        *generation = generation.wrapping_add(1);
+        let mut cache = self.metadata_cache.lock().unwrap();
+        let mut conflicts = Vec::new();
+        let mut accepted = 0;
+        for entry in entries {
+            if let Some(known) = cache.get_entry_by_path(&entry.path) {
+                if known.node_id != peer {
+                    if known.kind == FsEntryKind::Directory && entry.kind == FsEntryKind::Directory
+                    {
+                        continue;
+                    }
+                    conflicts.push(entry.path.clone());
+                    continue;
+                }
+                // Do not let a delayed announcement roll back fresher state.
+                if known.guid != entry.guid {
+                    conflicts.push(entry.path.clone());
+                }
+                continue;
+            }
+            if let Some(known) = cache.get_entry_by_guid(&entry.guid) {
+                conflicts.push(entry.path.clone());
+                conflicts.push(known.path.clone());
+                continue;
+            }
+            cache.upsert_entry_in(ctx, entry);
+            accepted += 1;
+        }
+        if !conflicts.is_empty() {
+            self.conflicts.lock().unwrap().extend(conflicts);
+        }
+        drop(cache);
+        drop(generations);
+        accepted
     }
 
     /// How long a node may stay silent before its entries are treated as
@@ -391,12 +447,17 @@ impl Store {
     /// Which node owns `path`.
     fn node_of(&self, path: &str) -> Result<String, StoreError> {
         let tree = self.metadata_cache.lock().unwrap();
-        tree.get_entry_by_path(path)
-            .map(|e| e.node_id.clone())
-            // An unknown path is routed to the first node so the server can
-            // produce the authoritative NotFound; guessing a node would be
-            // worse than asking one.
-            .or_else(|| self.nodes.first().map(|n| n.node_id.clone()))
+        if let Some(entry) = tree.get_entry_by_path(path) {
+            return Ok(entry.node_id.clone());
+        }
+        // Legacy remote-only clients historically probed their first server
+        // for unknown paths. A combined node must never guess an owner.
+        if self.local_node_enabled {
+            return Err(StoreError::NotFound);
+        }
+        self.nodes
+            .first()
+            .map(|node| node.node_id.clone())
             .ok_or_else(|| StoreError::Io("no backing nodes configured".into()))
     }
 
@@ -423,15 +484,37 @@ impl Store {
 
         let mut outcomes: Vec<(String, ListingOutcome)> = Vec::new();
         let mut any_answered = false;
+        let observed_generations = self.peer_generation.lock().unwrap().clone();
 
-        for conn in &self.nodes {
-            let mut client = conn.client.clone(); // cheap: shares the channel
-            let answer = self.rt.block_on(
-                client.list_directory(ctx.request(ListDirectoryRequest { path: dir.into() })),
-            );
+        // Fetch in parallel under per-RPC deadlines. Preserve configuration
+        // order when applying the outcomes so merging is deterministic.
+        let answers = self.rt.block_on(async {
+            let mut tasks = tokio::task::JoinSet::new();
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+            for (index, conn) in self.nodes.iter().enumerate() {
+                let mut client = conn.client.clone();
+                let request = ctx.request(ListDirectoryRequest { path: dir.into() });
+                let permits = permits.clone();
+                tasks.spawn(async move {
+                    let _permit = permits.acquire().await.expect("semaphore remains open");
+                    (index, client.list_directory(request).await)
+                });
+            }
+            let mut answers: Vec<_> = (0..self.nodes.len()).map(|_| None).collect();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+            while let Ok(Some(result)) = tokio::time::timeout_at(deadline, tasks.join_next()).await
+            {
+                if let Ok((index, answer)) = result {
+                    answers[index] = Some(answer);
+                }
+            }
+            tasks.abort_all();
+            answers
+        });
 
+        for (conn, answer) in self.nodes.iter().zip(answers) {
             match answer {
-                Ok(resp) => {
+                Some(Ok(resp)) => {
                     conn.touch();
                     any_answered = true;
                     let children = resp
@@ -445,7 +528,7 @@ impl Store {
                         .collect::<Vec<_>>();
                     outcomes.push((conn.node_id.clone(), ListingOutcome::Answered(children)));
                 }
-                Err(_) => {
+                Some(Err(_)) | None => {
                     outcomes.push((conn.node_id.clone(), ListingOutcome::Unreachable));
                 }
             }
@@ -456,11 +539,17 @@ impl Store {
         if outcomes.is_empty() && self.local_node_enabled {
             return Ok(());
         }
+        let generations = self.peer_generation.lock().unwrap();
+        outcomes.retain(|(node, _)| {
+            generations.get(node).copied().unwrap_or(0)
+                == observed_generations.get(node).copied().unwrap_or(0)
+        });
         let conflicts = self
             .metadata_cache
             .lock()
             .unwrap()
             .reconcile_from_in(ctx, dir, outcomes);
+        drop(generations);
         if !conflicts.is_empty() {
             for path in &conflicts {
                 eprintln!("punkfs: duplicate name across nodes, refusing to pick one: {path}");
@@ -578,7 +667,12 @@ fn attr_from_proto(attr: punk_fs::FileAttr) -> FileAttrData {
 }
 
 /// Build a catalog entry from a server-reported attribute message.
-fn entry_from_attr(inode: u64, path: &str, attr: punk_fs::FileAttr, node_id: &str) -> FsEntry {
+pub(crate) fn entry_from_attr(
+    inode: u64,
+    path: &str,
+    attr: punk_fs::FileAttr,
+    node_id: &str,
+) -> FsEntry {
     let attr = attr_from_proto(attr);
     FsEntry {
         inode,

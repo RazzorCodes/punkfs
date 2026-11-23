@@ -20,6 +20,7 @@ mod local_passthrough_tests;
 mod metadata_cache_tests;
 mod metadata_conformance;
 mod multinode_conformance;
+mod node_tests;
 mod mutation_conformance;
 mod read_conformance;
 mod store_tests;

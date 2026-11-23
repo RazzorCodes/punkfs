@@ -3,49 +3,54 @@
 //! The root descriptor is opened before mounting. Relative operations use
 //! `/proc/self/fd` so they do not traverse the FUSE mount recursively.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::grpc::service::PunkFsService;
+use crate::core::backing::{Backing, SafePath};
 use crate::store::db::metadata_cache::FsEntry;
 use crate::store::{SetattrChanges, StoreApi, StoreChild, StoreError};
 use crate::telemetry::{self, Event, OperationContext, Severity};
 
 mod dir;
 mod error;
-mod file;
 mod helpers;
 mod lookup;
 mod meta;
 mod misc;
 
 pub(crate) struct Local {
-    root: File,
+    backing: Arc<Backing>,
     node: String,
-    attrs: Arc<PunkFsService>,
     mutation: Mutex<()>,
+    publisher: Mutex<Option<crate::grpc::peer::Publisher>>,
 }
 
 use error::from_io as error;
 
 impl Local {
     pub(crate) fn new(mountpoint: &Path, node: &str) -> io::Result<Arc<Self>> {
-        let root = File::open(mountpoint)?;
-        if !root.metadata()?.is_dir() {
-            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
-        }
-        Ok(Arc::new(Self {
-            root,
-            node: node.into(),
-            attrs: PunkFsService::new("/", node),
-            mutation: Mutex::new(()),
-        }))
+        Ok(Self::from_backing(Arc::new(Backing::open(
+            mountpoint, node,
+        )?)))
     }
 
-    fn real(&self, path: &str) -> Result<PathBuf, StoreError> {
+    pub(crate) fn from_backing(backing: Arc<Backing>) -> Arc<Self> {
+        Arc::new(Self {
+            node: backing.node_id().to_owned(),
+            backing,
+            mutation: Mutex::new(()),
+            publisher: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn set_publisher(&self, publisher: crate::grpc::peer::Publisher) {
+        *self.publisher.lock().unwrap() = Some(publisher);
+    }
+
+    fn real(&self, path: &str) -> Result<SafePath, StoreError> {
         helpers::real(self, path)
     }
 
@@ -89,7 +94,7 @@ impl Local {
         ctx: &OperationContext,
         dir: &str,
     ) -> Result<(), StoreError> {
-        match dir::list(self, dir) {
+        match dir::list(self, ctx, dir) {
             Ok(entries) => store.reconcile_local_in(ctx, dir, entries),
             Err(StoreError::Local(libc::ENOENT)) => store.reconcile_local_in(ctx, dir, Vec::new()),
             Err(e) => Err(e),
@@ -97,12 +102,7 @@ impl Local {
     }
 
     fn ensure_parents(&self, path: &str) -> Result<(), StoreError> {
-        let parent = self
-            .real(path)?
-            .parent()
-            .ok_or(StoreError::Local(libc::EINVAL))?
-            .to_owned();
-        fs::create_dir_all(parent).map_err(error)
+        self.backing.ensure_parents(path).map_err(error)
     }
 
     pub(crate) fn readlink(
@@ -156,7 +156,12 @@ impl Local {
                 .entry(path)
                 .and_then(|entry| store.upsert_local_in(ctx, entry))
             {
-                Ok(inode) => Ok(inode),
+                Ok(inode) => {
+                    if !directory && let Some(publisher) = self.publisher.lock().unwrap().as_ref() {
+                        publisher.created(ctx, path);
+                    }
+                    Ok(inode)
+                }
                 Err(e) => {
                     let rollback = if directory {
                         fs::remove_dir(&real)
@@ -253,7 +258,7 @@ impl StoreApi for RoutedStore {
         if !self.local(p) {
             return self.inner.read_in(&self.ctx, p, offset, size);
         }
-        let result = file::read(&self.local.real(p)?, offset, size);
+        let result = self.local.backing.read(p, offset, size).map_err(error);
         self.result("read", result)
     }
     fn write(&self, p: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
@@ -261,7 +266,7 @@ impl StoreApi for RoutedStore {
         if !self.local(p) {
             return self.inner.write_in(&self.ctx, p, offset, data);
         }
-        let result = file::write(&self.local.real(p)?, offset, data);
+        let result = self.local.backing.write(p, offset, data).map_err(error);
         self.result("write", result)
     }
     fn fsync(&self, p: &str, datasync: bool) -> Result<(), StoreError> {
@@ -269,7 +274,7 @@ impl StoreApi for RoutedStore {
         if !self.local(p) {
             return self.inner.fsync_in(&self.ctx, p, datasync);
         }
-        let result = file::fsync(&self.local.real(p)?, datasync);
+        let result = self.local.backing.fsync(p, datasync).map_err(error);
         self.result("fsync", result)
     }
     fn setattr(
@@ -282,7 +287,7 @@ impl StoreApi for RoutedStore {
             return self.inner.setattr_in(&self.ctx, p, c);
         }
         let result = (|| {
-            let path = self.local.real(p)?;
+            let path = self.local.backing.existing(p).map_err(error)?;
             meta::setattr(&path, c)?;
             let entry = self.local.entry(p)?;
             let attr = entry.attr.clone();

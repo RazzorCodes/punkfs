@@ -52,6 +52,32 @@ service PunkFs {
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
 
+// Node-to-node metadata control. This never forwards file contents.
+service PeerMetadata {
+  // Exchange the two local inventories once when a peer comes online.
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  // Announce a newly created regular file (and needed parent directories).
+  rpc PublishCreate(PublishCreateRequest) returns (PublishCreateResponse);
+}
+
+message PublishedEntry {
+  string path = 1;
+  FileAttr attr = 2;
+}
+message HandshakeRequest {
+  string node_id = 1;
+  repeated PublishedEntry entries = 2;
+}
+message HandshakeResponse {
+  string node_id = 1;
+  repeated PublishedEntry entries = 2;
+}
+message PublishCreateRequest {
+  string node_id = 1;
+  repeated PublishedEntry entries = 2;
+}
+message PublishCreateResponse {}
+
 // --- shared payloads -------------------------------------------------------
 
 enum FileKind {

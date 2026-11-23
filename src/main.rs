@@ -8,14 +8,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mountpoint = PathBuf::from(
         args.next()
-            .ok_or("usage: punkfs <mountpoint> <local-node-id> [<remote-node-id>=<url> ...]")?,
+            .ok_or("usage: punkfs <mountpoint> <local-node-id> [--listen <address>] [<remote-node-id>=<url> ...]")?,
     );
     let local = args.next().ok_or("missing local node id")?;
     let mut nodes = Vec::new();
-    for arg in args {
+    let mut listen = None;
+    while let Some(arg) = args.next() {
+        if arg == "--listen" {
+            if listen.is_some() {
+                return Err("--listen may only be supplied once".into());
+            }
+            listen = Some(args.next().ok_or("--listen requires an address")?.parse()?);
+            continue;
+        }
         let (id, url) = arg
             .split_once('=')
-            .ok_or("expected <remote-node-id>=<url>")?;
+            .ok_or("expected <remote-node-id>=<url> or --listen <address>")?;
         if id.is_empty() || url.is_empty() {
             return Err("remote node id and URL must not be empty".into());
         }
@@ -29,6 +37,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("0") | Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("PUNKFS_LOG_ROUTES must be 1, 0, true, or false".into()),
     };
+    if let Some(listen) = listen {
+        return punkfs::core::node::run(punkfs::core::node::NodeConfig {
+            mountpoint,
+            node_id: local,
+            listen,
+            peers: nodes,
+            route_console,
+        });
+    }
     let node = FsNode { node_id: local };
     let _session = if route_console {
         PunkFs::mount_with_local_console(&nodes, &mountpoint, node)?
