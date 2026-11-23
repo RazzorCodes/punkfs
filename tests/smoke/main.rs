@@ -5,6 +5,8 @@
 //! tests that assume it would tell a confusing story, so we pin the
 //! primitive cheaply here.
 
+mod posix_backing;
+
 use std::time::{Duration, SystemTime};
 
 use punkfs::store::db::attributes::{FileAttrData, FileTimes, FsEntryKind, Stat};

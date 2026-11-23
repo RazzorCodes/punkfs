@@ -11,6 +11,9 @@
 //! end. No synthetic in-process mocks; the real binaries are the system
 //! under test.
 
+#[path = "../posix_contract/mod.rs"]
+mod posix_contract;
+
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -21,9 +24,9 @@ use std::time::{Duration, Instant};
 /// half-mounted state on a machine without FUSE.
 fn require_fuse() -> bool {
     if Path::new("/dev/fuse").exists()
-        && std::env::var_os("PATH").map(|p| {
-            std::env::split_paths(&p).any(|d| d.join("fusermount3").exists())
-        }).unwrap_or(false)
+        && std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join("fusermount3").exists()))
+            .unwrap_or(false)
     {
         return true;
     }
@@ -36,6 +39,7 @@ fn require_fuse() -> bool {
 struct Node {
     child: Child,
     root: tempfile::TempDir,
+    _logs: tempfile::TempDir,
 }
 
 impl Node {
@@ -48,6 +52,7 @@ impl Node {
         addr: SocketAddr,
         peers: &[(String, SocketAddr)],
     ) -> Self {
+        let logs = tempfile::tempdir().expect("separate log directory");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_punkfs"));
         cmd.arg(root.path())
             .arg(id)
@@ -55,7 +60,7 @@ impl Node {
             .arg(addr.to_string())
             .env("PUNKFS_LOG_DESTINATION", "file")
             .env("PUNKFS_LOG_LEVEL", "debug")
-            .env("PUNKFS_LOG_FILE", root.path().join("node.jsonl"))
+            .env("PUNKFS_LOG_FILE", logs.path().join("node.jsonl"))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         for (peer_id, peer_addr) in peers {
@@ -65,6 +70,7 @@ impl Node {
         let mut node = Self {
             child,
             root,
+            _logs: logs,
         };
         node.wait_ready();
         node
@@ -78,16 +84,28 @@ impl Node {
 
     fn wait_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(15);
+        let target = std::fs::canonicalize(self.root.path()).unwrap();
         while Instant::now() < deadline {
             if self.child.try_wait().ok().flatten().is_some() {
                 panic!("node exited during startup");
             }
-            if std::fs::read_dir(self.root.path()).is_ok() {
+            let mounted = std::fs::read_to_string("/proc/self/mountinfo")
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.split_once(" - "))
+                .any(|(left, right)| {
+                    left.split_whitespace().nth(4) == target.to_str()
+                        && right
+                            .split_whitespace()
+                            .next()
+                            .is_some_and(|kind| kind.starts_with("fuse"))
+                });
+            if mounted && std::fs::read_dir(&target).is_ok() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("node never became ready");
+        panic!("node never mounted at {}", target.display());
     }
 
     fn stop(&mut self) {
@@ -130,6 +148,206 @@ fn peers(i: usize, n: usize, ids: &[String], addrs: &[SocketAddr]) -> Vec<(Strin
         .collect()
 }
 
+/// Exercise a remote-owned file through a real two-node process deployment.
+fn run_posix(contract: fn(&Path), mode: u32) {
+    if !require_fuse() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let addrs = addresses(2);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("data"), b"abcdef").unwrap();
+    std::fs::write(first.path().join("other"), b"other").unwrap();
+    std::fs::set_permissions(
+        first.path().join("data"),
+        std::fs::Permissions::from_mode(mode),
+    )
+    .unwrap();
+    let mut a = Node::start("a", first, addrs[0], &[("b".into(), addrs[1])]);
+    let mut b = Node::start("b", second, addrs[1], &[("a".into(), addrs[0])]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::symlink_metadata(b.path().join("data")).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote file never became visible"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    contract(b.path());
+    b.stop();
+    a.stop();
+}
+
+macro_rules! posix_contracts {
+    ($($name:ident => $contract:ident $(, mode = $mode:expr)?;)+) => {$ (
+        #[test]
+        fn $name() { posix_contracts!(@run $contract $(, $mode)?); }
+    )+};
+    (@run $contract:ident, $mode:expr) => { run_posix(posix_contract::$contract, $mode) };
+    (@run $contract:ident) => { run_posix(posix_contract::$contract, 0o600) };
+}
+
+posix_contracts! {
+    blackbox_remote_truncate => truncate;
+    blackbox_remote_chmod => mode;
+    blackbox_remote_nanosecond_timestamps => timestamps;
+    blackbox_open_handle_after_unlink => open_handle_unlink;
+    blackbox_open_handle_after_rename => open_handle_rename;
+    blackbox_open_handle_after_destination_replacement => open_handle_replaced_destination;
+    blackbox_zero_mode_is_reported => permissions, mode = 0;
+    blackbox_access_denies_mode_zero => access_checks, mode = 0;
+    blackbox_access_denies_without_execute_bits => access_executable;
+    blackbox_owner_can_retain_ownership => ownership;
+    blackbox_hard_links_share_identity => hard_link;
+    blackbox_local_hard_links_share_identity => local_hard_link;
+    blackbox_fifo_is_a_fifo => fifo;
+    blackbox_user_extended_attributes_round_trip => xattr;
+    blackbox_list_extended_attributes => xattr_list;
+    blackbox_posix_acl_round_trips => acl_roundtrip;
+    blackbox_non_utf8_filename_round_trips => byte_filename;
+    blackbox_new_files_and_directories_can_be_created => create_file_and_directory;
+    blackbox_symlinks_follow_normal_rules => symlink_semantics;
+    blackbox_concurrent_append_is_atomic => concurrent_append;
+    blackbox_concurrent_exclusive_create_has_one_winner => concurrent_create_exclusive;
+    blackbox_advisory_locks_exclude_other_open_files => advisory_lock;
+    blackbox_fsync_and_fdatasync_are_usable => fsync_data;
+    blackbox_mmap_reads_file_contents => mmap_read;
+    blackbox_rename_nonempty_directory_preserves_both => rename_nonempty;
+    blackbox_rename_noreplace_preserves_existing_file => rename_noreplace;
+    blackbox_rename_exchange_swaps_files => rename_exchange;
+}
+
+#[test]
+fn blackbox_owner_ids_match_backing_even_when_gid_is_zero() {
+    if !require_fuse() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let addrs = addresses(2);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let data = first.path().join("data");
+    std::fs::write(&data, b"abcdef").unwrap();
+    let raw = std::ffi::CString::new(data.as_os_str().as_encoded_bytes()).unwrap();
+    if unsafe { libc::chown(raw.as_ptr(), u32::MAX, 0) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EPERM) {
+            eprintln!("skipping gid-zero ownership test: no permission to set backing gid 0");
+            return;
+        }
+        panic!("set backing gid: {err}");
+    }
+    let expected = std::fs::metadata(data).unwrap();
+    let mut a = Node::start("a", first, addrs[0], &[("b".into(), addrs[1])]);
+    let mut b = Node::start("b", second, addrs[1], &[("a".into(), addrs[0])]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::symlink_metadata(b.path().join("data")).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "remote file never became visible"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    posix_contract::uid_gid_match(b.path(), expected.uid(), expected.gid());
+    b.stop();
+    a.stop();
+}
+
+fn seeded_xattr_case(contract: fn(&Path)) {
+    if !require_fuse() {
+        return;
+    }
+    let addrs = addresses(2);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("data"), b"abcdef").unwrap();
+    if let Err(err) = posix_contract::seed_xattr(&first.path().join("data")) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::EPERM)
+        ) {
+            eprintln!("skipping xattr: backing does not support it: {err}");
+            return;
+        }
+        panic!("seed xattr: {err}");
+    }
+    let mut a = Node::start("a", first, addrs[0], &[("b".into(), addrs[1])]);
+    let mut b = Node::start("b", second, addrs[1], &[("a".into(), addrs[0])]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::symlink_metadata(b.path().join("data")).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "remote file never became visible"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    contract(b.path());
+    b.stop();
+    a.stop();
+}
+
+#[test]
+fn blackbox_existing_user_xattr_can_be_read_listed_and_removed() {
+    seeded_xattr_case(posix_contract::seeded_xattr);
+}
+#[test]
+fn blackbox_existing_user_xattr_can_be_listed() {
+    seeded_xattr_case(posix_contract::seeded_xattr_list);
+}
+#[test]
+fn blackbox_existing_user_xattr_can_be_removed() {
+    seeded_xattr_case(posix_contract::seeded_xattr_remove);
+}
+
+#[test]
+fn blackbox_append_after_another_mount_grows_file_uses_current_eof() {
+    if !require_fuse() {
+        return;
+    }
+    use std::io::Write;
+    let addrs = addresses(2);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("data"), b"").unwrap();
+    let mut a = Node::start("a", first, addrs[0], &[("b".into(), addrs[1])]);
+    let mut b = Node::start("b", second, addrs[1], &[("a".into(), addrs[0])]);
+    let file = b.path().join("data");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&file).is_ok_and(|metadata| metadata.len() == 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote empty file must be visible"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(a.path().join("data"))
+        .unwrap();
+    writer.write_all(b"abcdef").unwrap();
+    drop(writer);
+    let mut appender = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap();
+    appender.write_all(b"-new").unwrap();
+    drop(appender);
+    assert_eq!(
+        std::fs::read(a.path().join("data")).unwrap(),
+        b"abcdef-new",
+        "append must use the current owner EOF"
+    );
+    b.stop();
+    a.stop();
+}
+
 /// The whole product under one assertion: a folder is built from several
 /// remote folders, a file seeded on one node's backing directory appears in
 /// every other node's mount, and a file created through one node's mount is
@@ -144,7 +362,11 @@ fn blackbox_changes_on_one_node_are_visible_in_all_others() {
     let roots: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     // Seed each node's own pre-existing file before its process starts.
     for i in 0..3 {
-        std::fs::write(roots[i].path().join(format!("own-{i}.txt")), format!("from {i}")).unwrap();
+        std::fs::write(
+            roots[i].path().join(format!("own-{i}.txt")),
+            format!("from {i}"),
+        )
+        .unwrap();
     }
     let mut nodes = Vec::new();
     for (i, root) in roots.into_iter().enumerate() {
@@ -165,7 +387,11 @@ fn blackbox_changes_on_one_node_are_visible_in_all_others() {
     }
 
     // Create a file through node 0's mount; it must appear in the others.
-    std::fs::write(nodes[0].path().join("new-file.txt"), b"created-through-mount").unwrap();
+    std::fs::write(
+        nodes[0].path().join("new-file.txt"),
+        b"created-through-mount",
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_millis(900));
     for i in 0..3 {
         let ok = std::fs::read(nodes[i].path().join("new-file.txt"))

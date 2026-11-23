@@ -11,9 +11,13 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+#[path = "../posix_contract/mod.rs"]
+mod shared_posix_contract;
+
 mod correlation;
 mod merge;
 mod metadata_cache;
 mod multinode;
 mod peers;
+mod posix_contract;
 mod store;

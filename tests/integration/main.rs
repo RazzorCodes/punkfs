@@ -10,6 +10,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../posix_contract/mod.rs"]
+mod posix_contract;
 
 mod cli_conformance;
 mod handle_conformance;
@@ -17,6 +19,8 @@ mod local_passthrough_tests;
 mod metadata_conformance;
 mod multinode_conformance;
 mod node_tests;
+#[path = "posix_contract.rs"]
+mod posix_contract_tests;
 mod mutation_conformance;
 mod read_conformance;
 mod telemetry_tests;

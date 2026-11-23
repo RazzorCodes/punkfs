@@ -40,4 +40,5 @@ work, not claims that the current code already provides them.
   console routing, and end-to-end correlation propagation when those features
   are implemented. Follow the project's existing tests and avoid claiming
   unsupported telemetry behavior is already available. See
-  `docs/telemetry-plan.md` for the implementation plan and acceptance tests.
+  `.docs/telemetry-plan.md` for the implementation plan and acceptance tests.
+- All agent-generated or agent-required docs exist in the gitignored .docs folder. Do not create another folder to host docs.
