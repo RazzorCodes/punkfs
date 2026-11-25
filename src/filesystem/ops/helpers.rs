@@ -73,18 +73,25 @@ pub(crate) fn attr_for(store: &dyn StoreApi, inode: u64, uid: u32, gid: u32) -> 
 /// Like [`attr_for`], but reports an unknown inode as `ENOENT`.
 pub(crate) fn attr_or_not_found(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     inode: u64,
     uid: u32,
     gid: u32,
 ) -> OpResult<FileAttr> {
-    let entry = store.catalog_inode(inode)?.ok_or(OpError::NotFound)?;
+    let entry = store
+        .catalog_inode_in(ctx, inode)?
+        .ok_or(OpError::NotFound)?;
     Ok(attr_from(inode, &entry.attr, uid, gid))
 }
 
 /// Resolve an inode to its catalog path.
-pub(crate) fn path_of(store: &dyn StoreApi, inode: u64) -> OpResult<String> {
+pub(crate) fn path_of(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+    inode: u64,
+) -> OpResult<String> {
     store
-        .catalog_inode(inode)?
+        .catalog_inode_in(ctx, inode)?
         .map(|e| e.path)
         .ok_or(OpError::NotFound)
 }

@@ -23,32 +23,45 @@ use crate::filesystem::filesystem::helpers_for_create;
 use crate::store::{CreateEntry, StoreApi};
 
 /// Return the target bytes of a symlink from its owning backend.
-pub(crate) fn readlink_decision(store: &dyn StoreApi, ino: u64) -> OpResult<Vec<u8>> {
-    let path = helpers::path_of(store, ino)?;
+pub(crate) fn readlink_decision(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+    ino: u64,
+) -> OpResult<Vec<u8>> {
+    let path = helpers::path_of(store, ctx, ino)?;
     if store.has_conflict(&path) {
         return Err(OpError::Local(libc::EIO));
     }
-    Ok(store.readlink(&path)?)
+    Ok(store.readlink_in(ctx, &path)?)
 }
 
 fn mknod_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     parent: u64,
     name: &OsStr,
     mode: u32,
     rdev: u32,
 ) -> OpResult<u64> {
-    helpers_for_create::create(store, parent, name, CreateEntry::Special { mode, rdev })
+    helpers_for_create::create(
+        store,
+        ctx,
+        parent,
+        name,
+        CreateEntry::Special { mode, rdev },
+    )
 }
 
 fn symlink_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     parent: u64,
     name: &OsStr,
     target: &Path,
 ) -> OpResult<u64> {
     helpers_for_create::create(
         store,
+        ctx,
         parent,
         name,
         CreateEntry::Symlink {
@@ -61,18 +74,19 @@ fn symlink_decision(
 /// links rather than silently copying).
 pub(crate) fn link_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     ino: u64,
     newparent: u64,
     newname: &OsStr,
 ) -> OpResult<(u64, fuser::FileAttr)> {
-    let _ = helpers::path_of(store, ino)?;
-    let parent_path = helpers::path_of(store, newparent)?;
+    let _ = helpers::path_of(store, ctx, ino)?;
+    let parent_path = helpers::path_of(store, ctx, newparent)?;
     let _ = helpers::child_path(&parent_path, newname)?;
     Err(OpError::NotPermitted)
 }
 
 pub(crate) fn readlink(fs: &Fs, _req: &Request, ino: INodeNo, reply: ReplyData) {
-    match readlink_decision(fs.store.as_ref(), ino.0) {
+    match readlink_decision(fs.store.as_ref(), &fs.context, ino.0) {
         Ok(target) => reply.data(&target),
         Err(e) => reply.error(e.errno()),
     }
@@ -88,8 +102,16 @@ pub(crate) fn mknod(
     rdev: u32,
     reply: ReplyEntry,
 ) {
-    match mknod_decision(fs.store.as_ref(), parent.0, name, mode & !umask, rdev).and_then(|inode| {
-        helpers::attr_or_not_found(fs.store.as_ref(), inode, req.uid(), req.gid())
+    match mknod_decision(
+        fs.store.as_ref(),
+        &fs.context,
+        parent.0,
+        name,
+        mode & !umask,
+        rdev,
+    )
+    .and_then(|inode| {
+        helpers::attr_or_not_found(fs.store.as_ref(), &fs.context, inode, req.uid(), req.gid())
     }) {
         Ok(attr) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
         Err(e) => reply.error(e.errno()),
@@ -104,9 +126,11 @@ pub(crate) fn symlink(
     target: &Path,
     reply: ReplyEntry,
 ) {
-    match symlink_decision(fs.store.as_ref(), parent.0, link_name, target).and_then(|inode| {
-        helpers::attr_or_not_found(fs.store.as_ref(), inode, req.uid(), req.gid())
-    }) {
+    match symlink_decision(fs.store.as_ref(), &fs.context, parent.0, link_name, target).and_then(
+        |inode| {
+            helpers::attr_or_not_found(fs.store.as_ref(), &fs.context, inode, req.uid(), req.gid())
+        },
+    ) {
         Ok(attr) => {
             fs.log_route("symlink", attr.ino.0);
             reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0));
@@ -123,7 +147,7 @@ pub(crate) fn link(
     newname: &OsStr,
     reply: ReplyEntry,
 ) {
-    match link_decision(fs.store.as_ref(), ino.0, newparent.0, newname) {
+    match link_decision(fs.store.as_ref(), &fs.context, ino.0, newparent.0, newname) {
         Ok((_, attr)) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
         Err(e) => reply.error(e.errno()),
     }
@@ -151,29 +175,66 @@ mod tests {
 
         // Each creation-like op resolves its inodes first, then refuses.
         assert_eq!(
-            mknod_decision(&store, 2, OsStr::new("dev"), 0, 0).unwrap_err(),
+            mknod_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                2,
+                OsStr::new("dev"),
+                0,
+                0
+            )
+            .unwrap_err(),
             OpError::NotPermitted
         );
         assert_eq!(
-            symlink_decision(&store, 2, OsStr::new("l"), Path::new("/x")).unwrap_err(),
+            symlink_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                2,
+                OsStr::new("l"),
+                Path::new("/x")
+            )
+            .unwrap_err(),
             OpError::NotPermitted
         );
         assert_eq!(
-            link_decision(&store, 3, 2, OsStr::new("hard")).unwrap_err(),
+            link_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                3,
+                2,
+                OsStr::new("hard")
+            )
+            .unwrap_err(),
             OpError::NotPermitted
         );
 
         // A nonexistent inode / parent is reported as not-found first.
         assert_eq!(
-            readlink_decision(&store, 99).unwrap_err(),
+            readlink_decision(&store, &crate::telemetry::OperationContext::new(), 99).unwrap_err(),
             OpError::NotFound
         );
         assert_eq!(
-            mknod_decision(&store, 99, OsStr::new("dev"), 0, 0).unwrap_err(),
+            mknod_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                99,
+                OsStr::new("dev"),
+                0,
+                0
+            )
+            .unwrap_err(),
             OpError::NotFound
         );
         assert_eq!(
-            link_decision(&store, 99, 2, OsStr::new("hard")).unwrap_err(),
+            link_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                99,
+                2,
+                OsStr::new("hard")
+            )
+            .unwrap_err(),
             OpError::NotFound
         );
     }

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::core::backing::{Backing, SafePath};
-use crate::core::metadata::FsEntry;
+use crate::core::types::FsEntry;
 use crate::core::types::{FileAttrData, misc::xattr};
 use crate::store::{SetattrChanges, StatFs, Store, StoreApi, StoreError};
 use crate::telemetry::{self, Event, OperationContext, Severity};

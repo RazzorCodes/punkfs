@@ -16,8 +16,8 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::core::backing::Backing;
 use crate::core::cache::metadata::{FsNode, ListingOutcome, MetadataCache};
-use crate::core::metadata::{Availability, FsEntry};
 use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
+use crate::core::types::{Availability, FsEntry};
 use crate::db::persistent::PersistentDb;
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
@@ -25,7 +25,6 @@ use crate::punk_fs::{
     SetAttrRequest, StatFsRequest, WriteFileRequest,
 };
 use crate::telemetry::OperationContext;
-pub(crate) mod contextual;
 mod local;
 use local::Local;
 
@@ -128,11 +127,6 @@ pub enum CreateEntry {
 /// every method can be unit tested against a mock store without a
 /// server, a runtime, or a FUSE session.
 pub trait StoreApi: Send + Sync {
-    /// The ingress operation bound to this store view, if any.
-    fn operation_context(&self) -> Option<&OperationContext> {
-        None
-    }
-
     /// This machine's identity, as registered with the server.
     fn node_id(&self) -> &str;
 
@@ -148,12 +142,6 @@ pub trait StoreApi: Send + Sync {
 
     /// Fallible catalog reads for request handling. An unavailable on-disk
     /// catalog is not equivalent to an unknown path or inode.
-    fn catalog_path(&self, path: &str) -> Result<Option<FsEntry>, StoreError> {
-        self.catalog_path_in(&OperationContext::new(), path)
-    }
-    fn catalog_inode(&self, inode: u64) -> Result<Option<FsEntry>, StoreError> {
-        self.catalog_inode_in(&OperationContext::new(), inode)
-    }
     fn catalog_path_in(
         &self,
         _ctx: &OperationContext,
@@ -168,21 +156,10 @@ pub trait StoreApi: Send + Sync {
     ) -> Result<Option<FsEntry>, StoreError> {
         Ok(self.get_entry(inode))
     }
-    fn list(&self, path: &str) -> Result<Vec<StoreChild>, StoreError> {
-        self.list_in(&OperationContext::new(), path)
-    }
     fn list_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<StoreChild>, StoreError> {
         Ok(self.get_children_in(ctx, path))
     }
 
-    /// Fetch and reconcile `dir` from the server.
-    fn ensure_listed(&self, dir: &str) -> Result<(), StoreError>;
-    /// Children of `path`, using whatever listing is cached.
-    fn get_children(&self, path: &str) -> Vec<StoreChild>;
-    /// Read already-reconciled children without issuing a network request.
-    fn cached_children(&self, path: &str) -> Vec<StoreChild> {
-        self.get_children(path)
-    }
     /// Whether a logical name has multiple known owners.
     fn has_conflict(&self, _path: &str) -> bool {
         false
@@ -192,27 +169,21 @@ pub trait StoreApi: Send + Sync {
         false
     }
 
-    // --- content -------------------------------------------------------
-    /// Return a symlink's target bytes without following it.
-    fn readlink(&self, _path: &str) -> Result<Vec<u8>, StoreError> {
-        Err(StoreError::Unsupported("readlink".into()))
-    }
-    /// Read at most `size` bytes at `offset`; a short read means EOF.
-    fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError>;
-    /// Write `data` at `offset`; returns how many bytes were taken.
-    fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError>;
-    /// Durability barrier for `path`; `datasync` skips metadata.
-    fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError>;
-
     // --- metadata ------------------------------------------------------
-    fn get_xattr(&self, _path: &str, _name: &[u8]) -> Result<Vec<u8>, StoreError> {
-        Err(StoreError::Unsupported("xattr".into()))
-    }
-    fn list_xattr(&self, _path: &str) -> Result<Vec<u8>, StoreError> {
-        Err(StoreError::Unsupported("xattr".into()))
-    }
-    fn set_xattr(
+    fn get_xattr_in(
         &self,
+        _ctx: &OperationContext,
+        _path: &str,
+        _name: &[u8],
+    ) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Unsupported("xattr".into()))
+    }
+    fn list_xattr_in(&self, _ctx: &OperationContext, _path: &str) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Unsupported("xattr".into()))
+    }
+    fn set_xattr_in(
+        &self,
+        _ctx: &OperationContext,
         _path: &str,
         _name: &[u8],
         _value: &[u8],
@@ -220,44 +191,14 @@ pub trait StoreApi: Send + Sync {
     ) -> Result<(), StoreError> {
         Err(StoreError::Unsupported("xattr".into()))
     }
-    fn remove_xattr(&self, _path: &str, _name: &[u8]) -> Result<(), StoreError> {
-        Err(StoreError::Unsupported("xattr".into()))
-    }
-    fn get_xattr_in(
-        &self,
-        _ctx: &OperationContext,
-        path: &str,
-        name: &[u8],
-    ) -> Result<Vec<u8>, StoreError> {
-        self.get_xattr(path, name)
-    }
-    fn list_xattr_in(&self, _ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
-        self.list_xattr(path)
-    }
-    fn set_xattr_in(
-        &self,
-        _ctx: &OperationContext,
-        path: &str,
-        name: &[u8],
-        value: &[u8],
-        flags: i32,
-    ) -> Result<(), StoreError> {
-        self.set_xattr(path, name, value, flags)
-    }
     fn remove_xattr_in(
         &self,
         _ctx: &OperationContext,
-        path: &str,
-        name: &[u8],
+        _path: &str,
+        _name: &[u8],
     ) -> Result<(), StoreError> {
-        self.remove_xattr(path, name)
+        Err(StoreError::Unsupported("xattr".into()))
     }
-    /// Apply the requested attribute changes, returning the new attributes.
-    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError>;
-    /// Re-read one entry's attributes, bypassing the cache.
-    fn refresh(&self, path: &str) -> Result<FileAttrData, StoreError>;
-    /// Aggregate capacity for `statfs`.
-    fn statfs(&self) -> Result<StatFs, StoreError>;
 
     // --- namespace mutation --------------------------------------------
     /// Create on the local backing. Client-only stores have no creation RPC.
@@ -275,82 +216,48 @@ pub trait StoreApi: Send + Sync {
         })
     }
 
-    fn create_entry(&self, path: &str, entry: CreateEntry) -> Result<u64, StoreError> {
-        self.create_in(&OperationContext::new(), path, entry)
-    }
-    /// Remove the file at `path`.
-    fn unlink(&self, path: &str) -> Result<(), StoreError>;
-    /// Remove the *empty* directory at `path`.
-    fn rmdir(&self, path: &str) -> Result<(), StoreError>;
-    /// Move `old` to `new`, honouring `flags`.
-    fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError>;
-
-    // Context-aware entry points. Existing mock/embedded implementations can
-    // retain their original behavior; the network store overrides these.
-    fn ensure_listed_in(&self, _ctx: &OperationContext, dir: &str) -> Result<(), StoreError> {
-        self.ensure_listed(dir)
-    }
-    fn get_children_in(&self, _ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
-        self.get_children(path)
-    }
-    fn readlink_in(&self, _ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
-        self.readlink(path)
+    fn ensure_listed_in(&self, ctx: &OperationContext, dir: &str) -> Result<(), StoreError>;
+    fn get_children_in(&self, ctx: &OperationContext, path: &str) -> Vec<StoreChild>;
+    fn readlink_in(&self, _ctx: &OperationContext, _path: &str) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Unsupported("readlink".into()))
     }
     fn read_in(
         &self,
-        _ctx: &OperationContext,
+        ctx: &OperationContext,
         path: &str,
         offset: u64,
         size: u32,
-    ) -> Result<Vec<u8>, StoreError> {
-        self.read(path, offset, size)
-    }
+    ) -> Result<Vec<u8>, StoreError>;
     fn write_in(
         &self,
-        _ctx: &OperationContext,
+        ctx: &OperationContext,
         path: &str,
         offset: u64,
         data: &[u8],
-    ) -> Result<u32, StoreError> {
-        self.write(path, offset, data)
-    }
+    ) -> Result<u32, StoreError>;
     fn fsync_in(
         &self,
-        _ctx: &OperationContext,
+        ctx: &OperationContext,
         path: &str,
         datasync: bool,
-    ) -> Result<(), StoreError> {
-        self.fsync(path, datasync)
-    }
+    ) -> Result<(), StoreError>;
     fn setattr_in(
         &self,
-        _ctx: &OperationContext,
+        ctx: &OperationContext,
         path: &str,
         changes: SetattrChanges,
-    ) -> Result<FileAttrData, StoreError> {
-        self.setattr(path, changes)
-    }
-    fn refresh_in(&self, _ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
-        self.refresh(path)
-    }
-    fn statfs_in(&self, _ctx: &OperationContext) -> Result<StatFs, StoreError> {
-        self.statfs()
-    }
-    fn unlink_in(&self, _ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
-        self.unlink(path)
-    }
-    fn rmdir_in(&self, _ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
-        self.rmdir(path)
-    }
+    ) -> Result<FileAttrData, StoreError>;
+    fn refresh_in(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError>;
+    fn statfs_in(&self, ctx: &OperationContext) -> Result<StatFs, StoreError>;
+    fn unlink_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError>;
+    fn rmdir_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError>;
     fn rename_in(
         &self,
-        _ctx: &OperationContext,
+        ctx: &OperationContext,
         old: &str,
         new: &str,
         flags: RenameFlags,
-    ) -> Result<(), StoreError> {
-        self.rename(old, new, flags)
-    }
+    ) -> Result<(), StoreError>;
 }
 
 pub struct Store {
@@ -1216,10 +1123,6 @@ impl StoreApi for Store {
     /// listing would report entries that no longer exist (or hide new
     /// ones). Correctness first; caching belongs behind a validity check
     /// we do not have yet.
-    fn ensure_listed(&self, dir: &str) -> Result<(), StoreError> {
-        self.ensure_listed_in(&OperationContext::new(), dir)
-    }
-
     fn ensure_listed_in(&self, ctx: &OperationContext, dir: &str) -> Result<(), StoreError> {
         let Some(local) = self.local.as_deref() else {
             return self.fetch_listing(ctx, dir, true);
@@ -1235,22 +1138,8 @@ impl StoreApi for Store {
 
     /// Children as (inode, name, kind). A server error is reported to the
     /// caller, which decides whether browsing may fall back to the cache.
-    fn get_children(&self, path: &str) -> Vec<StoreChild> {
-        self.get_children_in(&OperationContext::new(), path)
-    }
-
     fn get_children_in(&self, ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
         self.list_in(ctx, path).unwrap_or_default()
-    }
-
-    fn cached_children(&self, path: &str) -> Vec<StoreChild> {
-        self.metadata_cache
-            .lock()
-            .unwrap()
-            .lookup_children_of(path)
-            .into_iter()
-            .map(store_child)
-            .collect()
     }
 
     fn create_in(
@@ -1278,10 +1167,6 @@ impl StoreApi for Store {
         }
     }
 
-    fn readlink(&self, path: &str) -> Result<Vec<u8>, StoreError> {
-        self.readlink_in(&OperationContext::new(), path)
-    }
-
     fn readlink_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
         if let Some(local) = self.local_for(ctx, path)? {
             return local.readlink(path, ctx);
@@ -1304,10 +1189,6 @@ impl StoreApi for Store {
             })?;
         self.conn_for(&node_id)?.touch();
         Ok(response.into_inner().target)
-    }
-
-    fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
-        self.read_in(&OperationContext::new(), path, offset, size)
     }
 
     fn read_in(
@@ -1334,10 +1215,6 @@ impl StoreApi for Store {
         Ok(resp.into_inner().data)
     }
 
-    fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
-        self.write_in(&OperationContext::new(), path, offset, data)
-    }
-
     fn write_in(
         &self,
         ctx: &OperationContext,
@@ -1362,10 +1239,6 @@ impl StoreApi for Store {
         Ok(resp.into_inner().written)
     }
 
-    fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
-        self.fsync_in(&OperationContext::new(), path, datasync)
-    }
-
     fn fsync_in(
         &self,
         ctx: &OperationContext,
@@ -1387,24 +1260,6 @@ impl StoreApi for Store {
         Ok(())
     }
 
-    fn get_xattr(&self, path: &str, name: &[u8]) -> Result<Vec<u8>, StoreError> {
-        self.get_xattr_in(&OperationContext::new(), path, name)
-    }
-    fn list_xattr(&self, path: &str) -> Result<Vec<u8>, StoreError> {
-        self.list_xattr_in(&OperationContext::new(), path)
-    }
-    fn set_xattr(
-        &self,
-        path: &str,
-        name: &[u8],
-        value: &[u8],
-        flags: i32,
-    ) -> Result<(), StoreError> {
-        self.set_xattr_in(&OperationContext::new(), path, name, value, flags)
-    }
-    fn remove_xattr(&self, path: &str, name: &[u8]) -> Result<(), StoreError> {
-        self.remove_xattr_in(&OperationContext::new(), path, name)
-    }
     fn get_xattr_in(
         &self,
         ctx: &OperationContext,
@@ -1497,10 +1352,6 @@ impl StoreApi for Store {
         Ok(())
     }
 
-    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
-        self.setattr_in(&OperationContext::new(), path, changes)
-    }
-
     fn setattr_in(
         &self,
         ctx: &OperationContext,
@@ -1534,10 +1385,6 @@ impl StoreApi for Store {
         Ok(attr)
     }
 
-    fn refresh(&self, path: &str) -> Result<FileAttrData, StoreError> {
-        self.refresh_in(&OperationContext::new(), path)
-    }
-
     fn refresh_in(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
         if let Some(local) = self.local_for(ctx, path)? {
             return local.refresh(self, ctx, path);
@@ -1546,10 +1393,6 @@ impl StoreApi for Store {
         let (node, attr) = self.getattr(ctx, path)?;
         self.store_attr(ctx, path, expected.as_ref(), &node, attr.clone())?;
         Ok(attr)
-    }
-
-    fn statfs(&self) -> Result<StatFs, StoreError> {
-        self.statfs_in(&OperationContext::new())
     }
 
     fn statfs_in(&self, ctx: &OperationContext) -> Result<StatFs, StoreError> {
@@ -1583,10 +1426,6 @@ impl StoreApi for Store {
         })
     }
 
-    fn unlink(&self, path: &str) -> Result<(), StoreError> {
-        self.unlink_in(&OperationContext::new(), path)
-    }
-
     fn unlink_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
         if let Some(local) = self.local_for(ctx, path)? {
             return local.unlink(self, ctx, path);
@@ -1614,10 +1453,6 @@ impl StoreApi for Store {
         Ok(())
     }
 
-    fn rmdir(&self, path: &str) -> Result<(), StoreError> {
-        self.rmdir_in(&OperationContext::new(), path)
-    }
-
     fn rmdir_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
         if let Some(local) = self.local_for(ctx, path)? {
             return local.rmdir(self, ctx, path);
@@ -1632,10 +1467,6 @@ impl StoreApi for Store {
         self.conn_for(&node_id)?.touch();
         self.after_mutation(ctx, path, &node_id)?;
         Ok(())
-    }
-
-    fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError> {
-        self.rename_in(&OperationContext::new(), old, new, flags)
     }
 
     fn rename_in(

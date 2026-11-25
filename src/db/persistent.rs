@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::core::metadata::{Availability, FsEntry};
+use crate::core::types::{Availability, FsEntry};
 use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 
 const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");

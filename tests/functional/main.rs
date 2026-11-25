@@ -21,3 +21,4 @@ mod multinode;
 mod peers;
 mod posix_contract;
 mod store;
+mod store_test_api;

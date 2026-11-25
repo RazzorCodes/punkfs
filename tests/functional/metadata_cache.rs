@@ -2,7 +2,7 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use punkfs::core::cache::metadata::{ListingOutcome, MetadataCache};
-use punkfs::core::metadata::{Availability, FsEntry};
+use punkfs::core::types::{Availability, FsEntry};
 use punkfs::core::types::misc::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use punkfs::telemetry::{self, Config, Destination, OperationContext, Severity};
 

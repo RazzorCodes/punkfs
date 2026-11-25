@@ -29,6 +29,7 @@ use crate::store::{StatFs, StoreApi};
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn setattr_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     uid: u32,
     gid: u32,
     ino: u64,
@@ -44,7 +45,7 @@ pub(crate) fn setattr_decision(
     bkuptime: Option<SystemTime>,
     flags: Option<BsdFileFlags>,
 ) -> OpResult<FileAttr> {
-    let path = helpers::path_of(store, ino)?;
+    let path = helpers::path_of(store, ctx, ino)?;
     if ctime.is_some()
         || crtime.is_some()
         || chgtime.is_some()
@@ -79,7 +80,8 @@ pub(crate) fn setattr_decision(
     };
     let (accessed_unix, accessed_nanos) = split_time(atime)?;
     let (modified_unix, modified_nanos) = split_time(mtime)?;
-    let result = store.setattr(
+    let result = store.setattr_in(
+        ctx,
         &path,
         crate::store::SetattrChanges {
             mode,
@@ -92,7 +94,7 @@ pub(crate) fn setattr_decision(
             modified_nanos,
         },
     );
-    if let (Some(ctx), Some(logger)) = (store.operation_context(), crate::telemetry::global()) {
+    if let Some(logger) = crate::telemetry::global() {
         let severity = if result.is_ok() {
             crate::telemetry::Severity::Debug
         } else {
@@ -116,24 +118,34 @@ pub(crate) fn setattr_decision(
 }
 
 /// Remove the file `parent`/`name`.
-pub(crate) fn unlink_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) -> OpResult<()> {
-    let parent_path = helpers::path_of(store, parent)?;
+pub(crate) fn unlink_decision(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+    parent: u64,
+    name: &OsStr,
+) -> OpResult<()> {
+    let parent_path = helpers::path_of(store, ctx, parent)?;
     let path = helpers::child_path(&parent_path, name)?;
-    Ok(store.unlink(&path)?)
+    Ok(store.unlink_in(ctx, &path)?)
 }
 
 /// Remove the empty directory `parent`/`name`.
 ///
 /// The emptiness check is a fast local rejection; the backend enforces it
 /// authoritatively.
-pub(crate) fn rmdir_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) -> OpResult<()> {
-    let parent_path = helpers::path_of(store, parent)?;
+pub(crate) fn rmdir_decision(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+    parent: u64,
+    name: &OsStr,
+) -> OpResult<()> {
+    let parent_path = helpers::path_of(store, ctx, parent)?;
     let path = helpers::child_path(&parent_path, name)?;
 
-    if store.catalog_path(&path)?.is_some() && !store.list(&path)?.is_empty() {
+    if store.catalog_path_in(ctx, &path)?.is_some() && !store.list_in(ctx, &path)?.is_empty() {
         return Err(OpError::NotEmpty);
     }
-    Ok(store.rmdir(&path)?)
+    Ok(store.rmdir_in(ctx, &path)?)
 }
 
 /// Move `parent`/`name` to `newparent`/`newname`.
@@ -153,33 +165,39 @@ pub(crate) fn rmdir_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) ->
 /// backend's call to make or refuse.
 pub(crate) fn rename_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     parent: u64,
     name: &OsStr,
     newparent: u64,
     newname: &OsStr,
     flags: RenameFlags,
 ) -> OpResult<()> {
-    let old_parent = helpers::path_of(store, parent)?;
-    let new_parent = helpers::path_of(store, newparent)?;
+    let old_parent = helpers::path_of(store, ctx, parent)?;
+    let new_parent = helpers::path_of(store, ctx, newparent)?;
     let old_path = helpers::child_path(&old_parent, name)?;
     let new_path = helpers::child_path(&new_parent, newname)?;
 
     // A file keeps the node that holds its bytes; moving it elsewhere would
     // mean copying, which is not a rename. Directories are exempt: their
     // handling is unchanged from before multi-node support.
-    let source = store.catalog_path(&old_path)?.ok_or(OpError::NotFound)?;
+    let source = store
+        .catalog_path_in(ctx, &old_path)?
+        .ok_or(OpError::NotFound)?;
 
     if source.kind != FsEntryKind::Directory || flags.contains(RenameFlags::RENAME_EXCHANGE) {
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
-            store.ensure_listed(&new_parent)?;
+            store.ensure_listed_in(ctx, &new_parent)?;
             if store.has_conflict(&old_path) || store.has_conflict(&new_path) {
                 return Err(OpError::Local(libc::EIO));
             }
         } else {
-            let _ = store.ensure_listed(&new_parent);
+            let _ = store.ensure_listed_in(ctx, &new_parent);
         }
         let owner = source.node_id;
-        match store.catalog_path(&new_path)?.map(|entry| entry.node_id) {
+        match store
+            .catalog_path_in(ctx, &new_path)?
+            .map(|entry| entry.node_id)
+        {
             // Renaming in place on the same node.
             Some(dest_owner) if dest_owner == owner => {}
             // The destination is new: it is created on the source's node.
@@ -189,12 +207,15 @@ pub(crate) fn rename_decision(
         }
     }
 
-    Ok(store.rename(&old_path, &new_path, flags)?)
+    Ok(store.rename_in(ctx, &old_path, &new_path, flags)?)
 }
 
 /// Aggregate capacity counters for `df`.
-pub(crate) fn statfs_decision(store: &dyn StoreApi) -> OpResult<StatFs> {
-    Ok(store.statfs()?)
+pub(crate) fn statfs_decision(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+) -> OpResult<StatFs> {
+    Ok(store.statfs_in(ctx)?)
 }
 
 pub(crate) fn setattr(
@@ -217,6 +238,7 @@ pub(crate) fn setattr(
 ) {
     let result = setattr_decision(
         fs.store.as_ref(),
+        &fs.context,
         req.uid(),
         req.gid(),
         ino.0,
@@ -239,14 +261,14 @@ pub(crate) fn setattr(
 }
 
 pub(crate) fn unlink(fs: &Fs, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-    match unlink_decision(fs.store.as_ref(), parent.0, name) {
+    match unlink_decision(fs.store.as_ref(), &fs.context, parent.0, name) {
         Ok(()) => reply.ok(),
         Err(e) => reply.error(e.errno()),
     }
 }
 
 pub(crate) fn rmdir(fs: &Fs, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-    match rmdir_decision(fs.store.as_ref(), parent.0, name) {
+    match rmdir_decision(fs.store.as_ref(), &fs.context, parent.0, name) {
         Ok(()) => reply.ok(),
         Err(e) => reply.error(e.errno()),
     }
@@ -264,6 +286,7 @@ pub(crate) fn rename(
 ) {
     match rename_decision(
         fs.store.as_ref(),
+        &fs.context,
         parent.0,
         name,
         newparent.0,
@@ -276,7 +299,7 @@ pub(crate) fn rename(
 }
 
 pub(crate) fn statfs(fs: &Fs, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-    match statfs_decision(fs.store.as_ref()) {
+    match statfs_decision(fs.store.as_ref(), &fs.context) {
         Ok(s) => reply.statfs(
             s.blocks,
             s.bfree,
@@ -312,20 +335,44 @@ mod tests {
     #[test]
     fn unlink_and_rmdir_join_paths_and_check_emptiness() {
         let store = seeded();
-        unlink_decision(&store, 2, OsStr::new("a.txt")).unwrap();
+        unlink_decision(
+            &store,
+            &crate::telemetry::OperationContext::new(),
+            2,
+            OsStr::new("a.txt"),
+        )
+        .unwrap();
         assert_eq!(store.calls().unlink, vec!["/docs/a.txt".to_string()]);
 
         let nonempty = seeded();
-        let err = rmdir_decision(&nonempty, 1, OsStr::new("docs")).unwrap_err();
+        let err = rmdir_decision(
+            &nonempty,
+            &crate::telemetry::OperationContext::new(),
+            1,
+            OsStr::new("docs"),
+        )
+        .unwrap_err();
         assert_eq!(err, OpError::NotEmpty);
         assert!(nonempty.calls().rmdir.is_empty());
 
         let empty = seeded();
-        rmdir_decision(&empty, 2, OsStr::new("empty")).unwrap();
+        rmdir_decision(
+            &empty,
+            &crate::telemetry::OperationContext::new(),
+            2,
+            OsStr::new("empty"),
+        )
+        .unwrap();
         assert_eq!(empty.calls().rmdir, vec!["/docs/empty".to_string()]);
 
         assert_eq!(
-            unlink_decision(&seeded(), 99, OsStr::new("x")).unwrap_err(),
+            unlink_decision(
+                &seeded(),
+                &crate::telemetry::OperationContext::new(),
+                99,
+                OsStr::new("x")
+            )
+            .unwrap_err(),
             OpError::NotFound
         );
     }
@@ -337,6 +384,7 @@ mod tests {
         let store = seeded();
         rename_decision(
             &store,
+            &crate::telemetry::OperationContext::new(),
             2,
             OsStr::new("a.txt"),
             1,
@@ -357,6 +405,7 @@ mod tests {
         let passthrough = seeded();
         rename_decision(
             &passthrough,
+            &crate::telemetry::OperationContext::new(),
             2,
             OsStr::new("a.txt"),
             2,
@@ -379,13 +428,15 @@ mod tests {
             fragment_size: 4096,
             ..StatFs::default()
         }));
-        let stats = statfs_decision(&store).unwrap();
+        let stats = statfs_decision(&store, &crate::telemetry::OperationContext::new()).unwrap();
         assert_eq!(stats.blocks, 10);
         assert_eq!(stats.block_size, 4096);
 
         store.expect_statfs(Err(StoreError::Io("down".into())));
         assert_eq!(
-            statfs_decision(&store).unwrap_err().errno(),
+            statfs_decision(&store, &crate::telemetry::OperationContext::new())
+                .unwrap_err()
+                .errno(),
             fuser::Errno::EIO
         );
     }

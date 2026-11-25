@@ -10,7 +10,7 @@ mod posix_backing;
 use std::time::{Duration, SystemTime};
 
 use punkfs::core::cache::metadata::{FsNode, ListingOutcome, MetadataCache, NodeStatus};
-use punkfs::core::metadata::{Availability, FsEntry};
+use punkfs::core::types::{Availability, FsEntry};
 use punkfs::core::types::{FileAttrData, FileTimes, FsEntryKind, Stat};
 
 // ---------------------------------------------------------------------------

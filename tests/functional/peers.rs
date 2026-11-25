@@ -41,7 +41,7 @@ fn functional_unresponsive_peers_do_not_block_a_healthy_listing() {
     )
     .unwrap();
     let started = std::time::Instant::now();
-    let result = store.ensure_listed("/");
+    let result = store.ensure_listed_in(&punkfs::telemetry::OperationContext::new(), "/");
     let elapsed = started.elapsed();
     for (tx, thread) in stop {
         let _ = tx.send(());

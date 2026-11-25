@@ -19,18 +19,13 @@ use crate::store::{CreateEntry, StoreApi};
 
 /// The `fs` itself: implements the fuser `Filesystem` trait below.
 ///
-/// All state lives in `store` — the client-side view of the server's
-/// directory tree (inodes, paths, which dirs have been listed). See
-/// `crate::store`.
-///
-/// The store is held as a trait object so tests can substitute a fake
-/// (see `crate::store::mock`) and exercise the op modules without a
-/// server or a FUSE session. Production always gets a real [`crate::Store`].
+/// The store owns the catalog and backing routing. Each callback uses an
+/// operation-local view with a fresh correlation context, passed explicitly
+/// to the operation helpers and store methods. Tests can inject a mock store.
 pub struct Fs {
-    /// In-memory snapshot of the server's tree, plus the grpc client used
-    /// to fetch listings on demand. `pub(crate)` so the op modules can
-    /// reach it without accessors.
+    /// Shared store; callbacks never bind their context into the store.
     pub(crate) store: Arc<dyn StoreApi>,
+    pub(crate) context: crate::telemetry::OperationContext,
     route_console: bool,
 }
 
@@ -54,12 +49,9 @@ impl MountOptions {
 impl Fs {
     /// Bind a fresh ingress identity to this FUSE callback and all its store work.
     fn for_operation(&self) -> Self {
-        let context = crate::telemetry::OperationContext::new();
         Self {
-            store: Arc::new(crate::store::contextual::ContextualStore {
-                inner: self.store.clone(),
-                context,
-            }),
+            store: self.store.clone(),
+            context: crate::telemetry::OperationContext::new(),
             route_console: self.route_console,
         }
     }
@@ -70,12 +62,10 @@ impl Fs {
         if !self.route_console {
             return;
         }
-        let Ok(Some(entry)) = self.store.catalog_inode(inode) else {
+        let Ok(Some(entry)) = self.store.catalog_inode_in(&self.context, inode) else {
             return;
         };
-        let Some(ctx) = self.store.operation_context() else {
-            return;
-        };
+        let ctx = &self.context;
         let Some(logger) = crate::telemetry::global() else {
             return;
         };
@@ -126,9 +116,10 @@ impl Fs {
         if !self.route_console {
             return;
         }
-        if let Ok(parent) = crate::filesystem::ops::helpers::path_of(self.store.as_ref(), parent)
+        if let Ok(parent) =
+            crate::filesystem::ops::helpers::path_of(self.store.as_ref(), &self.context, parent)
             && let Ok(path) = crate::filesystem::ops::helpers::child_path(&parent, name)
-            && let Ok(Some(entry)) = self.store.catalog_path(&path)
+            && let Ok(Some(entry)) = self.store.catalog_path_in(&self.context, &path)
         {
             self.log_route(operation, entry.inode);
         }
@@ -142,6 +133,7 @@ impl Fs {
     pub(crate) fn with_store(store: Box<dyn StoreApi>) -> Self {
         Fs {
             store: Arc::from(store),
+            context: crate::telemetry::OperationContext::new(),
             route_console: false,
         }
     }
@@ -159,6 +151,7 @@ impl Fs {
     ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
         let fs = Self {
             store: options.store,
+            context: crate::telemetry::OperationContext::new(),
             route_console: options.route_console,
         };
         let mut cfg = fuser::Config::default();
@@ -492,16 +485,20 @@ impl Filesystem for Fs {
         } else {
             operation
                 .store
-                .catalog_inode(ino.0)
+                .catalog_inode_in(&operation.context, ino.0)
                 .and_then(|entry| {
                     entry
                         .map(|e| e.path)
                         .ok_or(crate::store::StoreError::NotFound)
                 })
                 .and_then(|path| {
-                    operation
-                        .store
-                        .set_xattr(&path, name.as_bytes(), value, flags)
+                    operation.store.set_xattr_in(
+                        &operation.context,
+                        &path,
+                        name.as_bytes(),
+                        value,
+                        flags,
+                    )
                 })
         };
         match result {
@@ -522,13 +519,17 @@ impl Filesystem for Fs {
         operation.log_route("getxattr", ino.0);
         let result = operation
             .store
-            .catalog_inode(ino.0)
+            .catalog_inode_in(&operation.context, ino.0)
             .and_then(|entry| {
                 entry
                     .map(|e| e.path)
                     .ok_or(crate::store::StoreError::NotFound)
             })
-            .and_then(|path| operation.store.get_xattr(&path, name.as_bytes()));
+            .and_then(|path| {
+                operation
+                    .store
+                    .get_xattr_in(&operation.context, &path, name.as_bytes())
+            });
         reply_xattr(result, size, reply);
     }
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
@@ -536,13 +537,13 @@ impl Filesystem for Fs {
         operation.log_route("listxattr", ino.0);
         let result = operation
             .store
-            .catalog_inode(ino.0)
+            .catalog_inode_in(&operation.context, ino.0)
             .and_then(|entry| {
                 entry
                     .map(|e| e.path)
                     .ok_or(crate::store::StoreError::NotFound)
             })
-            .and_then(|path| operation.store.list_xattr(&path));
+            .and_then(|path| operation.store.list_xattr_in(&operation.context, &path));
         reply_xattr(result, size, reply);
     }
     fn removexattr(
@@ -557,13 +558,17 @@ impl Filesystem for Fs {
         operation.log_route("removexattr", ino.0);
         let result = operation
             .store
-            .catalog_inode(ino.0)
+            .catalog_inode_in(&operation.context, ino.0)
             .and_then(|entry| {
                 entry
                     .map(|e| e.path)
                     .ok_or(crate::store::StoreError::NotFound)
             })
-            .and_then(|path| operation.store.remove_xattr(&path, name.as_bytes()));
+            .and_then(|path| {
+                operation
+                    .store
+                    .remove_xattr_in(&operation.context, &path, name.as_bytes())
+            });
         match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(crate::filesystem::ops::error::OpError::from(e).errno()),
@@ -652,13 +657,14 @@ pub(super) mod helpers_for_create {
         name: &OsStr,
         kind: CreateEntry,
     ) -> OpResult<fuser::FileAttr> {
-        create(fs.store.as_ref(), parent, name, kind).and_then(|inode| {
-            helpers::attr_or_not_found(fs.store.as_ref(), inode, req.uid(), req.gid())
+        create(fs.store.as_ref(), &fs.context, parent, name, kind).and_then(|inode| {
+            helpers::attr_or_not_found(fs.store.as_ref(), &fs.context, inode, req.uid(), req.gid())
         })
     }
 
     pub(in crate::filesystem) fn create(
         store: &dyn crate::StoreApi,
+        ctx: &crate::telemetry::OperationContext,
         parent: u64,
         name: &OsStr,
         kind: CreateEntry,
@@ -667,8 +673,8 @@ pub(super) mod helpers_for_create {
         {
             return Err(OpError::InvalidInput);
         }
-        let path = helpers::child_path(&helpers::path_of(store, parent)?, name)?;
-        Ok(store.create_entry(&path, kind)?)
+        let path = helpers::child_path(&helpers::path_of(store, ctx, parent)?, name)?;
+        Ok(store.create_in(ctx, &path, kind)?)
     }
 }
 

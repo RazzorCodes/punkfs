@@ -14,7 +14,7 @@
 use std::time::{Duration, SystemTime};
 
 pub use punkfs::core::cache::metadata::{ListingOutcome, MetadataCache};
-pub use punkfs::core::metadata::{Availability, FsEntry};
+pub use punkfs::core::types::{Availability, FsEntry};
 use punkfs::core::types::{FileAttrData, FsEntryKind};
 
 /// Build a catalog entry owned by `node`.

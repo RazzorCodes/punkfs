@@ -43,10 +43,11 @@ pub(crate) struct DirItem {
 ///   entry as a regular file.
 pub(crate) fn readdir_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     ino: u64,
     offset: u64,
 ) -> OpResult<Vec<DirItem>> {
-    let dir_path = helpers::path_of(store, ino)?;
+    let dir_path = helpers::path_of(store, ctx, ino)?;
 
     let mut entries = vec![
         DirItem {
@@ -60,11 +61,16 @@ pub(crate) fn readdir_decision(
             name: "..".into(),
         },
     ];
-    entries.extend(store.list(&dir_path)?.into_iter().map(|child| DirItem {
-        inode: child.inode,
-        kind: helpers::file_type(child.kind),
-        name: OsString::from(child.name),
-    }));
+    entries.extend(
+        store
+            .list_in(ctx, &dir_path)?
+            .into_iter()
+            .map(|child| DirItem {
+                inode: child.inode,
+                kind: helpers::file_type(child.kind),
+                name: OsString::from(child.name),
+            }),
+    );
 
     Ok(entries.into_iter().skip(offset as usize).collect())
 }
@@ -91,7 +97,7 @@ pub(crate) fn readdir(
     offset: u64,
     mut reply: ReplyDirectory,
 ) {
-    let entries = match readdir_decision(fs.store.as_ref(), ino.0, offset) {
+    let entries = match readdir_decision(fs.store.as_ref(), &fs.context, ino.0, offset) {
         Ok(entries) => entries,
         Err(e) => {
             reply.error(e.errno());
@@ -141,7 +147,8 @@ mod tests {
     #[test]
     fn readdir_lists_children_with_kinds_and_offset() {
         let store = seeded();
-        let items = readdir_decision(&store, 2, 0).unwrap();
+        let items =
+            readdir_decision(&store, &crate::telemetry::OperationContext::new(), 2, 0).unwrap();
         let mut names = names(&items);
         assert_eq!(names.drain(..2).collect::<Vec<_>>(), vec![".", ".."]);
         names.sort();
@@ -155,11 +162,17 @@ mod tests {
         assert_eq!(by_name["sub"], FileType::Directory);
         assert_eq!(by_name["link"], FileType::Symlink);
 
-        let rest = readdir_decision(&store, 2, 2).unwrap();
+        let rest =
+            readdir_decision(&store, &crate::telemetry::OperationContext::new(), 2, 2).unwrap();
         assert_eq!(rest, items[2..].to_vec());
-        assert!(readdir_decision(&store, 2, 99).unwrap().is_empty());
+        assert!(
+            readdir_decision(&store, &crate::telemetry::OperationContext::new(), 2, 99)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            readdir_decision(&store, 77, 0).unwrap_err(),
+            readdir_decision(&store, &crate::telemetry::OperationContext::new(), 77, 0)
+                .unwrap_err(),
             super::super::error::OpError::NotFound
         );
     }
@@ -171,7 +184,10 @@ mod tests {
         let store = seeded();
         store.fail_get_children();
         assert_eq!(
-            names(&readdir_decision(&store, 2, 0).unwrap()),
+            names(
+                &readdir_decision(&store, &crate::telemetry::OperationContext::new(), 2, 0)
+                    .unwrap()
+            ),
             vec![".", ".."]
         );
     }

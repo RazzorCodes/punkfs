@@ -2,6 +2,7 @@
 //! These exercise behaviors accessible below FUSE; absent store operations
 //! are recorded as explicit uncovered gaps rather than fake passing tests.
 use crate::common::TestServer;
+use crate::store_test_api::TestStoreApi;
 use punkfs::{FsNode, SetattrChanges, Store, StoreApi};
 use std::os::unix::fs::PermissionsExt;
 

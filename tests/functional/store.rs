@@ -14,6 +14,7 @@ use punkfs::core::types::FsEntryKind;
 use punkfs::store::{StoreApi, StoreError};
 
 use crate::common::TestServer;
+use crate::store_test_api::TestStoreApi;
 
 fn store_for(server: &TestServer) -> Store {
     Store::new(
@@ -40,14 +41,15 @@ fn store_routes_local_and_remote_content_without_fuse() {
         root.path(),
     )
     .unwrap();
-    assert_eq!(store.catalog_path("/remote").unwrap(), None);
+    let ctx = punkfs::telemetry::OperationContext::new();
+    assert_eq!(store.catalog_path_in(&ctx, "/remote").unwrap(), None);
     assert_eq!(
         store.read("/remote", 0, 4).unwrap_err(),
         StoreError::NotFound
     );
     assert_eq!(
         store
-            .list("/")
+            .list_in(&ctx, "/")
             .unwrap()
             .into_iter()
             .map(|c| c.name)
@@ -59,12 +61,16 @@ fn store_routes_local_and_remote_content_without_fuse() {
     assert_eq!(store.write("/remote", 0, b"P").unwrap(), 1);
     assert_eq!(server.backing("remote"), b"Peer");
     let inode = store
-        .create_entry("/created", CreateEntry::File { mode: 0o600 })
+        .create_in(&ctx, "/created", CreateEntry::File { mode: 0o600 })
         .unwrap();
     assert!(root.path().join("created").is_file());
     assert!(!server.backing_exists("created"));
     assert_eq!(
-        store.catalog_inode(inode).unwrap().unwrap().node_id,
+        store
+            .catalog_inode_in(&ctx, inode)
+            .unwrap()
+            .unwrap()
+            .node_id,
         "local"
     );
 }

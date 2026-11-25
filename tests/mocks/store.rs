@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use fuser::RenameFlags;
 
-use crate::core::metadata::{Availability, FsEntry};
+use crate::core::types::{Availability, FsEntry};
 use crate::core::types::{FileAttrData, FsEntryKind};
 use crate::store::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
 
@@ -195,7 +195,11 @@ impl StoreApi for MockStore {
         self.lock().find_inode(inode).cloned()
     }
 
-    fn ensure_listed(&self, dir: &str) -> Result<(), StoreError> {
+    fn ensure_listed_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        dir: &str,
+    ) -> Result<(), StoreError> {
         let mut state = self.lock();
         state.calls.ensure_listed.push(dir.to_owned());
         if let Some(err) = state.fail_ensure_listed.clone() {
@@ -205,7 +209,11 @@ impl StoreApi for MockStore {
         Ok(())
     }
 
-    fn get_children(&self, path: &str) -> Vec<StoreChild> {
+    fn get_children_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+    ) -> Vec<StoreChild> {
         let mut state = self.lock();
         state.calls.get_children.push(path.to_owned());
         if state.fail_get_children {
@@ -233,7 +241,13 @@ impl StoreApi for MockStore {
             .collect()
     }
 
-    fn read(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, StoreError> {
+    fn read_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, StoreError> {
         let mut state = self.lock();
         state.calls.read.push((path.to_owned(), offset, size));
         state
@@ -243,7 +257,13 @@ impl StoreApi for MockStore {
             .unwrap_or(Err(StoreError::Unsupported("read".into())))
     }
 
-    fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
+    fn write_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, StoreError> {
         let mut state = self.lock();
         state
             .calls
@@ -256,19 +276,33 @@ impl StoreApi for MockStore {
             .unwrap_or(Err(StoreError::Unsupported("write".into())))
     }
 
-    fn fsync(&self, path: &str, datasync: bool) -> Result<(), StoreError> {
+    fn fsync_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+        datasync: bool,
+    ) -> Result<(), StoreError> {
         let mut state = self.lock();
         state.calls.fsync.push((path.to_owned(), datasync));
         Err(StoreError::Unsupported("fsync".into()))
     }
 
-    fn setattr(&self, path: &str, changes: SetattrChanges) -> Result<FileAttrData, StoreError> {
+    fn setattr_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+        changes: SetattrChanges,
+    ) -> Result<FileAttrData, StoreError> {
         let mut state = self.lock();
         state.calls.setattr.push((path.to_owned(), changes));
         Err(StoreError::Unsupported("setattr".into()))
     }
 
-    fn refresh(&self, path: &str) -> Result<FileAttrData, StoreError> {
+    fn refresh_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+    ) -> Result<FileAttrData, StoreError> {
         let mut state = self.lock();
         state.calls.refresh.push(path.to_owned());
         if state.expects.fail_refresh {
@@ -280,7 +314,7 @@ impl StoreApi for MockStore {
             .ok_or(StoreError::NotFound)
     }
 
-    fn statfs(&self) -> Result<StatFs, StoreError> {
+    fn statfs_in(&self, _ctx: &crate::telemetry::OperationContext) -> Result<StatFs, StoreError> {
         let mut state = self.lock();
         state.calls.statfs += 1;
         state
@@ -290,7 +324,11 @@ impl StoreApi for MockStore {
             .unwrap_or(Err(StoreError::Unsupported("statfs".into())))
     }
 
-    fn unlink(&self, path: &str) -> Result<(), StoreError> {
+    fn unlink_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+    ) -> Result<(), StoreError> {
         let mut state = self.lock();
         state.calls.unlink.push(path.to_owned());
         let pos = state
@@ -302,7 +340,11 @@ impl StoreApi for MockStore {
         Ok(())
     }
 
-    fn rmdir(&self, path: &str) -> Result<(), StoreError> {
+    fn rmdir_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        path: &str,
+    ) -> Result<(), StoreError> {
         let mut state = self.lock();
         state.calls.rmdir.push(path.to_owned());
         let prefix = format!("{}/", path.trim_end_matches('/'));
@@ -318,7 +360,13 @@ impl StoreApi for MockStore {
         Ok(())
     }
 
-    fn rename(&self, old: &str, new: &str, flags: RenameFlags) -> Result<(), StoreError> {
+    fn rename_in(
+        &self,
+        _ctx: &crate::telemetry::OperationContext,
+        old: &str,
+        new: &str,
+        flags: RenameFlags,
+    ) -> Result<(), StoreError> {
         let mut state = self.lock();
         state
             .calls

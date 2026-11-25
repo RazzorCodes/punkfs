@@ -4,9 +4,9 @@
 //! read — is exercised and its outcome asserted.
 
 use punkfs::StoreError;
-use punkfs::store::StoreApi;
 
 use crate::common::TestCluster;
+use crate::store_test_api::TestStoreApi;
 
 /// A directory present on two nodes is a **merge point**, not a collision.
 /// Only files can collide; two directories with the same name simply
@@ -81,8 +81,6 @@ fn functional_store_reports_unreachable_node_as_host_down() {
 
     match store.read("/data.txt", 0, 16) {
         Err(StoreError::Inaccessible(_)) | Err(StoreError::Io(_)) => {}
-        other => panic!(
-            "reading from a down node must report unreachability, got {other:?}"
-        ),
+        other => panic!("reading from a down node must report unreachability, got {other:?}"),
     }
 }

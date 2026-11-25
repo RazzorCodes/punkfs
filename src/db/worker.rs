@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use super::persistent::{CatalogPatch, PersistentDb};
-use crate::core::metadata::FsEntry;
+use crate::core::types::FsEntry;
 use crate::telemetry::{self, Event, Logger, OperationContext, Severity};
 
 type Snapshot = (Vec<FsEntry>, Vec<String>);

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::core::metadata::{Availability, FsEntry};
+use crate::core::types::{Availability, FsEntry};
 use crate::core::types::{FileAttrData, FsEntryKind};
 use crate::db::persistent::{
     CatalogPatch, CatalogRow, PersistentDb, normalize_rel_path, to_logical_path,

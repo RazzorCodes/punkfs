@@ -33,11 +33,16 @@ use crate::store::StoreApi;
 /// Refuses to conjure an entry that does not exist: `O_CREAT` does not
 /// imply creation here, so a missing path is `ENOENT` whether or not the
 /// flag is set.
-pub(crate) fn open_decision(store: &dyn StoreApi, ino: u64, _flags: OpenFlags) -> OpResult<u64> {
-    let path = helpers::path_of(store, ino)?;
+pub(crate) fn open_decision(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+    ino: u64,
+    _flags: OpenFlags,
+) -> OpResult<u64> {
+    let path = helpers::path_of(store, ctx, ino)?;
     // Confirms the entry is still known to the catalog before we hand out a
     // handle; the handle itself is positional and carries no server state.
-    let _ = store.refresh(&path).map_err(|e| match e {
+    let _ = store.refresh_in(ctx, &path).map_err(|e| match e {
         crate::store::StoreError::NotFound => OpError::NotFound,
         other => OpError::from(other),
     })?;
@@ -47,55 +52,66 @@ pub(crate) fn open_decision(store: &dyn StoreApi, ino: u64, _flags: OpenFlags) -
 /// Read up to `size` bytes of `ino` at `offset`. A short result means EOF.
 pub(crate) fn read_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     ino: u64,
     _fh: u64,
     offset: u64,
     size: u32,
 ) -> OpResult<Vec<u8>> {
-    let path = helpers::path_of(store, ino)?;
-    Ok(store.read(&path, offset, size)?)
+    let path = helpers::path_of(store, ctx, ino)?;
+    Ok(store.read_in(ctx, &path, offset, size)?)
 }
 
 /// Write `data` at `offset`; returns the number of bytes accepted.
 pub(crate) fn write_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     ino: u64,
     _fh: u64,
     offset: u64,
     data: &[u8],
 ) -> OpResult<u32> {
-    let path = helpers::path_of(store, ino)?;
-    Ok(store.write(&path, offset, data)?)
+    let path = helpers::path_of(store, ctx, ino)?;
+    Ok(store.write_in(ctx, &path, offset, data)?)
 }
 
 /// Push this handle's buffered state to the owning node.
 ///
 /// There is no client-side buffering — writes go straight out — so this is
 /// a no-op beyond confirming the entry still exists.
-pub(crate) fn flush_decision(store: &dyn StoreApi, ino: u64) -> OpResult<()> {
-    let _ = helpers::path_of(store, ino)?;
+pub(crate) fn flush_decision(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+    ino: u64,
+) -> OpResult<()> {
+    let _ = helpers::path_of(store, ctx, ino)?;
     Ok(())
 }
 
 /// Drop the handle (once per `open`). Nothing to release on the server.
-pub(crate) fn release_decision(store: &dyn StoreApi, ino: u64) -> OpResult<()> {
-    let _ = helpers::path_of(store, ino)?;
+pub(crate) fn release_decision(
+    store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
+    ino: u64,
+) -> OpResult<()> {
+    let _ = helpers::path_of(store, ctx, ino)?;
     Ok(())
 }
 
 /// Durability barrier; `datasync` skips metadata.
 pub(crate) fn fsync_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     ino: u64,
     _fh: u64,
     datasync: bool,
 ) -> OpResult<()> {
-    let path = helpers::path_of(store, ino)?;
-    Ok(store.fsync(&path, datasync)?)
+    let path = helpers::path_of(store, ctx, ino)?;
+    Ok(store.fsync_in(ctx, &path, datasync)?)
 }
 
 pub(crate) fn open(fs: &Fs, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-    match open_decision(fs.store.as_ref(), ino.0, flags) {
+    match open_decision(fs.store.as_ref(), &fs.context, ino.0, flags) {
         Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
         Err(e) => reply.error(e.errno()),
     }
@@ -112,7 +128,7 @@ pub(crate) fn read(
     _lock_owner: Option<LockOwner>,
     reply: ReplyData,
 ) {
-    match read_decision(fs.store.as_ref(), ino.0, fh.0, offset, size) {
+    match read_decision(fs.store.as_ref(), &fs.context, ino.0, fh.0, offset, size) {
         Ok(data) => reply.data(&data),
         Err(e) => reply.error(e.errno()),
     }
@@ -130,7 +146,7 @@ pub(crate) fn write(
     _lock_owner: Option<LockOwner>,
     reply: ReplyWrite,
 ) {
-    match write_decision(fs.store.as_ref(), ino.0, fh.0, offset, data) {
+    match write_decision(fs.store.as_ref(), &fs.context, ino.0, fh.0, offset, data) {
         Ok(written) => reply.written(written),
         Err(e) => reply.error(e.errno()),
     }
@@ -144,7 +160,7 @@ pub(crate) fn flush(
     _lock_owner: LockOwner,
     reply: ReplyEmpty,
 ) {
-    match flush_decision(fs.store.as_ref(), ino.0) {
+    match flush_decision(fs.store.as_ref(), &fs.context, ino.0) {
         Ok(()) => reply.ok(),
         Err(e) => reply.error(e.errno()),
     }
@@ -162,7 +178,7 @@ pub(crate) fn release(
     _flush: bool,
     reply: ReplyEmpty,
 ) {
-    let _ = release_decision(fs.store.as_ref(), ino.0);
+    let _ = release_decision(fs.store.as_ref(), &fs.context, ino.0);
     reply.ok();
 }
 
@@ -174,7 +190,7 @@ pub(crate) fn fsync(
     datasync: bool,
     reply: ReplyEmpty,
 ) {
-    match fsync_decision(fs.store.as_ref(), ino.0, fh.0, datasync) {
+    match fsync_decision(fs.store.as_ref(), &fs.context, ino.0, fh.0, datasync) {
         Ok(()) => reply.ok(),
         Err(e) => reply.error(e.errno()),
     }
@@ -199,10 +215,25 @@ mod tests {
     #[test]
     fn open_resolves_and_refuses_missing_entries() {
         let store = seeded();
-        assert_eq!(open_decision(&store, 2, OpenFlags(0)).unwrap(), 2);
+        assert_eq!(
+            open_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                2,
+                OpenFlags(0)
+            )
+            .unwrap(),
+            2
+        );
         assert_eq!(store.calls().refresh, vec!["/f".to_string()]);
         assert_eq!(
-            open_decision(&store, 99, OpenFlags(0)).unwrap_err(),
+            open_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                99,
+                OpenFlags(0)
+            )
+            .unwrap_err(),
             OpError::NotFound
         );
     }
@@ -214,12 +245,29 @@ mod tests {
         let store = seeded();
         store.expect_read(Err(crate::store::StoreError::Io("boom".into())));
         assert_eq!(
-            read_decision(&store, 2, 2, 0, 1).unwrap_err().errno(),
+            read_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                2,
+                2,
+                0,
+                1
+            )
+            .unwrap_err()
+            .errno(),
             fuser::Errno::EIO
         );
         store.expect_write(Err(crate::store::StoreError::NotPermitted));
         assert_eq!(
-            write_decision(&store, 2, 2, 0, b"x").unwrap_err(),
+            write_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                2,
+                2,
+                0,
+                b"x"
+            )
+            .unwrap_err(),
             OpError::NotPermitted
         );
     }
@@ -229,8 +277,11 @@ mod tests {
     #[test]
     fn flush_and_release_confirm_existence() {
         let store = seeded();
-        flush_decision(&store, 2).unwrap();
-        release_decision(&store, 2).unwrap();
-        assert_eq!(flush_decision(&store, 99).unwrap_err(), OpError::NotFound);
+        flush_decision(&store, &crate::telemetry::OperationContext::new(), 2).unwrap();
+        release_decision(&store, &crate::telemetry::OperationContext::new(), 2).unwrap();
+        assert_eq!(
+            flush_decision(&store, &crate::telemetry::OperationContext::new(), 99).unwrap_err(),
+            OpError::NotFound
+        );
     }
 }

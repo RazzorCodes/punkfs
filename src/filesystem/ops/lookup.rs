@@ -42,24 +42,27 @@ use crate::store::StoreApi;
 /// - A non-UTF8 name is `EINVAL`.
 pub(crate) fn lookup_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     uid: u32,
     gid: u32,
     parent: u64,
     name: &OsStr,
 ) -> OpResult<(u64, FileAttr)> {
-    let parent_path = helpers::path_of(store, parent)?;
+    let parent_path = helpers::path_of(store, ctx, parent)?;
     let full_path = helpers::child_path(&parent_path, name)?;
 
     // `.`/`..` are resolved arithmetically; only real children need a
     // server round trip.
     if name != "." && name != ".." {
-        let _ = store.ensure_listed(&parent_path);
+        let _ = store.ensure_listed_in(ctx, &parent_path);
     }
 
     if store.has_conflict(&full_path) {
         return Err(OpError::Local(libc::EIO));
     }
-    let entry = store.catalog_path(&full_path)?.ok_or(OpError::NotFound)?;
+    let entry = store
+        .catalog_path_in(ctx, &full_path)?
+        .ok_or(OpError::NotFound)?;
     // A publication can populate the name before its first write reaches
     // the owner. Return the owner's current size for a remote regular file:
     // the kernel may use lookup attributes to calculate an O_APPEND offset.
@@ -67,7 +70,7 @@ pub(crate) fn lookup_decision(
         && entry.kind == crate::core::types::FsEntryKind::File
         && entry.node_id != store.node_id()
     {
-        store.refresh(&entry.path).unwrap_or(entry.attr)
+        store.refresh_in(ctx, &entry.path).unwrap_or(entry.attr)
     } else {
         entry.attr
     };
@@ -84,20 +87,28 @@ pub(crate) fn lookup_decision(
 /// which is what keeps an offline directory usable.
 pub(crate) fn getattr_decision(
     store: &dyn StoreApi,
+    ctx: &crate::telemetry::OperationContext,
     uid: u32,
     gid: u32,
     ino: u64,
 ) -> OpResult<FileAttr> {
-    let entry = store.catalog_inode(ino)?.ok_or(OpError::NotFound)?;
+    let entry = store.catalog_inode_in(ctx, ino)?.ok_or(OpError::NotFound)?;
     if store.has_conflict(&entry.path) {
         return Err(OpError::Local(libc::EIO));
     }
-    let attr = store.refresh(&entry.path).unwrap_or(entry.attr);
+    let attr = store.refresh_in(ctx, &entry.path).unwrap_or(entry.attr);
     Ok(helpers::attr_from(ino, &attr, uid, gid))
 }
 
 pub(crate) fn lookup(fs: &Fs, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-    match lookup_decision(fs.store.as_ref(), req.uid(), req.gid(), parent.0, name) {
+    match lookup_decision(
+        fs.store.as_ref(),
+        &fs.context,
+        req.uid(),
+        req.gid(),
+        parent.0,
+        name,
+    ) {
         // Zero TTL so the kernel re-asks us instead of caching.
         Ok((inode, attr)) => {
             fs.log_route("lookup", inode);
@@ -114,7 +125,7 @@ pub(crate) fn getattr(
     _fh: Option<FileHandle>,
     reply: ReplyAttr,
 ) {
-    match getattr_decision(fs.store.as_ref(), req.uid(), req.gid(), ino.0) {
+    match getattr_decision(fs.store.as_ref(), &fs.context, req.uid(), req.gid(), ino.0) {
         Ok(attr) => {
             fs.log_route("getattr", ino.0);
             reply.attr(&TIMEOUT, &attr);
@@ -143,18 +154,42 @@ mod tests {
     #[test]
     fn lookup_resolves_and_dot_names_skip_the_network() {
         let store = seeded();
-        let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new("readme")).unwrap();
+        let (ino, _) = lookup_decision(
+            &store,
+            &crate::telemetry::OperationContext::new(),
+            7,
+            8,
+            2,
+            OsStr::new("readme"),
+        )
+        .unwrap();
         assert_eq!(ino, 3);
         assert_eq!(store.listed(), vec!["/docs".to_string()]);
 
         assert_eq!(
-            lookup_decision(&store, 7, 8, 2, OsStr::new(".")).unwrap().0,
+            lookup_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                7,
+                8,
+                2,
+                OsStr::new(".")
+            )
+            .unwrap()
+            .0,
             2
         );
         assert_eq!(
-            lookup_decision(&store, 7, 8, 2, OsStr::new(".."))
-                .unwrap()
-                .0,
+            lookup_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                7,
+                8,
+                2,
+                OsStr::new("..")
+            )
+            .unwrap()
+            .0,
             1
         );
         assert!(
@@ -169,7 +204,15 @@ mod tests {
     fn lookup_offline_failure_is_swallowed() {
         let store = seeded();
         store.fail_ensure_listed(crate::store::StoreError::Io("down".into()));
-        let (ino, _) = lookup_decision(&store, 7, 8, 2, OsStr::new("readme")).unwrap();
+        let (ino, _) = lookup_decision(
+            &store,
+            &crate::telemetry::OperationContext::new(),
+            7,
+            8,
+            2,
+            OsStr::new("readme"),
+        )
+        .unwrap();
         assert_eq!(ino, 3);
     }
 
@@ -179,15 +222,32 @@ mod tests {
     fn missing_or_unreadable_entries_report_not_found() {
         let store = seeded();
         assert_eq!(
-            lookup_decision(&store, 7, 8, 2, OsStr::new("nope")).unwrap_err(),
+            lookup_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                7,
+                8,
+                2,
+                OsStr::new("nope")
+            )
+            .unwrap_err(),
             OpError::NotFound
         );
         assert_eq!(
-            lookup_decision(&store, 7, 8, 99, OsStr::new("readme")).unwrap_err(),
+            lookup_decision(
+                &store,
+                &crate::telemetry::OperationContext::new(),
+                7,
+                8,
+                99,
+                OsStr::new("readme")
+            )
+            .unwrap_err(),
             OpError::NotFound
         );
         assert_eq!(
-            getattr_decision(&store, 7, 8, 42).unwrap_err(),
+            getattr_decision(&store, &crate::telemetry::OperationContext::new(), 7, 8, 42)
+                .unwrap_err(),
             OpError::NotFound
         );
     }
@@ -200,7 +260,18 @@ mod tests {
 
         let offline = seeded();
         offline.fail_refresh();
-        assert_eq!(getattr_decision(&offline, 7, 8, 3).unwrap().ino, INodeNo(3));
+        assert_eq!(
+            getattr_decision(
+                &offline,
+                &crate::telemetry::OperationContext::new(),
+                7,
+                8,
+                3
+            )
+            .unwrap()
+            .ino,
+            INodeNo(3)
+        );
 
         let store = MockStore::new();
         store.insert("/", 1, FsEntryKind::Directory);
@@ -223,7 +294,8 @@ mod tests {
                 ..FileAttrData::default()
             },
         );
-        let attr = getattr_decision(&store, 7, 8, 5).unwrap();
+        let attr =
+            getattr_decision(&store, &crate::telemetry::OperationContext::new(), 7, 8, 5).unwrap();
         assert_eq!(attr.size, 1234);
         assert_eq!(attr.perm, 0o640);
         assert_eq!((attr.uid, attr.gid), (33, 44));

@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("PUNKFS_LOG_ROUTES must be 1, 0, true, or false".into()),
     };
     if let Some(listen) = listen {
-        return punkfs::core::node::run(punkfs::core::node::NodeConfig {
+        return punkfs::run(punkfs::NodeConfig {
             mountpoint,
             node_id: local,
             listen,
