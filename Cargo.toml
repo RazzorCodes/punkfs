@@ -3,6 +3,7 @@ name = "punkfs"
 description = ""
 version = "0.0.1"
 edition = "2024"
+license = "0BSD"
 
 [dependencies]
 fuser = "0.18.0"
