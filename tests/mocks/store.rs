@@ -13,8 +13,8 @@ use std::sync::Mutex;
 
 use fuser::RenameFlags;
 
-use crate::core::types::{FileAttrData, FsEntryKind};
 use crate::core::metadata::{Availability, FsEntry};
+use crate::core::types::{FileAttrData, FsEntryKind};
 use crate::store::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
 
 /// One recorded call per trait method, in order.
@@ -98,7 +98,13 @@ impl MockStore {
     }
 
     /// Add or replace an entry (matched by inode or path).
-    pub(crate) fn insert_with(&self, path: &str, inode: u64, kind: FsEntryKind, attr: FileAttrData) {
+    pub(crate) fn insert_with(
+        &self,
+        path: &str,
+        inode: u64,
+        kind: FsEntryKind,
+        attr: FileAttrData,
+    ) {
         let mut state = self.lock();
         let inode = if inode == 0 { state.alloc() } else { inode };
         let entry = FsEntry {
@@ -239,7 +245,10 @@ impl StoreApi for MockStore {
 
     fn write(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, StoreError> {
         let mut state = self.lock();
-        state.calls.write.push((path.to_owned(), offset, data.to_vec()));
+        state
+            .calls
+            .write
+            .push((path.to_owned(), offset, data.to_vec()));
         state
             .expects
             .write

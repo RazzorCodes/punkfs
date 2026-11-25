@@ -8,6 +8,5 @@ pub mod cache;
 pub mod config;
 pub mod metadata;
 pub mod node;
-pub mod punkfs;
 pub mod store;
 pub mod types;

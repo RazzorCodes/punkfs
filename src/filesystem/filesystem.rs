@@ -1,24 +1,8 @@
-//! The `fs`: our FUSE filesystem. `punkfs` (the whole crate) wires this
-//! together with the grpc client, db, etc.
-//!
-//! Split by operation type. Rust allows at most one `impl Filesystem for Fs`
-//! block per type, so each method here is a thin delegate to the free
-//! function with the same name in the op modules:
-//!
-//! - `lookup.rs` — name resolution + metadata: `lookup`, `getattr`
-//! - `dir.rs`    — directories: `opendir`, `readdir`
-//! - `file.rs`   — file content: `open`, `read`, `write`, `flush`,
-//!   `release`, `fsync`
-//! - `meta.rs`   — metadata/namespace mutation: `setattr`, `unlink`,
-//!   `rmdir`, `rename`, `statfs`
-//! - `misc.rs`   — uncategorisable ops: `readlink`, `mknod`, `symlink`,
-//!   `link`
-//! - `helpers.rs` — helpers that fit none of the above
+//! FUSE adapter. Request handling delegates backing operations to the store.
 
-use crate::filesystem::passthrough::{Local, RoutedStore};
 #[cfg(test)]
-use crate::filesystem::remote::helpers;
-use crate::filesystem::remote::{dir, file, lookup, meta, misc};
+use crate::filesystem::ops::helpers;
+use crate::filesystem::ops::{dir, file, lookup, meta, misc};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -31,9 +15,7 @@ use fuser::MountOption;
 use fuser::ReplyAttr;
 use fuser::Request;
 
-use crate::core::cache::metadata::FsNode;
-use crate::store::Store;
-use crate::store::StoreApi;
+use crate::store::{CreateEntry, StoreApi};
 
 /// The `fs` itself: implements the fuser `Filesystem` trait below.
 ///
@@ -43,35 +25,41 @@ use crate::store::StoreApi;
 ///
 /// The store is held as a trait object so tests can substitute a fake
 /// (see `crate::store::mock`) and exercise the op modules without a
-/// server or a FUSE session. Production always gets a real [`Store`].
+/// server or a FUSE session. Production always gets a real [`crate::Store`].
 pub struct Fs {
     /// In-memory snapshot of the server's tree, plus the grpc client used
     /// to fetch listings on demand. `pub(crate)` so the op modules can
     /// reach it without accessors.
     pub(crate) store: Arc<dyn StoreApi>,
-    pub(crate) local: Option<Arc<Local>>,
     route_console: bool,
+}
+
+/// FUSE mount configuration. Construct the store before mounting so its
+/// local backing, if any, is pinned before the kernel covers the directory.
+pub struct MountOptions {
+    pub store: Arc<dyn StoreApi>,
+    /// Opt-in console diagnostics. These include file and directory names.
+    pub route_console: bool,
+}
+
+impl MountOptions {
+    pub fn new(store: Arc<dyn StoreApi>) -> Self {
+        Self {
+            store,
+            route_console: false,
+        }
+    }
 }
 
 impl Fs {
     /// Bind a fresh ingress identity to this FUSE callback and all its store work.
     fn for_operation(&self) -> Self {
         let context = crate::telemetry::OperationContext::new();
-        let store: Arc<dyn StoreApi> = if let Some(local) = &self.local {
-            Arc::new(RoutedStore {
-                inner: self.store.clone(),
-                local: local.clone(),
-                ctx: context,
-            })
-        } else {
-            Arc::new(crate::store::contextual::ContextualStore {
+        Self {
+            store: Arc::new(crate::store::contextual::ContextualStore {
                 inner: self.store.clone(),
                 context,
-            })
-        };
-        Self {
-            store,
-            local: self.local.clone(),
+            }),
             route_console: self.route_console,
         }
     }
@@ -82,7 +70,7 @@ impl Fs {
         if !self.route_console {
             return;
         }
-        let Some(entry) = self.store.get_entry(inode) else {
+        let Ok(Some(entry)) = self.store.catalog_inode(inode) else {
             return;
         };
         let Some(ctx) = self.store.operation_context() else {
@@ -100,7 +88,7 @@ impl Fs {
             ("unresolved", "conflict")
         } else if directory || entry.node_id.is_empty() {
             ("multiple", "merged")
-        } else if self.local.is_some() && entry.node_id == self.store.node_id() {
+        } else if self.store.has_local_backing() && entry.node_id == self.store.node_id() {
             (entry.node_id.as_str(), "local")
         } else {
             (entry.node_id.as_str(), "remote")
@@ -138,32 +126,12 @@ impl Fs {
         if !self.route_console {
             return;
         }
-        if let Ok(parent) = crate::filesystem::remote::helpers::path_of(self.store.as_ref(), parent)
-            && let Ok(path) = crate::filesystem::remote::helpers::child_path(&parent, name)
-            && let Some(inode) = self.store.get_inode(&path)
+        if let Ok(parent) = crate::filesystem::ops::helpers::path_of(self.store.as_ref(), parent)
+            && let Ok(path) = crate::filesystem::ops::helpers::child_path(&parent, name)
+            && let Ok(Some(entry)) = self.store.catalog_path(&path)
         {
-            self.log_route(operation, inode);
+            self.log_route(operation, entry.inode);
         }
-    }
-
-    /// Create an `Fs` bound to a punkfs-server.
-    ///
-    /// Params:
-    /// - `server_url`: grpc endpoint of the server, e.g.
-    ///   `"http://127.0.0.1:10000"`. Not contacted yet — the channel is
-    ///   lazy, so an unreachable server only fails on the first RPC.
-    /// - `node`: this machine's identity (`FsNode`); the store tags
-    ///   everything this machine is authoritative for with it.
-    ///
-    /// Returns: the new `Fs`, or any error from building the tokio
-    /// runtime / grpc endpoint. The root inode is seeded by `Store::new`.
-    pub fn new(server_url: &str, node: FsNode) -> Result<Self, Box<dyn std::error::Error>> {
-        let store = Store::new(server_url, node)?; // root is seeded inside Store::new
-        Ok(Fs {
-            store: Arc::new(store),
-            local: None,
-            route_console: false,
-        })
     }
 
     /// Build an `Fs` over an arbitrary store implementation.
@@ -174,7 +142,6 @@ impl Fs {
     pub(crate) fn with_store(store: Box<dyn StoreApi>) -> Self {
         Fs {
             store: Arc::from(store),
-            local: None,
             route_console: false,
         }
     }
@@ -185,164 +152,15 @@ impl Fs {
         helpers::attr_for(self.store.as_ref(), inode, uid, gid)
     }
 
-    /// Mount this fs at `mountpoint` and return immediately: the fs runs
-    /// on background threads and the returned `BackgroundSession` keeps
-    /// it alive (dropping it unmounts).
-    ///
-    /// Params:
-    /// - `server_url`: passed to `new`.
-    /// - `mountpoint`: directory the fs appears under; must exist.
-    /// - `node`: this machine's identity, passed to `new`.
-    ///
-    /// Errors if fuser cannot mount (e.g. missing fusermount3, busy path).
+    /// Mount a configured store. The returned session owns the FUSE mount.
     pub fn mount(
-        server_url: &str,
         mountpoint: &Path,
-        node: FsNode,
+        options: MountOptions,
     ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
-        let fs = Fs::new(server_url, node)?;
-        Self::spawn(fs, mountpoint)
-    }
-
-    /// Mount several backing nodes as one merged namespace.
-    ///
-    /// Params:
-    /// - `nodes`: `(node_id, url)` pairs. Order is the precedence used when
-    ///   two nodes report the same name.
-    /// - `mountpoint`: directory the merged view appears under.
-    /// - `node`: this machine's identity.
-    ///
-    /// The nodes are not contacted here: connections are lazy, so a node
-    /// that is down at mount time simply contributes nothing until it
-    /// answers.
-    pub fn mount_cluster(
-        nodes: &[(String, String)],
-        mountpoint: &Path,
-        node: FsNode,
-    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
-        let store = Store::new_nodes(nodes, node)?;
-        Self::spawn(
-            Fs {
-                store: Arc::new(store),
-                local: None,
-                route_console: false,
-            },
-            mountpoint,
-        )
-    }
-
-    /// Mount a merged view over the existing local directory at `mountpoint`.
-    /// The local node must not also appear in `nodes`.
-    pub fn mount_with_local(
-        nodes: &[(String, String)],
-        mountpoint: &Path,
-        node: FsNode,
-    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
-        Self::mount_with_local_store(nodes, mountpoint, node).map(|(session, _)| session)
-    }
-
-    /// Mount with opt-in console diagnostics showing paths and backing nodes.
-    /// Paths can contain sensitive names; enable this only for trusted use.
-    pub fn mount_with_local_console(
-        nodes: &[(String, String)],
-        mountpoint: &Path,
-        node: FsNode,
-    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
-        Self::mount_with_local_options(nodes, mountpoint, node, true).map(|(session, _)| session)
-    }
-
-    /// Mount locally and return the shared catalog for embedders.
-    pub fn mount_with_local_store(
-        nodes: &[(String, String)],
-        mountpoint: &Path,
-        node: FsNode,
-    ) -> Result<(fuser::BackgroundSession, Arc<Store>), Box<dyn std::error::Error>> {
-        Self::mount_with_local_options(nodes, mountpoint, node, false)
-    }
-
-    fn mount_with_local_options(
-        nodes: &[(String, String)],
-        mountpoint: &Path,
-        node: FsNode,
-        route_console: bool,
-    ) -> Result<(fuser::BackgroundSession, Arc<Store>), Box<dyn std::error::Error>> {
-        if node.node_id.is_empty()
-            || nodes
-                .iter()
-                .any(|(id, _)| id.is_empty() || id == &node.node_id)
-        {
-            return Err("node ids must be nonempty and local must not be a remote backend".into());
-        }
-        let mut seen = std::collections::HashSet::new();
-        if nodes.iter().any(|(id, _)| !seen.insert(id)) {
-            return Err("remote node ids must be unique".into());
-        }
-        let local = Local::new(mountpoint, &node.node_id)?;
-        Self::mount_with_backing(nodes, mountpoint, node, route_console, local)
-    }
-
-    pub(crate) fn mount_with_backing(
-        nodes: &[(String, String)],
-        mountpoint: &Path,
-        node: FsNode,
-        route_console: bool,
-        local: Arc<Local>,
-    ) -> Result<(fuser::BackgroundSession, Arc<Store>), Box<dyn std::error::Error>> {
-        Self::mount_with_backing_persistence(
-            nodes,
-            mountpoint,
-            node,
-            route_console,
-            local,
-            None,
-            None,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn mount_with_backing_persistence(
-        nodes: &[(String, String)],
-        mountpoint: &Path,
-        node: FsNode,
-        route_console: bool,
-        local: Arc<Local>,
-        db_path: Option<&Path>,
-        cache_ttl: Option<std::time::Duration>,
-        cache_max_entries: Option<usize>,
-    ) -> Result<(fuser::BackgroundSession, Arc<Store>), Box<dyn std::error::Error>> {
-        let store = Arc::new(Store::new_with_local_persistence(
-            nodes,
-            node,
-            db_path,
-            cache_ttl,
-            cache_max_entries,
-        )?);
-        let session = Self::mount_with_store(mountpoint, route_console, local, store.clone())?;
-        Ok((session, store))
-    }
-
-    pub(crate) fn mount_with_store(
-        mountpoint: &Path,
-        route_console: bool,
-        local: Arc<Local>,
-        store: Arc<Store>,
-    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
-        Self::spawn(
-            Fs {
-                store,
-                local: Some(local),
-                route_console,
-            },
-            mountpoint,
-        )
-    }
-
-    /// Spawn the FUSE session for an already-constructed fs.
-    fn spawn(
-        fs: Fs,
-        mountpoint: &Path,
-    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
+        let fs = Self {
+            store: options.store,
+            route_console: options.route_console,
+        };
         let mut cfg = fuser::Config::default();
         cfg.mount_options = vec![MountOption::FSName("punkfs".into())];
         Ok(fuser::spawn_mount(fs, mountpoint, &cfg)?)
@@ -603,35 +421,18 @@ impl Filesystem for Fs {
         reply: fuser::ReplyCreate,
     ) {
         let operation = self.for_operation();
-        let Some(local) = &operation.local else {
-            reply.error(fuser::Errno::ENOSYS);
-            return;
-        };
-        let result = (|| {
-            let parent_path =
-                crate::filesystem::remote::helpers::path_of(operation.store.as_ref(), parent.0)?;
-            let path = helpers_for_create::path(&operation, parent.0, name)?;
-            operation
-                .store
-                .ensure_listed(&parent_path)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            let ctx = operation
-                .store
-                .operation_context()
-                .expect("operation context");
-            let inode = local
-                .create(self.store.as_ref(), ctx, &path, mode & !umask, false)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            let attr = crate::filesystem::remote::helpers::attr_or_not_found(
-                operation.store.as_ref(),
-                inode,
-                req.uid(),
-                req.gid(),
-            )?;
-            Ok::<_, crate::filesystem::remote::error::OpError>((inode, attr))
-        })();
+        let result = helpers_for_create::entry(
+            &operation,
+            req,
+            parent.0,
+            name,
+            CreateEntry::File {
+                mode: mode & !umask,
+            },
+        );
         match result {
-            Ok((inode, attr)) => {
+            Ok(attr) => {
+                let inode = attr.ino.0;
                 operation.log_route("create", inode);
                 reply.created(
                     &crate::TIMEOUT,
@@ -655,32 +456,15 @@ impl Filesystem for Fs {
         reply: fuser::ReplyEntry,
     ) {
         let operation = self.for_operation();
-        let Some(local) = &operation.local else {
-            reply.error(fuser::Errno::ENOSYS);
-            return;
-        };
-        let result = (|| {
-            let parent_path =
-                crate::filesystem::remote::helpers::path_of(operation.store.as_ref(), parent.0)?;
-            let path = helpers_for_create::path(&operation, parent.0, name)?;
-            operation
-                .store
-                .ensure_listed(&parent_path)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            let ctx = operation
-                .store
-                .operation_context()
-                .expect("operation context");
-            let inode = local
-                .create(self.store.as_ref(), ctx, &path, mode & !umask, true)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            crate::filesystem::remote::helpers::attr_or_not_found(
-                operation.store.as_ref(),
-                inode,
-                req.uid(),
-                req.gid(),
-            )
-        })();
+        let result = helpers_for_create::entry(
+            &operation,
+            req,
+            parent.0,
+            name,
+            CreateEntry::Directory {
+                mode: mode & !umask,
+            },
+        );
         match result {
             Ok(attr) => {
                 operation.log_route("mkdir", attr.ino.0);
@@ -708,8 +492,12 @@ impl Filesystem for Fs {
         } else {
             operation
                 .store
-                .get_path(ino.0)
-                .ok_or(crate::store::StoreError::NotFound)
+                .catalog_inode(ino.0)
+                .and_then(|entry| {
+                    entry
+                        .map(|e| e.path)
+                        .ok_or(crate::store::StoreError::NotFound)
+                })
                 .and_then(|path| {
                     operation
                         .store
@@ -718,7 +506,7 @@ impl Filesystem for Fs {
         };
         match result {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(crate::filesystem::remote::error::OpError::from(e).errno()),
+            Err(e) => reply.error(crate::filesystem::ops::error::OpError::from(e).errno()),
         }
     }
     fn getxattr(
@@ -734,8 +522,12 @@ impl Filesystem for Fs {
         operation.log_route("getxattr", ino.0);
         let result = operation
             .store
-            .get_path(ino.0)
-            .ok_or(crate::store::StoreError::NotFound)
+            .catalog_inode(ino.0)
+            .and_then(|entry| {
+                entry
+                    .map(|e| e.path)
+                    .ok_or(crate::store::StoreError::NotFound)
+            })
             .and_then(|path| operation.store.get_xattr(&path, name.as_bytes()));
         reply_xattr(result, size, reply);
     }
@@ -744,8 +536,12 @@ impl Filesystem for Fs {
         operation.log_route("listxattr", ino.0);
         let result = operation
             .store
-            .get_path(ino.0)
-            .ok_or(crate::store::StoreError::NotFound)
+            .catalog_inode(ino.0)
+            .and_then(|entry| {
+                entry
+                    .map(|e| e.path)
+                    .ok_or(crate::store::StoreError::NotFound)
+            })
             .and_then(|path| operation.store.list_xattr(&path));
         reply_xattr(result, size, reply);
     }
@@ -761,12 +557,16 @@ impl Filesystem for Fs {
         operation.log_route("removexattr", ino.0);
         let result = operation
             .store
-            .get_path(ino.0)
-            .ok_or(crate::store::StoreError::NotFound)
+            .catalog_inode(ino.0)
+            .and_then(|entry| {
+                entry
+                    .map(|e| e.path)
+                    .ok_or(crate::store::StoreError::NotFound)
+            })
             .and_then(|path| operation.store.remove_xattr(&path, name.as_bytes()));
         match result {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(crate::filesystem::remote::error::OpError::from(e).errno()),
+            Err(e) => reply.error(crate::filesystem::ops::error::OpError::from(e).errno()),
         }
     }
 
@@ -792,36 +592,7 @@ impl Filesystem for Fs {
         reply: fuser::ReplyEntry,
     ) {
         let operation = self.for_operation();
-        let Some(local) = &operation.local else {
-            misc::mknod(&operation, req, parent, name, mode, umask, rdev, reply);
-            return;
-        };
-        let result = (|| {
-            let parent_path =
-                crate::filesystem::remote::helpers::path_of(operation.store.as_ref(), parent.0)?;
-            let path = helpers_for_create::path(&operation, parent.0, name)?;
-            operation
-                .store
-                .ensure_listed(&parent_path)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            let ctx = operation
-                .store
-                .operation_context()
-                .expect("operation context");
-            let inode = local
-                .create_special(self.store.as_ref(), ctx, &path, mode & !umask, rdev)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            crate::filesystem::remote::helpers::attr_or_not_found(
-                operation.store.as_ref(),
-                inode,
-                req.uid(),
-                req.gid(),
-            )
-        })();
-        match result {
-            Ok(attr) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
-            Err(e) => reply.error(e.errno()),
-        }
+        misc::mknod(&operation, req, parent, name, mode, umask, rdev, reply);
     }
 
     /// Create a symlink at `parent/link_name` pointing to `target`.
@@ -835,39 +606,7 @@ impl Filesystem for Fs {
         reply: fuser::ReplyEntry,
     ) {
         let operation = self.for_operation();
-        let Some(local) = &operation.local else {
-            misc::symlink(&operation, req, parent, link_name, target, reply);
-            return;
-        };
-        let result = (|| {
-            let parent_path =
-                crate::filesystem::remote::helpers::path_of(operation.store.as_ref(), parent.0)?;
-            let path = helpers_for_create::path(&operation, parent.0, link_name)?;
-            operation
-                .store
-                .ensure_listed(&parent_path)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            let ctx = operation
-                .store
-                .operation_context()
-                .expect("operation context");
-            let inode = local
-                .create_symlink(self.store.as_ref(), ctx, &path, target)
-                .map_err(crate::filesystem::remote::error::OpError::from)?;
-            crate::filesystem::remote::helpers::attr_or_not_found(
-                operation.store.as_ref(),
-                inode,
-                req.uid(),
-                req.gid(),
-            )
-        })();
-        match result {
-            Ok(attr) => {
-                operation.log_route("symlink", attr.ino.0);
-                reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0));
-            }
-            Err(error) => reply.error(error.errno()),
-        }
+        misc::symlink(&operation, req, parent, link_name, target, reply);
     }
 
     /// Create a hard link `newparent/newname` referring to `ino`.
@@ -894,23 +633,42 @@ fn reply_xattr(
         Ok(data) if size == 0 => reply.size(data.len() as u32),
         Ok(data) if data.len() <= size as usize => reply.data(&data),
         Ok(_) => reply.error(fuser::Errno::ERANGE),
-        Err(e) => reply.error(crate::filesystem::remote::error::OpError::from(e).errno()),
+        Err(e) => reply.error(crate::filesystem::ops::error::OpError::from(e).errno()),
     }
 }
 
-mod helpers_for_create {
-    use super::Fs;
-    use crate::filesystem::remote::{
+pub(super) mod helpers_for_create {
+    use super::{CreateEntry, Fs, Request};
+    use crate::filesystem::ops::{
         error::{OpError, OpResult},
         helpers,
     };
     use std::ffi::OsStr;
-    pub(super) fn path(fs: &Fs, parent: u64, name: &OsStr) -> OpResult<String> {
+
+    pub(in crate::filesystem) fn entry(
+        fs: &Fs,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        kind: CreateEntry,
+    ) -> OpResult<fuser::FileAttr> {
+        create(fs.store.as_ref(), parent, name, kind).and_then(|inode| {
+            helpers::attr_or_not_found(fs.store.as_ref(), inode, req.uid(), req.gid())
+        })
+    }
+
+    pub(in crate::filesystem) fn create(
+        store: &dyn crate::StoreApi,
+        parent: u64,
+        name: &OsStr,
+        kind: CreateEntry,
+    ) -> OpResult<u64> {
         if name == "." || name == ".." || name.as_encoded_bytes().contains(&b'/') || name.is_empty()
         {
             return Err(OpError::InvalidInput);
         }
-        helpers::child_path(&helpers::path_of(fs.store.as_ref(), parent)?, name)
+        let path = helpers::child_path(&helpers::path_of(store, parent)?, name)?;
+        Ok(store.create_entry(&path, kind)?)
     }
 }
 

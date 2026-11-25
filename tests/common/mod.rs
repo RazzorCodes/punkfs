@@ -101,8 +101,7 @@ impl TestServer {
 
     /// Create a directory in the backing store, bypassing punkfs.
     pub fn seed_dir(&self, path: &str) {
-        std::fs::create_dir_all(self.root().join(path.trim_start_matches('/')))
-            .expect("seed dir");
+        std::fs::create_dir_all(self.root().join(path.trim_start_matches('/'))).expect("seed dir");
     }
 
     /// Read a file straight from the backing store.
@@ -147,7 +146,8 @@ impl Mount {
             node_id: "test-node".into(),
         };
 
-        let session = punkfs::PunkFs::mount(&server.url, path.path(), node)
+        let store = std::sync::Arc::new(punkfs::Store::new(&server.url, node).unwrap());
+        let session = punkfs::PunkFs::mount(path.path(), punkfs::MountOptions::new(store))
             .unwrap_or_else(|e| panic!("mount failed: {e}"));
 
         // The session keeps the fs alive on background threads; leaking it
@@ -291,7 +291,8 @@ impl MultiMount {
             node_id: "test-node".into(),
         };
 
-        let session = punkfs::PunkFs::mount_cluster(&cluster.nodes(), path.path(), node)
+        let store = std::sync::Arc::new(punkfs::Store::new_nodes(&cluster.nodes(), node).unwrap());
+        let session = punkfs::PunkFs::mount(path.path(), punkfs::MountOptions::new(store))
             .unwrap_or_else(|e| panic!("mount failed: {e}"));
         std::mem::forget(session);
 
@@ -332,9 +333,7 @@ pub fn fuse_available() -> bool {
         return false;
     }
     std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p).any(|dir| dir.join("fusermount3").exists())
-        })
+        .map(|p| std::env::split_paths(&p).any(|dir| dir.join("fusermount3").exists()))
         .unwrap_or(false)
 }
 
@@ -404,4 +403,23 @@ fn copy_dir(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), &target).expect("copy");
         }
     }
+}
+
+/// Integration fixture returning the same catalog used by the FUSE adapter.
+#[allow(dead_code)]
+pub fn mount_local(
+    peers: &[(String, String)],
+    path: &std::path::Path,
+    node: punkfs::FsNode,
+    route_console: bool,
+) -> Result<(fuser::BackgroundSession, std::sync::Arc<punkfs::Store>), Box<dyn std::error::Error>> {
+    let store = std::sync::Arc::new(punkfs::Store::new_local(peers, node, path)?);
+    let session = punkfs::PunkFs::mount(
+        path,
+        punkfs::MountOptions {
+            store: store.clone(),
+            route_console,
+        },
+    )?;
+    Ok((session, store))
 }

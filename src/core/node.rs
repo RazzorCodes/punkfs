@@ -11,15 +11,13 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 use crate::core::backing::Backing;
-use crate::core::cache::metadata::FsNode;
-use crate::core::punkfs::Fs;
-use crate::filesystem::passthrough::Local;
 use crate::grpc::peer;
 use crate::grpc::service::PunkFsService;
 use crate::punk_fs::peer_metadata_server::PeerMetadataServer;
 use crate::punk_fs::punk_fs_server::PunkFsServer;
 use crate::store::Store;
 use crate::telemetry::{self, Event, Severity};
+use crate::{MountOptions, PunkFs};
 
 /// Configuration for one mounted and served backing directory.
 pub struct NodeConfig {
@@ -77,18 +75,16 @@ fn run_inner(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         .max_blocking_threads(32)
         .enable_all()
         .build()?;
-    let local = Local::from_backing(backing.clone());
     let (publisher, publications) = peer::publisher(backing.clone());
-    local.set_publisher(publisher);
-    let store = Arc::new(Store::new_with_local_persistence(
+    let store = Arc::new(Store::new_with_backing(
         &config.peers,
-        FsNode {
-            node_id: config.node_id.clone(),
-        },
+        backing.clone(),
         config.db_path.as_deref(),
         config.cache_ttl,
         config.cache_max_entries,
     )?);
+
+    store.set_local_publisher(publisher);
 
     // Scan before exposing the FUSE mount: otherwise a lookup can race the
     // initial snapshot and block it while reconciling the whole backing tree.
@@ -108,11 +104,12 @@ fn run_inner(config: NodeConfig) -> Result<(), Box<dyn Error>> {
             .insert("entries".into(), serde_json::json!(scanned));
         logger.emit_in(&scan_ctx, event);
     }
-    let session = Fs::mount_with_store(
+    let session = PunkFs::mount(
         &config.mountpoint,
-        config.route_console,
-        local,
-        store.clone(),
+        MountOptions {
+            store: store.clone(),
+            route_console: config.route_console,
+        },
     )?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -207,5 +204,8 @@ fn run_inner(config: NodeConfig) -> Result<(), Box<dyn Error>> {
     }
     runtime.shutdown_timeout(Duration::from_secs(1));
     unmount?;
+    store
+        .flush_catalog()
+        .map_err(|error| std::io::Error::other(format!("catalog shutdown: {error:?}")))?;
     reason
 }

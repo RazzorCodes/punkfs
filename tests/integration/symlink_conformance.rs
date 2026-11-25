@@ -1,6 +1,6 @@
 //! Symlinks must behave as namespace entries, regardless of their owner.
 use crate::common::{self, TestServer};
-use punkfs::{FsNode, PunkFs};
+use punkfs::FsNode;
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::symlink;
@@ -16,12 +16,13 @@ fn local_symlinks_follow_normal_namespace_semantics() {
     fs::create_dir(root.path().join("dir")).unwrap();
     fs::write(root.path().join("dir/nested"), b"nested").unwrap();
     symlink("file", root.path().join("existing")).unwrap();
-    let (session, cache) = PunkFs::mount_with_local_store(
+    let (session, cache) = crate::common::mount_local(
         &[],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     let at = |name: &str| root.path().join(name);
@@ -107,12 +108,13 @@ fn symlink_targets_resolve_in_the_merged_namespace() {
     symlink("remote-file", root.path().join("local-link")).unwrap();
     symlink("remote-file", root.path().join("collision")).unwrap();
     server.seed("collision", b"remote collision");
-    let (session, cache) = PunkFs::mount_with_local_store(
+    let (session, cache) = crate::common::mount_local(
         &[("peer".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     assert!(

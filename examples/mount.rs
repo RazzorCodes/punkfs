@@ -17,7 +17,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = punkfs::FsNode {
         node_id: "manual-test".into(),
     };
-    let _session = punkfs::PunkFs::mount(&server_url, &mountpoint, node)?;
+    let store = std::sync::Arc::new(punkfs::Store::new(&server_url, node)?);
+    let _session = punkfs::PunkFs::mount(&mountpoint, punkfs::MountOptions::new(store))?;
     println!(
         "mounted {server_url} at {}; Ctrl-C to unmount",
         mountpoint.display()

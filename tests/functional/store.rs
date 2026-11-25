@@ -26,6 +26,50 @@ fn store_for(server: &TestServer) -> Store {
 }
 
 #[test]
+fn store_routes_local_and_remote_content_without_fuse() {
+    use punkfs::store::CreateEntry;
+    let server = TestServer::empty();
+    server.seed("remote", b"peer");
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("local"), b"home").unwrap();
+    let store = Store::new_local(
+        &[("peer".into(), server.url.clone())],
+        FsNode {
+            node_id: "local".into(),
+        },
+        root.path(),
+    )
+    .unwrap();
+    assert_eq!(store.catalog_path("/remote").unwrap(), None);
+    assert_eq!(
+        store.read("/remote", 0, 4).unwrap_err(),
+        StoreError::NotFound
+    );
+    assert_eq!(
+        store
+            .list("/")
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect::<Vec<_>>(),
+        ["local", "remote"]
+    );
+    assert_eq!(store.read("/local", 0, 4).unwrap(), b"home");
+    assert_eq!(store.read("/remote", 0, 4).unwrap(), b"peer");
+    assert_eq!(store.write("/remote", 0, b"P").unwrap(), 1);
+    assert_eq!(server.backing("remote"), b"Peer");
+    let inode = store
+        .create_entry("/created", CreateEntry::File { mode: 0o600 })
+        .unwrap();
+    assert!(root.path().join("created").is_file());
+    assert!(!server.backing_exists("created"));
+    assert_eq!(
+        store.catalog_inode(inode).unwrap().unwrap().node_id,
+        "local"
+    );
+}
+
+#[test]
 fn listing_reports_exactly_the_backing_children() {
     let server = TestServer::empty();
     server.seed("a.txt", b"a");
@@ -35,7 +79,11 @@ fn listing_reports_exactly_the_backing_children() {
 
     store.ensure_listed("/").expect("list root");
 
-    let mut names: Vec<String> = store.get_children("/").into_iter().map(|c| c.name).collect();
+    let mut names: Vec<String> = store
+        .get_children("/")
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     names.sort();
     assert_eq!(names, vec!["a.txt", "b.txt", "c"]);
 }
@@ -51,7 +99,11 @@ fn listing_reflects_entries_added_behind_our_back() {
     // The backing store changes without punkfs knowing.
     server.seed("second.txt", b"2");
 
-    let names: Vec<String> = store.get_children("/").into_iter().map(|c| c.name).collect();
+    let names: Vec<String> = store
+        .get_children("/")
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     assert!(
         names.contains(&"second.txt".to_string()),
         "a newly created backing file must appear on the next listing, got {names:?}"
@@ -68,7 +120,11 @@ fn listing_drops_entries_removed_behind_our_back() {
 
     std::fs::remove_file(server.root().join("goes.txt")).unwrap();
 
-    let names: Vec<String> = store.get_children("/").into_iter().map(|c| c.name).collect();
+    let names: Vec<String> = store
+        .get_children("/")
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     assert_eq!(
         names,
         vec!["stays.txt"],

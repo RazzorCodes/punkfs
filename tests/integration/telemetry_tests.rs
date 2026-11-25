@@ -172,14 +172,17 @@ fn metadata_cache_correlation_child() {
             ("a".to_owned(), a.url.clone()),
             ("b".to_owned(), b.url.clone()),
         ];
-        let session = punkfs::PunkFs::mount_cluster(
-            &nodes,
-            mount.path(),
-            FsNode {
-                node_id: "client".into(),
-            },
-        )
-        .unwrap();
+        let store = std::sync::Arc::new(
+            punkfs::Store::new_nodes(
+                &nodes,
+                FsNode {
+                    node_id: "client".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let session =
+            punkfs::PunkFs::mount(mount.path(), punkfs::MountOptions::new(store)).unwrap();
         let _ = std::fs::read_dir(mount.path()).unwrap().collect::<Vec<_>>();
         assert!(telemetry::global().unwrap().flush(Duration::from_secs(2)));
         let events = read_events();
@@ -240,12 +243,13 @@ fn local_cache_telemetry_child() {
     })
     .unwrap();
     let root = tempfile::tempdir().unwrap();
-    let session = punkfs::PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     std::fs::write(root.path().join("private-name"), b"private-contents").unwrap();
@@ -318,12 +322,13 @@ fn route_console_child() {
     server.seed("remote.txt", b"remote-content-secret");
     let mount = tempfile::tempdir().unwrap();
     std::fs::write(mount.path().join("local.txt"), b"local-content-secret").unwrap();
-    let session = punkfs::PunkFs::mount_with_local_console(
+    let (session, _) = crate::common::mount_local(
         &[("remote-node".into(), server.url.clone())],
         mount.path(),
         FsNode {
             node_id: "local-node".into(),
         },
+        true,
     )
     .unwrap();
     let _ = std::fs::read(mount.path().join("local.txt")).unwrap();
@@ -402,14 +407,16 @@ fn fuse_listing_fanout_reuses_one_id_for_both_nodes() {
         ("a".to_owned(), a.url.clone()),
         ("b".to_owned(), b.url.clone()),
     ];
-    let session = punkfs::PunkFs::mount_cluster(
-        &nodes,
-        mount.path(),
-        FsNode {
-            node_id: "client".into(),
-        },
-    )
-    .unwrap();
+    let store = std::sync::Arc::new(
+        punkfs::Store::new_nodes(
+            &nodes,
+            FsNode {
+                node_id: "client".into(),
+            },
+        )
+        .unwrap(),
+    );
+    let session = punkfs::PunkFs::mount(mount.path(), punkfs::MountOptions::new(store)).unwrap();
     let _ = std::fs::read_dir(mount.path()).unwrap().collect::<Vec<_>>();
     let ids_a = a.ids();
     let ids_b = b.ids();

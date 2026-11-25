@@ -80,7 +80,10 @@ mod tests {
         let cases = [
             (OpError::from(StoreError::NotFound), Errno::ENOENT),
             (OpError::from(StoreError::NotPermitted), Errno::EPERM),
-            (OpError::from(StoreError::Unsupported("n".into())), Errno::ENOSYS),
+            (
+                OpError::from(StoreError::Unsupported("n".into())),
+                Errno::ENOSYS,
+            ),
             (
                 OpError::from(StoreError::Inaccessible("node-a".into())),
                 Errno::EHOSTDOWN,

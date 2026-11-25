@@ -1,9 +1,9 @@
 //! Filesystem ops that fit none of the other categories: readlink,
 //! mknod, symlink, link.
 //!
-//! Remote symlink targets are read from their owning backend. Local symlink
-//! creation is handled by the passthrough layer; the client-only mount still
-//! refuses creation. Special files and hard links are not implemented.
+//! The store routes symlink reads to their owner and handles local symlink
+//! and special-file creation. Client-only mounts cannot create, and hard
+//! links are not implemented.
 //!
 //! Each decision still resolves its inodes through the store first, so an
 //! op on a nonexistent parent reports `ENOENT` rather than a misleading
@@ -18,8 +18,9 @@ use fuser::Request;
 
 use super::error::{OpError, OpResult};
 use super::helpers;
-use crate::core::punkfs::Fs;
-use crate::store::StoreApi;
+use crate::filesystem::filesystem::Fs;
+use crate::filesystem::filesystem::helpers_for_create;
+use crate::store::{CreateEntry, StoreApi};
 
 /// Return the target bytes of a symlink from its owning backend.
 pub(crate) fn readlink_decision(store: &dyn StoreApi, ino: u64) -> OpResult<Vec<u8>> {
@@ -30,27 +31,30 @@ pub(crate) fn readlink_decision(store: &dyn StoreApi, ino: u64) -> OpResult<Vec<
     Ok(store.readlink(&path)?)
 }
 
-/// Create a device node / fifo / socket: always refused.
-pub(crate) fn mknod_decision(
+fn mknod_decision(
     store: &dyn StoreApi,
     parent: u64,
     name: &OsStr,
-) -> OpResult<(u64, fuser::FileAttr)> {
-    let parent_path = helpers::path_of(store, parent)?;
-    let _ = helpers::child_path(&parent_path, name)?;
-    Err(OpError::NotPermitted)
+    mode: u32,
+    rdev: u32,
+) -> OpResult<u64> {
+    helpers_for_create::create(store, parent, name, CreateEntry::Special { mode, rdev })
 }
 
-/// Create a symlink: always refused (no symlink policy yet).
-pub(crate) fn symlink_decision(
+fn symlink_decision(
     store: &dyn StoreApi,
     parent: u64,
-    link_name: &OsStr,
-    _target: &Path,
-) -> OpResult<(u64, fuser::FileAttr)> {
-    let parent_path = helpers::path_of(store, parent)?;
-    let _ = helpers::child_path(&parent_path, link_name)?;
-    Err(OpError::NotPermitted)
+    name: &OsStr,
+    target: &Path,
+) -> OpResult<u64> {
+    helpers_for_create::create(
+        store,
+        parent,
+        name,
+        CreateEntry::Symlink {
+            target: target.into(),
+        },
+    )
 }
 
 /// Create a hard link: always refused (spec §8: reject cross-owner hard
@@ -76,30 +80,37 @@ pub(crate) fn readlink(fs: &Fs, _req: &Request, ino: INodeNo, reply: ReplyData) 
 
 pub(crate) fn mknod(
     fs: &Fs,
-    _req: &Request,
+    req: &Request,
     parent: INodeNo,
     name: &OsStr,
-    _mode: u32,
-    _umask: u32,
-    _rdev: u32,
+    mode: u32,
+    umask: u32,
+    rdev: u32,
     reply: ReplyEntry,
 ) {
-    match mknod_decision(fs.store.as_ref(), parent.0, name) {
-        Ok((_, attr)) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
+    match mknod_decision(fs.store.as_ref(), parent.0, name, mode & !umask, rdev).and_then(|inode| {
+        helpers::attr_or_not_found(fs.store.as_ref(), inode, req.uid(), req.gid())
+    }) {
+        Ok(attr) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
         Err(e) => reply.error(e.errno()),
     }
 }
 
 pub(crate) fn symlink(
     fs: &Fs,
-    _req: &Request,
+    req: &Request,
     parent: INodeNo,
     link_name: &OsStr,
     target: &Path,
     reply: ReplyEntry,
 ) {
-    match symlink_decision(fs.store.as_ref(), parent.0, link_name, target) {
-        Ok((_, attr)) => reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0)),
+    match symlink_decision(fs.store.as_ref(), parent.0, link_name, target).and_then(|inode| {
+        helpers::attr_or_not_found(fs.store.as_ref(), inode, req.uid(), req.gid())
+    }) {
+        Ok(attr) => {
+            fs.log_route("symlink", attr.ino.0);
+            reply.entry(&crate::TIMEOUT, &attr, fuser::Generation(0));
+        }
         Err(e) => reply.error(e.errno()),
     }
 }
@@ -140,7 +151,7 @@ mod tests {
 
         // Each creation-like op resolves its inodes first, then refuses.
         assert_eq!(
-            mknod_decision(&store, 2, OsStr::new("dev")).unwrap_err(),
+            mknod_decision(&store, 2, OsStr::new("dev"), 0, 0).unwrap_err(),
             OpError::NotPermitted
         );
         assert_eq!(
@@ -158,7 +169,7 @@ mod tests {
             OpError::NotFound
         );
         assert_eq!(
-            mknod_decision(&store, 99, OsStr::new("dev")).unwrap_err(),
+            mknod_decision(&store, 99, OsStr::new("dev"), 0, 0).unwrap_err(),
             OpError::NotFound
         );
         assert_eq!(

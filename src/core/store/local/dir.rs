@@ -1,7 +1,7 @@
 //! Read local directory entries before reconciling the merged catalog.
 use super::Local;
-use crate::store::StoreError;
 use crate::core::metadata::FsEntry;
+use crate::store::StoreError;
 use std::fs;
 
 pub(super) fn list(

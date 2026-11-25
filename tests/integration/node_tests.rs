@@ -118,10 +118,18 @@ impl Node {
                 self.child.try_wait().unwrap().is_none(),
                 "node exited during restart"
             );
-            if rt
-                .block_on(PunkFsClient::connect(format!("http://{}", self.addr)))
-                .is_ok()
-            {
+            // TCP can accept connections before the filesystem is mounted:
+            // the node binds the listener first. Wait for a real RPC reply.
+            if rt.block_on(async {
+                let Ok(mut client) = PunkFsClient::connect(format!("http://{}", self.addr)).await
+                else {
+                    return false;
+                };
+                client
+                    .list_directory(ListDirectoryRequest { path: "/".into() })
+                    .await
+                    .is_ok()
+            }) {
                 break;
             }
             assert!(
@@ -164,6 +172,32 @@ impl Drop for Node {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+#[test]
+fn graceful_shutdown_commits_fuse_mutations_before_restart_scan() {
+    if !require_fuse() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let mut node = Node::start("a", addresses(1)[0], &[], "seed");
+    let before = node.path().join("before");
+    let after = node.path().join("after");
+    fs::write(&before, b"data").unwrap();
+    let inode = fs::metadata(&before).unwrap().ino();
+    fs::rename(&before, &after).unwrap();
+    fs::remove_file(node.path().join("seed")).unwrap();
+    assert!(node.stop().success());
+
+    let db =
+        punkfs::db::persistent::PersistentDb::open(&node.logs.path().join("catalog.redb")).unwrap();
+    assert_eq!(db.get_inode("/after").unwrap(), Some(inode));
+    assert_eq!(db.get_inode("/before").unwrap(), None);
+    assert_eq!(db.get_inode("/seed").unwrap(), None);
+    drop(db);
+    node.restart("a", &[]);
+    assert_eq!(fs::metadata(&after).unwrap().ino(), inode);
+    assert_eq!(fs::read(after).unwrap(), b"data");
 }
 
 #[test]

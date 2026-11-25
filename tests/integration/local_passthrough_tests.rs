@@ -1,6 +1,6 @@
 //! Real-FUSE coverage for the directory under the mount.
 use super::common::{TestServer, require_fuse};
-use punkfs::{FsNode, PunkFs, StoreApi};
+use punkfs::{FsNode, StoreApi};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -19,7 +19,7 @@ fn local_entries_and_creates_operate_on_the_covered_directory() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("existing"), b"local-data").unwrap();
     std::os::unix::fs::symlink("existing", root.path().join("link")).unwrap();
-    let (session, catalog) = PunkFs::mount_with_local_store(&[], root.path(), node()).unwrap();
+    let (session, catalog) = crate::common::mount_local(&[], root.path(), node(), false).unwrap();
     assert_eq!(
         fs::read(root.path().join("existing")).unwrap(),
         b"local-data"
@@ -78,7 +78,7 @@ fn local_and_remote_entries_merge_and_operations_follow_owner() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("local"), b"local-data").unwrap();
     let nodes = vec![("remote-node".to_owned(), server.url.clone())];
-    let session = PunkFs::mount_with_local(&nodes, root.path(), node()).unwrap();
+    let (session, _) = crate::common::mount_local(&nodes, root.path(), node(), false).unwrap();
     assert_eq!(fs::read(root.path().join("local")).unwrap(), b"local-data");
     assert_eq!(
         fs::read(root.path().join("remote")).unwrap(),
@@ -111,10 +111,11 @@ fn known_offline_remote_name_is_reserved_for_create() {
     let server = TestServer::empty();
     server.seed("reserved", b"remote");
     let root = tempfile::tempdir().unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote-node".into(), server.url.clone())],
         root.path(),
         node(),
+        false,
     )
     .unwrap();
     assert!(root.path().join("reserved").exists());
@@ -138,10 +139,11 @@ fn conflicting_local_and_remote_names_cannot_be_read_or_deleted() {
     server.seed("duplicate", b"remote");
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("duplicate"), b"local").unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote-node".into(), server.url.clone())],
         root.path(),
         node(),
+        false,
     )
     .unwrap();
     assert!(fs::read(root.path().join("duplicate")).is_err());
@@ -155,10 +157,11 @@ fn conflicting_local_and_remote_names_cannot_be_read_or_deleted() {
 fn local_identity_cannot_also_be_a_remote_backend() {
     let root = tempfile::tempdir().unwrap();
     assert!(
-        PunkFs::mount_with_local(
+        crate::common::mount_local(
             &[("local-node".into(), "http://127.0.0.1:1".into())],
             root.path(),
-            node()
+            node(),
+            false,
         )
         .is_err()
     );

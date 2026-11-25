@@ -8,8 +8,8 @@ use fuser::FileType;
 use fuser::INodeNo;
 
 use super::error::{OpError, OpResult};
-use crate::store::StoreApi;
 use crate::core::types::{FileAttrData, FsEntryKind};
+use crate::store::StoreApi;
 
 /// Convert catalog kind to the `FileType` the kernel is told.
 ///
@@ -64,6 +64,7 @@ pub(crate) fn attr_from(inode: u64, attr: &FileAttrData, _uid: u32, _gid: u32) -
 }
 
 /// Attributes for `inode`, or `None` if the store has no such entry.
+#[cfg(test)]
 pub(crate) fn attr_for(store: &dyn StoreApi, inode: u64, uid: u32, gid: u32) -> Option<FileAttr> {
     let entry = store.get_entry(inode)?;
     Some(attr_from(inode, &entry.attr, uid, gid))
@@ -76,12 +77,16 @@ pub(crate) fn attr_or_not_found(
     uid: u32,
     gid: u32,
 ) -> OpResult<FileAttr> {
-    attr_for(store, inode, uid, gid).ok_or(OpError::NotFound)
+    let entry = store.catalog_inode(inode)?.ok_or(OpError::NotFound)?;
+    Ok(attr_from(inode, &entry.attr, uid, gid))
 }
 
 /// Resolve an inode to its catalog path.
 pub(crate) fn path_of(store: &dyn StoreApi, inode: u64) -> OpResult<String> {
-    store.get_path(inode).ok_or(OpError::NotFound)
+    store
+        .catalog_inode(inode)?
+        .map(|e| e.path)
+        .ok_or(OpError::NotFound)
 }
 
 /// Join a directory path with a single child name.

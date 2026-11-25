@@ -22,7 +22,7 @@ use fuser::Request;
 use super::error::{OpError, OpResult};
 use super::helpers;
 use crate::TIMEOUT;
-use crate::core::punkfs::Fs;
+use crate::filesystem::filesystem::Fs;
 use crate::store::StoreApi;
 
 /// Resolve `parent`/`name` to an inode and its attributes.
@@ -59,9 +59,22 @@ pub(crate) fn lookup_decision(
     if store.has_conflict(&full_path) {
         return Err(OpError::Local(libc::EIO));
     }
-    let inode = store.get_inode(&full_path).ok_or(OpError::NotFound)?;
-    let attr = helpers::attr_or_not_found(store, inode, uid, gid)?;
-    Ok((inode, attr))
+    let entry = store.catalog_path(&full_path)?.ok_or(OpError::NotFound)?;
+    // A publication can populate the name before its first write reaches
+    // the owner. Return the owner's current size for a remote regular file:
+    // the kernel may use lookup attributes to calculate an O_APPEND offset.
+    let attr = if store.has_local_backing()
+        && entry.kind == crate::core::types::FsEntryKind::File
+        && entry.node_id != store.node_id()
+    {
+        store.refresh(&entry.path).unwrap_or(entry.attr)
+    } else {
+        entry.attr
+    };
+    Ok((
+        entry.inode,
+        helpers::attr_from(entry.inode, &attr, uid, gid),
+    ))
 }
 
 /// Attributes of an inode.
@@ -75,19 +88,12 @@ pub(crate) fn getattr_decision(
     gid: u32,
     ino: u64,
 ) -> OpResult<FileAttr> {
-    if let Some(path) = store.get_path(ino)
-        && store.has_conflict(&path)
-    {
+    let entry = store.catalog_inode(ino)?.ok_or(OpError::NotFound)?;
+    if store.has_conflict(&entry.path) {
         return Err(OpError::Local(libc::EIO));
     }
-    if let Some(path) = store.get_path(ino)
-        && store.refresh(&path).is_ok()
-    {
-        // The refresh stored the fresh attributes; serve from there.
-        return helpers::attr_or_not_found(store, ino, uid, gid);
-    }
-
-    helpers::attr_or_not_found(store, ino, uid, gid)
+    let attr = store.refresh(&entry.path).unwrap_or(entry.attr);
+    Ok(helpers::attr_from(ino, &attr, uid, gid))
 }
 
 pub(crate) fn lookup(fs: &Fs, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -146,7 +152,9 @@ mod tests {
             2
         );
         assert_eq!(
-            lookup_decision(&store, 7, 8, 2, OsStr::new("..")).unwrap().0,
+            lookup_decision(&store, 7, 8, 2, OsStr::new(".."))
+                .unwrap()
+                .0,
             1
         );
         assert!(

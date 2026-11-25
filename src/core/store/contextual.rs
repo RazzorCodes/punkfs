@@ -1,7 +1,7 @@
 //! Bind an operation context to the store without global or thread-local state.
-use super::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
-use crate::core::types::FileAttrData;
+use super::{CreateEntry, SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
 use crate::core::metadata::FsEntry;
+use crate::core::types::FileAttrData;
 use crate::telemetry::OperationContext;
 use fuser::RenameFlags;
 
@@ -28,6 +28,24 @@ impl StoreApi for ContextualStore {
     }
     fn owner_of(&self, path: &str) -> Option<String> {
         self.inner.owner_of(path)
+    }
+    fn has_conflict(&self, path: &str) -> bool {
+        self.inner.has_conflict(path)
+    }
+    fn has_local_backing(&self) -> bool {
+        self.inner.has_local_backing()
+    }
+    fn create_entry(&self, path: &str, entry: CreateEntry) -> Result<u64, StoreError> {
+        self.inner.create_in(&self.context, path, entry)
+    }
+    fn catalog_path(&self, path: &str) -> Result<Option<FsEntry>, StoreError> {
+        self.inner.catalog_path_in(&self.context, path)
+    }
+    fn catalog_inode(&self, inode: u64) -> Result<Option<FsEntry>, StoreError> {
+        self.inner.catalog_inode_in(&self.context, inode)
+    }
+    fn list(&self, path: &str) -> Result<Vec<StoreChild>, StoreError> {
+        self.inner.list_in(&self.context, path)
     }
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError> {
         self.inner.ensure_listed_in(&self.context, dir)

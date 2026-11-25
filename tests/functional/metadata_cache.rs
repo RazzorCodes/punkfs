@@ -370,6 +370,87 @@ fn persisted_listing_reconciles_after_eviction_without_deleting_other_owner() {
 }
 
 #[test]
+fn queued_owner_removal_leaves_other_directory_contributions_visible() {
+    use punkfs::db::persistent::PersistentDb;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(PersistentDb::open(&dir.path().join("catalog.redb")).unwrap());
+    let mut cache = MetadataCache::new();
+    cache.attach_db(db.clone(), None, Some(1)).unwrap();
+    cache.insert_root("/", "/", FsEntryKind::Directory);
+    let directory = |node: &str| {
+        let mut entry = event_test_entry("/shared", node, node);
+        entry.kind = FsEntryKind::Directory;
+        entry.attr.kind = FsEntryKind::Directory;
+        entry
+    };
+    cache.reconcile_from(
+        "/",
+        vec![
+            ("a".into(), ListingOutcome::Answered(vec![directory("a")])),
+            ("b".into(), ListingOutcome::Answered(vec![directory("b")])),
+        ],
+    );
+    cache.upsert_entry(event_test_entry("/shared/child", "child", "b"));
+    let inode = cache.lookup_inode("/shared").unwrap();
+    cache.reconcile_from("/", vec![("a".into(), ListingOutcome::Answered(vec![]))]);
+    let children = cache.lookup_children_of("/");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].inode, inode);
+    assert_eq!(children[0].node_id, "b");
+    assert_eq!(cache.lookup_children_of("/shared")[0].path, "/shared/child");
+    cache.flush().unwrap();
+    assert_eq!(db.get_by_inode(inode).unwrap().unwrap().node_id, "b");
+    assert!(db.get_by_path("/shared/child").unwrap().is_some());
+}
+
+#[test]
+fn database_write_failure_is_correlated_and_keeps_uncommitted_namespace() {
+    use punkfs::db::persistent::PersistentDb;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let db = Arc::new(PersistentDb::open(&dir.path().join("catalog.redb")).unwrap());
+    let first = db
+        .upsert_entry(&event_test_entry("/committed", "first", "owner"))
+        .unwrap();
+    let (logger, mut guard) = telemetry::start(logger_config(&log, Severity::Trace)).unwrap();
+    let mut cache = MetadataCache::with_logger(logger);
+    cache.attach_db(db.clone(), None, Some(1)).unwrap();
+    let operation = OperationContext::new();
+    // Fault injection: the write transaction must reject an occupied inode
+    // belonging to a different path rather than damage the reverse index.
+    let mut pending = event_test_entry("/pending", "second", "owner");
+    pending.inode = first.inode;
+    cache.upsert_entry_in(&operation, pending);
+    let failure = cache.flush().unwrap_err();
+    assert!(failure.contains("duplicate or invalid inode"), "{failure}");
+    assert!(cache.lookup_entry_by_path("/pending").is_some());
+    assert!(
+        cache
+            .lookup_children_of("/")
+            .iter()
+            .any(|entry| entry.path == "/pending")
+    );
+    assert_eq!(db.get_inode("/pending").unwrap(), None);
+    assert_eq!(
+        db.get_path(first.inode).unwrap().as_deref(),
+        Some("/committed")
+    );
+    assert!(guard.shutdown(Duration::from_secs(2)));
+    assert!(
+        events(&log)
+            .iter()
+            .any(|event| event["component"] == "metadata_db"
+                && event["severity"] == "error"
+                && event["operation"] == "upsert"
+                && event["correlation_id"] == operation.id().to_string())
+    );
+}
+
+#[test]
 fn cache_events_obey_info_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");

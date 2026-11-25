@@ -8,7 +8,7 @@ pub mod grpc;
 pub mod telemetry;
 
 pub use core::cache::metadata::FsNode;
-pub use core::punkfs::Fs as PunkFs;
+pub use filesystem::filesystem::{Fs as PunkFs, MountOptions};
 pub use store::{SetattrChanges, StatFs, Store, StoreApi, StoreChild, StoreError};
 
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(0);

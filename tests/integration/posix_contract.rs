@@ -1,6 +1,6 @@
 //! Desired POSIX contracts through a real combined FUSE mount.
 use crate::{common, posix_contract};
-use punkfs::{FsNode, PunkFs};
+use punkfs::FsNode;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
@@ -13,12 +13,13 @@ fn run(contract: fn(&std::path::Path), mode: u32) {
     server.seed("other", b"other");
     fs::set_permissions(server.root().join("data"), fs::Permissions::from_mode(mode)).unwrap();
     let root = tempfile::tempdir().unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     contract(root.path());
@@ -47,12 +48,13 @@ fn remote_fifo_transfers_bytes_from_owner() {
     let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     let root = tempfile::tempdir().unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     let owner = std::thread::spawn(move || {
@@ -94,12 +96,13 @@ fn cross_owner_exchange_is_refused_without_data_loss() {
     server.seed("remote", b"remote");
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("local"), b"local").unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote-node".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local-node".into(),
         },
+        false,
     )
     .unwrap();
     let local = std::ffi::CString::new(root.path().join("local").as_os_str().as_bytes()).unwrap();
@@ -136,12 +139,13 @@ fn remote_exchange_directories_keeps_subtree_inodes() {
     server.seed("exchange-left/nested/file", b"left");
     server.seed("exchange-right/nested/file", b"right");
     let root = tempfile::tempdir().unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     posix_contract::rename_exchange_directories(root.path());
@@ -158,12 +162,13 @@ fn local_exchange_preserves_inode_identity() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("left"), b"left").unwrap();
     fs::write(root.path().join("right"), b"right").unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     let left = root.path().join("left");
@@ -232,12 +237,13 @@ fn owner_ids_match_backing_even_when_gid_is_zero() {
     }
     let expected = fs::metadata(server.root().join("data")).unwrap();
     let root = tempfile::tempdir().unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     posix_contract::uid_gid_match(root.path(), expected.uid(), expected.gid());
@@ -261,12 +267,13 @@ fn seeded_xattr_case(contract: fn(&std::path::Path)) {
         panic!("seed xattr: {err}");
     }
     let root = tempfile::tempdir().unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     contract(root.path());
@@ -295,12 +302,13 @@ fn append_after_backing_growth_uses_current_eof() {
     let server = common::TestServer::empty();
     server.seed("data", b"");
     let root = tempfile::tempdir().unwrap();
-    let session = PunkFs::mount_with_local(
+    let (session, _) = crate::common::mount_local(
         &[("remote".into(), server.url.clone())],
         root.path(),
         FsNode {
             node_id: "local".into(),
         },
+        false,
     )
     .unwrap();
     assert_eq!(fs::metadata(root.path().join("data")).unwrap().len(), 0);

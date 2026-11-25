@@ -11,13 +11,16 @@
 //!
 //! Entries are therefore looked up by `guid` when we reconcile a listing,
 //! and by `inode`/`path` when the kernel asks about something.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::metadata::{Availability, FsEntry};
 use crate::core::types::{FileAttrData, FsEntryKind};
-use crate::db::persistent::PersistentDb;
+use crate::db::persistent::{
+    CatalogPatch, CatalogRow, PersistentDb, normalize_rel_path, to_logical_path,
+};
+use crate::db::worker::CatalogWriter;
 use crate::telemetry::{self, Event, Logger, OperationContext, Severity};
 
 pub struct FsNode {
@@ -80,6 +83,12 @@ pub struct MetadataCache {
     logger: Option<Logger>,
     local_node: Option<String>,
     db: Option<Arc<PersistentDb>>,
+    writer: Option<CatalogWriter>,
+    // Separate from the hot cache: an unacknowledged row cannot be evicted.
+    // A tombstone masks committed DB data by logical path, including reverse
+    // inode and GUID lookups.
+    pending: BTreeMap<String, (u64, Option<CatalogRow>)>,
+    memory_directory_owners: HashMap<String, Vec<String>>,
     ttl: Option<Duration>,
     max_entries: Option<usize>,
     cached_at: HashMap<String, Instant>,
@@ -111,6 +120,9 @@ impl MetadataCache {
             logger,
             local_node: None,
             db: None,
+            writer: None,
+            pending: BTreeMap::new(),
+            memory_directory_owners: HashMap::new(),
             ttl: None,
             max_entries: None,
             cached_at: HashMap::new(),
@@ -128,14 +140,24 @@ impl MetadataCache {
     }
 
     /// Attach a `redb` persistence backend and bounded in-memory cache policy.
-    /// Existing entries from the DB are hydrated into memory up to `max_entries`.
+    /// Existing entries are hydrated up to `max_entries`. Once attached, this
+    /// cache's worker must be the only writer to the database.
     pub fn attach_db(
         &mut self,
         db: Arc<PersistentDb>,
         ttl: Option<Duration>,
         max_entries: Option<usize>,
     ) -> Result<(), redb::Error> {
+        if self.writer.is_some() {
+            return Err(
+                redb::StorageError::Io(std::io::Error::other("catalog already attached")).into(),
+            );
+        }
         let (loaded, next_inode) = db.load_limit(max_entries)?;
+        self.writer = Some(
+            CatalogWriter::start(db.clone(), self.logger.clone())
+                .map_err(redb::StorageError::Io)?,
+        );
         self.next_inode = self.next_inode.max(next_inode);
         self.db = Some(db);
         self.ttl = ttl;
@@ -154,8 +176,57 @@ impl MetadataCache {
 
     /// A failed catalog write makes the process's view unreliable. Keep the
     /// error until restart rather than reporting later operations as durable.
-    pub(crate) fn persistence_error(&self) -> Option<&str> {
+    pub(crate) fn persistence_error(&self) -> Option<String> {
+        self.persistence_error
+            .clone()
+            .or_else(|| self.writer.as_ref().and_then(CatalogWriter::failure))
+    }
+
+    /// Synchronous read/admission failure, distinct from an asynchronously
+    /// failed commit. Do not roll back a backing operation after its update
+    /// has already been accepted into the queue.
+    pub(crate) fn admission_error(&self) -> Option<&str> {
         self.persistence_error.as_deref()
+    }
+
+    /// Wait for already accepted updates to reach the durable catalog. This
+    /// is a lifecycle barrier, not part of normal foreground mutations.
+    pub fn flush(&mut self) -> Result<(), String> {
+        if let Some(writer) = &self.writer {
+            writer.flush()?;
+        }
+        self.reap_committed();
+        self.persistence_error().map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn reconcile_persistent_snapshot(
+        &mut self,
+        ctx: &OperationContext,
+        owner: &str,
+        snapshot: Vec<FsEntry>,
+    ) -> Result<(usize, Vec<String>), String> {
+        let writer = self.writer.as_ref().expect("persistent catalog");
+        let (stored, conflicts) = writer.reconcile_snapshot(ctx, owner, snapshot)?;
+        // The snapshot ran after all queued changes and may allocate inodes.
+        self.reap_committed();
+        self.entries.clear();
+        self.cached_at.clear();
+        self.last_used.clear();
+        let next = self
+            .db
+            .as_ref()
+            .unwrap()
+            .next_inode()
+            .map_err(|error| self.read_error(Some(ctx), "snapshot_next_inode", error))?;
+        self.next_inode = self.next_inode.max(next);
+        Ok((stored.len(), conflicts))
+    }
+
+    fn reap_committed(&mut self) {
+        if let Some(writer) = &self.writer {
+            let committed = writer.committed();
+            self.pending.retain(|_, (seq, _)| *seq > committed);
+        }
     }
 
     fn record_db_error(
@@ -177,23 +248,18 @@ impl MetadataCache {
         }
     }
 
-    pub(crate) fn clear_memory(&mut self) {
-        self.entries.clear();
-        self.cached_at.clear();
-        self.last_used.clear();
-    }
-
-    pub(crate) fn db(&self) -> Option<&Arc<PersistentDb>> {
-        self.db.as_ref()
+    pub(crate) fn is_persistent(&self) -> bool {
+        self.db.is_some()
     }
 
     /// Drop expired or over-capacity entries from the *in-memory* cache.
     /// Entries remain in `redb` so `get_inode`/`get_path` still resolve
     /// constant local inodes on cache misses.
     pub fn prune_expired(&mut self) {
+        self.reap_committed();
         if let Some(ttl) = self.ttl {
             let now = Instant::now();
-            let expired: Vec<String> = self
+            let expired: HashSet<String> = self
                 .entries
                 .iter()
                 .filter(|e| e.path != "/")
@@ -205,8 +271,7 @@ impl MetadataCache {
                 .map(|e| e.path.clone())
                 .collect();
             if !expired.is_empty() {
-                self.entries
-                    .retain(|e| !expired.iter().any(|p| p == &e.path));
+                self.entries.retain(|e| !expired.contains(&e.path));
                 for path in expired {
                     self.cached_at.remove(&path);
                     self.last_used.remove(&path);
@@ -220,24 +285,20 @@ impl MetadataCache {
         let Some(max) = self.max_entries else {
             return;
         };
-        while self.entries.len() > max {
-            let Some(victim) = self
-                .entries
-                .iter()
-                .filter(|e| e.path != "/")
-                .min_by_key(|e| {
-                    self.last_used
-                        .get(&e.path)
-                        .copied()
-                        .unwrap_or_else(Instant::now)
-                })
-                .map(|e| e.path.clone())
-            else {
-                break;
-            };
-            self.entries.retain(|e| e.path != victim);
-            self.cached_at.remove(&victim);
-            self.last_used.remove(&victim);
+        let excess = self.entries.len().saturating_sub(max);
+        if excess == 0 {
+            return;
+        }
+        let mut candidates: Vec<_> = self.entries.iter().filter(|e| e.path != "/").collect();
+        if excess < candidates.len() {
+            candidates.select_nth_unstable_by_key(excess, |e| self.last_used.get(&e.path).copied());
+            candidates.truncate(excess);
+        }
+        let evicted: HashSet<_> = candidates.into_iter().map(|e| e.path.clone()).collect();
+        self.entries.retain(|e| !evicted.contains(&e.path));
+        for path in evicted {
+            self.cached_at.remove(&path);
+            self.last_used.remove(&path);
         }
     }
 
@@ -247,141 +308,284 @@ impl MetadataCache {
         self.last_used.insert(path.to_owned(), now);
     }
 
-    /// Look up by path, falling back to `redb` on in-memory cache miss
-    /// (and warming the in-memory cache).
-    pub fn lookup_entry_by_path(&mut self, path: &str) -> Option<FsEntry> {
-        self.prune_expired();
-        if let Some(entry) = self.entries.iter().find(|e| e.path == path).cloned() {
-            self.touch_mem(path);
-            return Some(entry);
+    fn current_row(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        path: &str,
+    ) -> Result<Option<CatalogRow>, String> {
+        if let Some((_, row)) = self.pending.get(path) {
+            return Ok(row.clone());
         }
-        let db = self.db.as_ref()?.clone();
-        let entry = match db.get_by_path(path) {
-            Ok(entry) => entry?,
-            Err(err) => {
-                self.record_db_error(None, "lookup_path", err);
-                return None;
-            }
+        // Only directories need owner data in addition to the hot entry.
+        if let Some(entry) = self
+            .get_entry_by_path(path)
+            .filter(|entry| entry.kind != FsEntryKind::Directory)
+        {
+            return Ok(Some(CatalogRow {
+                entry: entry.clone(),
+                directory_owners: Vec::new(),
+            }));
+        }
+        let mut row = if let Some(db) = &self.db {
+            db.get_row(path)
+                .map_err(|error| self.read_error(ctx, "lookup_path", error))?
+        } else {
+            None
         };
-        self.next_inode = self.next_inode.max(entry.inode + 1);
-        self.touch_mem(&entry.path);
-        self.entries.push(entry.clone());
-        self.evict_excess();
-        Some(entry)
+        if let Some(resident) = self.get_entry_by_path(path) {
+            row = Some(CatalogRow {
+                entry: resident.clone(),
+                directory_owners: row.map(|r| r.directory_owners).unwrap_or_else(|| {
+                    self.memory_directory_owners
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_default()
+                }),
+            });
+        }
+        Ok(row)
+    }
+
+    fn read_error(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        operation: &str,
+        err: redb::Error,
+    ) -> String {
+        self.record_db_error(ctx, operation, &err);
+        err.to_string()
+    }
+
+    pub fn lookup_entry_by_path(&mut self, path: &str) -> Option<FsEntry> {
+        self.try_lookup_by_path(None, path).ok().flatten()
+    }
+
+    /// Cache-first lookup, with DB I/O errors distinguishable from a miss.
+    pub(crate) fn try_lookup_by_path(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        path: &str,
+    ) -> Result<Option<FsEntry>, String> {
+        let path = to_logical_path(&normalize_rel_path(path));
+        self.prune_expired();
+        if let Some((_, row)) = self.pending.get(&path) {
+            return Ok(row.as_ref().map(|row| row.entry.clone()));
+        }
+        if let Some(entry) = self.get_entry_by_path(&path).cloned() {
+            self.touch_mem(&path);
+            return Ok(Some(entry));
+        }
+        let Some(db) = &self.db else {
+            return Ok(None);
+        };
+        let entry = db
+            .get_by_path(&path)
+            .map_err(|err| self.read_error(ctx, "lookup_path", err))?;
+        self.warm(entry.as_ref());
+        Ok(entry)
     }
 
     /// Find a stable identity regardless of in-memory eviction.
     pub fn lookup_entry_by_guid(&mut self, owner: &str, guid: &str) -> Option<FsEntry> {
         self.prune_expired();
+        self.try_lookup_guid(None, owner, guid).ok().flatten()
+    }
+
+    fn try_lookup_guid(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        owner: &str,
+        guid: &str,
+    ) -> Result<Option<FsEntry>, String> {
+        if guid.is_empty() {
+            return Ok(None);
+        }
         if let Some(entry) = self
-            .entries
-            .iter()
-            .find(|e| e.node_id == owner && e.guid == guid)
+            .pending
+            .values()
+            .filter_map(|(_, row)| row.as_ref().map(|r| &r.entry))
+            .chain(self.entries.iter())
+            .find(|entry| entry.node_id == owner && entry.guid == guid)
             .cloned()
         {
-            self.touch_mem(&entry.path);
-            return Some(entry);
-        }
-        let db = self.db.as_ref()?.clone();
-        match db.get_by_guid(owner, guid) {
-            Ok(entry) => entry,
-            Err(err) => {
-                self.record_db_error(None, "lookup_guid", err);
-                None
+            if self.get_entry_by_path(&entry.path).is_some() {
+                self.touch_mem(&entry.path);
             }
+            return Ok(Some(entry));
         }
-    }
-
-    /// Resolve a constant local inode by path, hitting `redb` on cache miss.
-    pub fn lookup_inode(&mut self, path: &str) -> Option<u64> {
-        self.prune_expired();
-        if let Some(inode) = self
-            .entries
-            .iter()
-            .find(|e| e.path == path)
-            .map(|e| e.inode)
-        {
-            self.touch_mem(path);
-            return Some(inode);
-        }
-        let db = self.db.as_ref()?.clone();
-        match db.get_inode(path) {
-            Ok(inode) => inode,
-            Err(err) => {
-                self.record_db_error(None, "lookup_inode", err);
-                None
-            }
-        }
-    }
-
-    /// Resolve a path by constant local inode, hitting `redb` on cache miss.
-    pub fn lookup_path(&mut self, inode: u64) -> Option<String> {
-        self.prune_expired();
-        if let Some(path) = self
-            .entries
-            .iter()
-            .find(|e| e.inode == inode)
-            .map(|e| e.path.clone())
-        {
-            self.touch_mem(&path);
-            return Some(path);
-        }
-        let db = self.db.as_ref()?.clone();
-        match db.get_path(inode) {
-            Ok(path) => path,
-            Err(err) => {
-                self.record_db_error(None, "lookup_inode_path", err);
-                None
-            }
-        }
-    }
-
-    /// Resolve an entry by constant local inode, hitting `redb` on cache miss.
-    pub fn lookup_entry_by_inode(&mut self, inode: u64) -> Option<FsEntry> {
-        self.prune_expired();
-        if let Some(entry) = self.entries.iter().find(|e| e.inode == inode).cloned() {
-            self.touch_mem(&entry.path);
-            return Some(entry);
-        }
-        let db = self.db.as_ref()?.clone();
-        let entry = match db.get_by_inode(inode) {
-            Ok(entry) => entry?,
-            Err(err) => {
-                self.record_db_error(None, "lookup_entry", err);
-                return None;
-            }
+        let Some(db) = &self.db else {
+            return Ok(None);
         };
-        self.next_inode = self.next_inode.max(entry.inode + 1);
-        self.touch_mem(&entry.path);
-        self.entries.push(entry.clone());
-        self.evict_excess();
-        Some(entry)
+        let entry = db
+            .get_by_guid(owner, guid)
+            .map_err(|err| self.read_error(ctx, "lookup_guid", err))?;
+        Ok(entry.filter(|entry| !self.pending.contains_key(&entry.path)))
     }
 
-    /// Direct children of `path`, falling back to `redb` when a DB is attached.
-    pub fn lookup_children_of(&mut self, path: &str) -> Vec<FsEntry> {
-        if let Some(db) = self.db.as_ref().cloned() {
-            return match db.get_children_of(path) {
-                Ok(children) => children,
-                Err(err) => {
-                    self.record_db_error(None, "lookup_children", err);
-                    Vec::new()
-                }
-            };
+    pub fn lookup_inode(&mut self, path: &str) -> Option<u64> {
+        self.lookup_entry_by_path(path).map(|entry| entry.inode)
+    }
+
+    pub fn lookup_path(&mut self, inode: u64) -> Option<String> {
+        self.lookup_entry_by_inode(inode).map(|entry| entry.path)
+    }
+
+    pub fn lookup_entry_by_inode(&mut self, inode: u64) -> Option<FsEntry> {
+        self.try_lookup_by_inode(None, inode).ok().flatten()
+    }
+
+    pub(crate) fn try_lookup_by_inode(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        inode: u64,
+    ) -> Result<Option<FsEntry>, String> {
+        self.prune_expired();
+        if let Some(entry) = self
+            .pending
+            .values()
+            .filter_map(|(_, row)| row.as_ref().map(|r| &r.entry))
+            .chain(self.entries.iter())
+            .find(|e| e.inode == inode)
+            .cloned()
+        {
+            if self.get_entry_by_path(&entry.path).is_some() {
+                self.touch_mem(&entry.path);
+            }
+            return Ok(Some(entry));
         }
-        self.get_children_of(path).into_iter().cloned().collect()
+        let Some(db) = &self.db else {
+            return Ok(None);
+        };
+        let entry = db
+            .get_by_inode(inode)
+            .map_err(|err| self.read_error(ctx, "lookup_inode", err))?;
+        let entry = entry.filter(|e| !self.pending.contains_key(&e.path));
+        self.warm(entry.as_ref());
+        Ok(entry)
+    }
+
+    fn warm(&mut self, entry: Option<&FsEntry>) {
+        if let Some(entry) = entry {
+            self.touch_mem(&entry.path);
+            self.entries.push(entry.clone());
+            self.evict_excess();
+        }
+    }
+
+    /// Union direct children by path. Resident and queued rows take priority
+    /// over redb; a queued deletion suppresses the durable row entirely.
+    pub fn lookup_children_of(&mut self, path: &str) -> Vec<FsEntry> {
+        self.try_lookup_children(None, path).unwrap_or_default()
+    }
+
+    pub(crate) fn try_lookup_children(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        path: &str,
+    ) -> Result<Vec<FsEntry>, String> {
+        self.prune_expired();
+        Ok(self
+            .rows_under(ctx, path, true)?
+            .into_values()
+            .map(|r| r.entry)
+            .collect())
+    }
+
+    fn rows_under(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        path: &str,
+        children_only: bool,
+    ) -> Result<BTreeMap<String, CatalogRow>, String> {
+        let path = to_logical_path(&normalize_rel_path(path));
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let matches = |key: &str| {
+            (!children_only && key == path)
+                || key.strip_prefix(&prefix).is_some_and(|suffix| {
+                    !suffix.is_empty() && (!children_only || !suffix.contains('/'))
+                })
+        };
+        let mut rows: BTreeMap<String, CatalogRow> = if let Some(db) = &self.db {
+            db.rows_under(&path, children_only)
+                .map_err(|err| self.read_error(ctx, "lookup_children", err))?
+                .into_iter()
+                .map(|row| (row.entry.path.clone(), row))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        for entry in self.entries.iter().filter(|e| matches(&e.path)) {
+            if let Some(row) = rows.get_mut(&entry.path) {
+                row.entry = entry.clone();
+            } else {
+                rows.insert(
+                    entry.path.clone(),
+                    CatalogRow {
+                        entry: entry.clone(),
+                        directory_owners: self
+                            .memory_directory_owners
+                            .get(&entry.path)
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                );
+            }
+        }
+        for (path, (_, row)) in self.pending.iter().filter(|(p, _)| matches(p)) {
+            if let Some(row) = row {
+                rows.insert(path.clone(), row.clone());
+            } else {
+                rows.remove(path);
+            }
+        }
+        Ok(rows)
+    }
+
+    fn apply(
+        &mut self,
+        ctx: &OperationContext,
+        operation: &'static str,
+        patch: CatalogPatch,
+    ) -> bool {
+        if patch.is_empty() {
+            return true;
+        }
+        let patch = Arc::new(patch);
+        if let Some(writer) = &mut self.writer {
+            match writer.submit(ctx, operation, patch.clone()) {
+                Ok(seq) => {
+                    self.reap_committed();
+                    for (path, row) in patch.iter() {
+                        self.pending.insert(path.clone(), (seq, row.clone()));
+                    }
+                }
+                Err(error) => {
+                    self.record_db_error(Some(ctx), operation, error);
+                    return false;
+                }
+            }
+        }
+        self.entries.retain(|e| !patch.contains_key(&e.path));
+        for (path, row) in patch.iter() {
+            self.cached_at.remove(path);
+            self.last_used.remove(path);
+            self.memory_directory_owners.remove(path);
+            if let Some(row) = row {
+                self.touch_mem(path);
+                self.entries.push(row.entry.clone());
+                if self.db.is_none() && !row.directory_owners.is_empty() {
+                    self.memory_directory_owners
+                        .insert(path.clone(), row.directory_owners.clone());
+                }
+            }
+        }
+        self.evict_excess();
+        true
     }
 
     /// Mark a node as locally accessible even during remote-only reconciliation.
     pub(crate) fn set_local_node(&mut self, node: String) {
         self.local_node = Some(node);
-    }
-
-    fn enabled(&self, severity: Severity) -> bool {
-        self.logger
-            .as_ref()
-            .or_else(|| telemetry::global())
-            .is_some_and(|logger| logger.enabled(severity))
     }
 
     fn emit(
@@ -459,94 +663,85 @@ impl MetadataCache {
     }
 
     /// Insert or update an entry as part of an existing operation.
-    pub fn upsert_entry_in(&mut self, ctx: &OperationContext, entry: FsEntry) -> Option<FsEntry> {
-        let mut entry = entry;
-        if entry.inode == 0 {
-            // Reuse the inode of the entry this one is replacing, matched
-            // by guid (a rename) or by path (the same file with a new
-            // server-assigned guid), or persisted in redb. Only a genuinely
-            // new entry gets a fresh inode.
-            let known = self
-                .entries
-                .iter()
-                .find(|e| {
-                    (e.node_id == entry.node_id && e.guid == entry.guid) || e.path == entry.path
-                })
-                .map(|e| e.inode);
-            entry.inode = known.unwrap_or_else(|| self.alloc_inode());
+    pub fn upsert_entry_in(
+        &mut self,
+        ctx: &OperationContext,
+        mut entry: FsEntry,
+    ) -> Option<FsEntry> {
+        self.prune_expired();
+        entry.path = to_logical_path(&normalize_rel_path(&entry.path));
+        let by_path = self.current_row(Some(ctx), &entry.path).ok()?;
+        let previous = if by_path.is_none() && entry.kind != FsEntryKind::Directory {
+            self.try_lookup_guid(Some(ctx), &entry.node_id, &entry.guid)
+                .ok()?
+                .filter(|e| e.kind != FsEntryKind::Directory)
         } else {
-            self.next_inode = self.next_inode.max(entry.inode + 1);
-        }
-
-        // A full listing often repeats unchanged attributes. Avoid a durable
-        // transaction per child when the committed, resident entry is identical.
-        if let Some(old) = self.entries.iter().find(|e| **e == entry).cloned() {
-            self.touch_mem(&entry.path);
-            return Some(old);
-        }
-
-        if let Some(db) = self.db.as_ref().cloned() {
-            match db.upsert_entry(&entry) {
-                Ok(persisted) => {
-                    entry.inode = persisted.inode;
-                    self.next_inode = self.next_inode.max(entry.inode + 1);
-                }
-                Err(err) => {
-                    self.record_db_error(Some(ctx), "upsert", err);
-                    return None;
-                }
-            }
-        }
-
-        let path = entry.path.clone();
-        self.touch_mem(&path);
-
-        let existing = self.entries.iter().position(|e| {
-            (e.node_id == entry.node_id && e.guid == entry.guid)
-                || e.path == entry.path
-                || e.inode == entry.inode
-        });
-
-        let old = match existing {
-            Some(idx) => {
-                let old = std::mem::replace(&mut self.entries[idx], entry);
-                if old.path != path {
-                    self.cached_at.remove(&old.path);
-                    self.last_used.remove(&old.path);
-                }
-                self.evict_excess();
-                Some(old)
-            }
-            None => {
-                self.entries.push(entry);
-                self.evict_excess();
-                None
-            }
+            None
         };
-        if self.enabled(Severity::Trace) {
-            self.emit(
-                Some(ctx),
-                Severity::Trace,
-                "upsert",
-                "metadata cache entry updated",
-                &[(
-                    "outcome",
-                    serde_json::json!(if old.is_some() {
-                        "replaced"
-                    } else {
-                        "inserted"
-                    }),
-                )],
-            );
+        let row = self.make_row(entry, by_path.as_ref(), previous.as_ref());
+        let old = by_path
+            .as_ref()
+            .map(|r| r.entry.clone())
+            .or_else(|| previous.clone());
+        if by_path.as_ref() == Some(&row) {
+            if self.get_entry_by_path(&row.entry.path).is_some() {
+                self.touch_mem(&row.entry.path);
+            }
+            return old;
         }
+        let mut patch = CatalogPatch::new();
+        if let Some(previous) = previous {
+            patch.insert(previous.path, None);
+        }
+        patch.insert(row.entry.path.clone(), Some(row));
+        if !self.apply(ctx, "upsert", patch) {
+            return None;
+        }
+        self.emit(
+            Some(ctx),
+            Severity::Trace,
+            "upsert",
+            "metadata cache entry updated",
+            &[(
+                "outcome",
+                serde_json::json!(if old.is_some() {
+                    "replaced"
+                } else {
+                    "inserted"
+                }),
+            )],
+        );
         old
     }
 
-    /// Seed an entry at a known inode, used for the root at startup.
+    fn make_row(
+        &mut self,
+        mut entry: FsEntry,
+        same_path: Option<&CatalogRow>,
+        previous: Option<&FsEntry>,
+    ) -> CatalogRow {
+        if entry.inode == 0 {
+            entry.inode = by_identity(same_path, previous).unwrap_or_else(|| self.alloc_inode());
+        }
+        self.next_inode = self.next_inode.max(entry.inode + 1);
+        let mut directory_owners = Vec::new();
+        if entry.kind == FsEntryKind::Directory {
+            if let Some(row) = same_path.filter(|r| r.entry.kind == FsEntryKind::Directory) {
+                directory_owners.clone_from(&row.directory_owners);
+                add_owner(&mut directory_owners, &row.entry.node_id);
+            }
+            add_owner(&mut directory_owners, &entry.node_id);
+        }
+        CatalogRow {
+            entry,
+            directory_owners,
+        }
+    }
+
+    /// Seed a root at its reserved inode.
     pub fn insert_root(&mut self, path: &str, guid: &str, kind: FsEntryKind) {
-        let inode = self.alloc_inode();
-        self.entries.push(FsEntry {
-            inode,
+        self.upsert_entry(FsEntry {
+            inode: 1,
             path: path.to_owned(),
             guid: guid.to_owned(),
             kind,
@@ -565,55 +760,30 @@ impl MetadataCache {
     }
 
     /// Drop `path` and, for a directory, everything below it.
-    ///
-    /// Used when the server reports a removal; the kernel's cached inodes
-    /// are invalidated separately by the caller.
     pub fn remove_entry(&mut self, path: &str) -> Option<FsEntry> {
         self.remove_entry_in(&OperationContext::new(), path)
     }
 
-    /// Remove an entry as part of an existing operation.
     pub fn remove_entry_in(&mut self, ctx: &OperationContext, path: &str) -> Option<FsEntry> {
-        let db_removed = if let Some(db) = self.db.as_ref().cloned() {
-            match db.remove_subtree(path) {
-                Ok(count) => count,
-                Err(err) => {
-                    self.record_db_error(Some(ctx), "remove", err);
-                    return None;
-                }
-            }
-        } else {
-            0
-        };
-        let before = self.entries.len();
-        let removed = self
-            .entries
-            .iter()
-            .position(|e| e.path == path)
-            .map(|idx| self.entries.remove(idx));
-        let prefix = format!("{}/", path.trim_end_matches('/'));
-        self.entries.retain(|e| !e.path.starts_with(&prefix));
-        self.cached_at
-            .retain(|k, _| k != path && !k.starts_with(&prefix));
-        self.last_used
-            .retain(|k, _| k != path && !k.starts_with(&prefix));
-        let total_removed = (before - self.entries.len()).max(db_removed);
+        self.prune_expired();
+        let rows = self.rows_under(Some(ctx), path, false).ok()?;
+        let removed = rows
+            .get(&to_logical_path(&normalize_rel_path(path)))
+            .map(|r| r.entry.clone());
+        let count = rows.len();
+        if !self.apply(
+            ctx,
+            "remove",
+            rows.into_keys().map(|key| (key, None)).collect(),
+        ) {
+            return None;
+        }
         self.emit(
             Some(ctx),
             Severity::Debug,
             "remove",
             "metadata cache removal completed",
-            &[
-                (
-                    "outcome",
-                    serde_json::json!(if removed.is_some() || db_removed > 0 {
-                        "removed"
-                    } else {
-                        "not_cached"
-                    }),
-                ),
-                ("entries_removed", serde_json::json!(total_removed)),
-            ],
+            &[("entries_removed", serde_json::json!(count))],
         );
         removed
     }
@@ -626,109 +796,130 @@ impl MetadataCache {
         path: &str,
         owner: &str,
     ) {
-        if let Some(db) = self.db.as_ref().cloned() {
-            match db.remove_owner_entry(path, owner) {
-                Ok(()) => self.clear_memory(),
-                Err(err) => self.record_db_error(Some(ctx), "remove_owner", err),
+        self.prune_expired();
+        let path = to_logical_path(&normalize_rel_path(path));
+        if path == "/" {
+            return;
+        }
+        if let Ok(Some(row)) = self.current_row(Some(ctx), &path) {
+            let survivor = remove_owner(row.clone(), owner);
+            if survivor.as_ref() != Some(&row)
+                && self.apply(
+                    ctx,
+                    "remove",
+                    CatalogPatch::from([(path.to_owned(), survivor)]),
+                )
+            {
+                self.emit(
+                    Some(ctx),
+                    Severity::Debug,
+                    "remove",
+                    "metadata cache owner removal completed",
+                    &[],
+                );
             }
-        } else {
-            self.remove_entry_in(ctx, path);
         }
     }
 
-    /// Move `old` (and its subtree) to `new`, keeping inodes and guids.
-    ///
-    /// This only rewrites our local view; the authoritative move happened
-    /// on the server. Returns false if `old` was not known.
+    /// Move `old` (and its subtree) to `new`, keeping inodes and GUIDs.
     pub fn rename_entry(&mut self, old: &str, new: &str) -> bool {
         self.rename_entry_in(&OperationContext::new(), old, new)
     }
 
-    /// Rename cached entries as part of an existing operation.
     pub fn rename_entry_in(&mut self, ctx: &OperationContext, old: &str, new: &str) -> bool {
-        let db_moved = if let Some(db) = self.db.as_ref().cloned() {
-            match db.rename_subtree(old, new) {
-                Ok(moved) => moved,
-                Err(err) => {
-                    self.record_db_error(Some(ctx), "rename", err);
-                    return false;
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        let mut moved = false;
-        let mut moved_entries = 0;
-        let old_prefix = format!("{}/", old.trim_end_matches('/'));
-        if old != new {
-            let new_prefix = format!("{}/", new.trim_end_matches('/'));
-            self.entries
-                .retain(|e| e.path != new && !e.path.starts_with(&new_prefix));
-            self.cached_at
-                .retain(|p, _| p != new && !p.starts_with(&new_prefix));
-            self.last_used
-                .retain(|p, _| p != new && !p.starts_with(&new_prefix));
-        }
-
-        for entry in &mut self.entries {
-            if entry.path == old {
-                entry.path = new.to_owned();
-                moved = true;
-                moved_entries += 1;
-            } else if let Some(rest) = entry.path.strip_prefix(&old_prefix) {
-                entry.path = format!("{}/{rest}", new.trim_end_matches('/'));
-                moved = true;
-                moved_entries += 1;
-            }
-        }
-        if !db_moved.is_empty() {
-            moved = true;
-            moved_entries = moved_entries.max(db_moved.len());
-            for entry in db_moved {
-                self.touch_mem(&entry.path);
-                if self.entries.iter().all(|e| e.path != entry.path) {
-                    self.entries.push(entry);
-                }
-            }
-            self.evict_excess();
-        }
-        self.emit(
-            Some(ctx),
-            Severity::Debug,
-            "rename",
-            "metadata cache rename completed",
-            &[
-                (
-                    "outcome",
-                    serde_json::json!(if moved { "renamed" } else { "not_cached" }),
-                ),
-                ("entries_renamed", serde_json::json!(moved_entries)),
-            ],
-        );
-        moved
+        self.move_entries(ctx, old, new, false)
     }
 
     /// Exchange two cached subtrees without changing their inode identities.
     pub fn exchange_entries(&mut self, old: &str, new: &str) {
-        if let Some(db) = self.db.as_ref().cloned()
-            && let Err(err) = db.exchange_subtrees(old, new)
-        {
-            self.record_db_error(None, "exchange", err);
-            return;
+        self.exchange_entries_in(&OperationContext::new(), old, new);
+    }
+
+    pub(crate) fn exchange_entries_in(&mut self, ctx: &OperationContext, old: &str, new: &str) {
+        self.move_entries(ctx, old, new, true);
+    }
+
+    pub(crate) fn owner_rename_allowed(
+        &mut self,
+        ctx: &OperationContext,
+        old: &str,
+        new: &str,
+        owner: &str,
+    ) -> Result<bool, String> {
+        self.prune_expired();
+        if old == new {
+            return Ok(true);
         }
-        let old_prefix = format!("{}/", old.trim_end_matches('/'));
-        let new_prefix = format!("{}/", new.trim_end_matches('/'));
-        for entry in &mut self.entries {
-            if entry.path == old {
-                entry.path = new.to_owned();
-            } else if entry.path == new {
-                entry.path = old.to_owned();
-            } else if let Some(rest) = entry.path.strip_prefix(&old_prefix) {
-                entry.path = format!("{}/{rest}", new.trim_end_matches('/'));
-            } else if let Some(rest) = entry.path.strip_prefix(&new_prefix) {
-                entry.path = format!("{}/{rest}", old.trim_end_matches('/'));
+        for path in [old, new] {
+            if self
+                .rows_under(Some(ctx), path, false)?
+                .values()
+                .any(|row| {
+                    (!row.entry.node_id.is_empty() && row.entry.node_id != owner)
+                        || row.directory_owners.iter().any(|id| id != owner)
+                })
+            {
+                return Ok(false);
             }
         }
+        Ok(true)
+    }
+
+    fn move_entries(
+        &mut self,
+        ctx: &OperationContext,
+        old: &str,
+        new: &str,
+        exchange: bool,
+    ) -> bool {
+        let old = to_logical_path(&normalize_rel_path(old));
+        let new = to_logical_path(&normalize_rel_path(new));
+        let (old, new) = (old.as_str(), new.as_str());
+        if old == "/" || new == "/" {
+            return false;
+        }
+        self.prune_expired();
+        let Ok(source) = self.rows_under(Some(ctx), old, false) else {
+            return false;
+        };
+        if source.is_empty() {
+            return false;
+        }
+        if old == new {
+            return true;
+        }
+        let Ok(target) = self.rows_under(Some(ctx), new, false) else {
+            return false;
+        };
+        let count = source.len() + if exchange { target.len() } else { 0 };
+        let mut patch: CatalogPatch = source
+            .keys()
+            .chain(target.keys())
+            .map(|p| (p.clone(), None))
+            .collect();
+        let mut move_rows = |rows: BTreeMap<String, CatalogRow>, from: &str, to: &str| {
+            for (path, mut row) in rows {
+                let next = format!("{to}{}", &path[from.len()..]);
+                row.entry.path = next.clone();
+                patch.insert(next, Some(row));
+            }
+        };
+        move_rows(source, old, new);
+        if exchange {
+            move_rows(target, new, old);
+        }
+        let operation = if exchange { "exchange" } else { "rename" };
+        if !self.apply(ctx, operation, patch) {
+            return false;
+        }
+        self.emit(
+            Some(ctx),
+            Severity::Debug,
+            operation,
+            "metadata cache rename completed",
+            &[("entries_renamed", serde_json::json!(count))],
+        );
+        true
     }
 
     /// Forget everything cached below `path`, keeping `path` itself.
@@ -744,6 +935,10 @@ impl MetadataCache {
         let before = self.entries.len();
         let prefix = format!("{}/", path.trim_end_matches('/'));
         self.entries.retain(|e| !e.path.starts_with(&prefix));
+        self.cached_at.retain(|p, _| !p.starts_with(&prefix));
+        self.last_used.retain(|p, _| !p.starts_with(&prefix));
+        self.memory_directory_owners
+            .retain(|p, _| !p.starts_with(&prefix));
         self.emit(
             Some(ctx),
             Severity::Debug,
@@ -787,63 +982,31 @@ impl MetadataCache {
         dir: &str,
         outcomes: Vec<(String, ListingOutcome)>,
     ) -> Vec<String> {
-        // Reconciliation is authoritative over all direct children, not just
-        // the subset currently resident in the bounded cache. Temporarily
-        // pin them until every owner's answer has been processed.
         self.prune_expired();
-        let max_entries = self.max_entries.take();
-        if let Some(db) = self.db.as_ref() {
-            match db.get_children_of(dir) {
-                Ok(children) => {
-                    for entry in children {
-                        if self.entries.iter().all(|e| e.path != entry.path) {
-                            self.entries.push(entry);
-                        }
-                    }
-                }
-                Err(err) => self.record_db_error(Some(ctx), "reconcile", err),
-            }
-        }
+        let Ok(initial) = self.rows_under(Some(ctx), dir, true) else {
+            return Vec::new();
+        };
+        let mut rows = initial.clone();
+        let mut displaced = CatalogPatch::new();
         let node_count = outcomes.len();
         let mut answered_count = 0usize;
         let mut unreachable_count = 0usize;
         let mut removed_count = 0usize;
         let mut recovered_count = 0usize;
-        let observe_recovery = self.enabled(Severity::Info);
-        let dir_prefix = if dir.ends_with('/') {
-            dir.to_owned()
-        } else {
-            format!("{dir}/")
-        };
-        let direct_child = |path: &str| {
-            path.strip_prefix(&dir_prefix)
-                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-        };
-
-        let mut conflicts: Vec<String> = Vec::new();
-        let mut claimed: Vec<String> = Vec::new();
+        let mut conflicts = Vec::new();
 
         for (node_id, outcome) in outcomes {
             match outcome {
                 ListingOutcome::Unreachable => {
                     unreachable_count += 1;
-                    // Keep this node's entries, but stop pretending they are
-                    // readable.
-                    let newly_inaccessible = self
-                        .entries
-                        .iter()
-                        .filter(|e| {
-                            e.node_id == node_id
-                                && direct_child(&e.path)
-                                && e.availability == Availability::Available
-                        })
-                        .count();
-                    let paths: Vec<String> = self
-                        .entries
-                        .iter()
-                        .filter(|e| e.node_id == node_id && direct_child(&e.path))
-                        .map(|e| e.path.clone())
-                        .collect();
+                    let mut count = 0;
+                    let mut newly_inaccessible = 0;
+                    for row in rows.values_mut().filter(|r| r.entry.node_id == node_id) {
+                        count += 1;
+                        newly_inaccessible +=
+                            usize::from(row.entry.availability == Availability::Available);
+                        row.entry.availability = Availability::Inaccessible;
+                    }
                     self.emit(
                         Some(ctx),
                         Severity::Warning,
@@ -851,116 +1014,97 @@ impl MetadataCache {
                         "backing node did not answer; cached entries retained",
                         &[
                             ("node_id", serde_json::json!(&node_id)),
-                            ("cached_entries", serde_json::json!(paths.len())),
+                            ("cached_entries", serde_json::json!(count)),
                             ("newly_inaccessible", serde_json::json!(newly_inaccessible)),
                         ],
                     );
-                    for path in paths {
-                        let survivors: Vec<FsEntry> = self
-                            .entries
-                            .iter()
-                            .filter(|e| e.path == path)
-                            .map(|e| {
-                                let mut kept = e.clone();
-                                if kept.node_id == node_id {
-                                    kept.availability = Availability::Inaccessible;
-                                }
-                                kept
-                            })
-                            .collect();
-                        self.entries.retain(|e| e.path != path);
-                        for entry in survivors {
-                            self.entries.push(entry);
-                        }
-                    }
                 }
                 ListingOutcome::Answered(children) => {
                     answered_count += 1;
-                    let mut node_recovered = 0usize;
-                    let reported: Vec<&str> = children.iter().map(|c| c.guid.as_str()).collect();
-
-                    // Only this node's own unreported entries are provably gone.
-                    let stale: Vec<String> = self
-                        .entries
-                        .iter()
-                        .filter(|e| e.node_id == node_id && direct_child(&e.path))
-                        // A link's GUID can fall back to its path (Linux
-                        // commonly disallows user xattrs on symlinks). A
-                        // rename performed through this mount already moved
-                        // the cached inode; keep it when the new path is
-                        // observed with its new fallback GUID.
-                        .filter(|e| {
-                            !(reported.contains(&e.guid.as_str())
-                                || e.kind == FsEntryKind::Link
-                                    && children.iter().any(|child| {
-                                        child.path == e.path && child.kind == FsEntryKind::Link
-                                    }))
+                    let reported: HashSet<_> = children.iter().map(|e| e.path.clone()).collect();
+                    // Keep the prior identities until this batch is applied,
+                    // so an out-of-band rename can reuse the old inode.
+                    let previous: HashMap<_, _> = rows
+                        .values()
+                        .filter(|r| {
+                            r.entry.node_id == node_id && r.entry.kind != FsEntryKind::Directory
                         })
-                        .map(|e| e.path.clone())
+                        .map(|r| (r.entry.guid.clone(), r.entry.clone()))
                         .collect();
-                    let before = self.entries.len();
-                    self.entries
-                        .retain(|e| !(e.node_id == node_id && stale.iter().any(|s| s == &e.path)));
-                    removed_count += before - self.entries.len();
-                    if let Some(db) = self.db.as_ref().cloned() {
-                        for stale_path in &stale {
-                            if let Err(err) = db.remove_owner_entry(stale_path, &node_id) {
-                                self.record_db_error(Some(ctx), "reconcile", err);
-                            }
-                            match db.get_by_path(stale_path) {
-                                Ok(Some(survivor)) => self.entries.push(survivor),
-                                Ok(None) => {
-                                    self.cached_at.remove(stale_path);
-                                    self.last_used.remove(stale_path);
-                                }
-                                Err(err) => self.record_db_error(Some(ctx), "reconcile", err),
-                            }
+                    let stale: Vec<_> = rows
+                        .values()
+                        .filter(|r| {
+                            r.entry.node_id == node_id || r.directory_owners.contains(&node_id)
+                        })
+                        .filter(|r| !reported.contains(r.entry.path.as_str()))
+                        .map(|r| r.entry.path.clone())
+                        .collect();
+                    for path in stale {
+                        let row = rows.remove(&path).unwrap();
+                        if let Some(survivor) = remove_owner(row, &node_id) {
+                            rows.insert(path, survivor);
+                        } else {
+                            removed_count += 1;
                         }
                     }
-
+                    let mut node_recovered = 0;
+                    let mut seen = HashSet::new();
                     for child in children {
-                        let also = self
-                            .entries
-                            .iter()
-                            .any(|e| e.path == child.path && e.node_id != child.node_id);
-
-                        if also {
-                            // Two nodes have a name in common. Directories
-                            // merge: both sides contribute children, which
-                            // is the whole point of a merged namespace.
-                            // Anything else is a genuine collision — two
-                            // different files claiming one name — and must
-                            // not be resolved silently.
+                        if !seen.insert(child.path.clone()) {
+                            continue;
+                        }
+                        if let Some(known) = rows.get_mut(&child.path)
+                            && known.entry.node_id != node_id
+                        {
                             if child.kind == FsEntryKind::Directory
-                                && self.entries.iter().any(|e| {
-                                    e.path == child.path && e.kind == FsEntryKind::Directory
-                                })
+                                && known.entry.kind == FsEntryKind::Directory
                             {
-                                if let Some(db) = self.db.as_ref()
-                                    && let Err(err) = db.add_directory_owner(&child.path, &node_id)
-                                {
-                                    self.record_db_error(Some(ctx), "reconcile", err);
-                                }
-                                continue;
-                            }
-                            if !conflicts.contains(&child.path) {
+                                add_owner(&mut known.directory_owners, &node_id);
+                            } else if !conflicts.contains(&child.path) {
                                 conflicts.push(child.path.clone());
                             }
                             continue;
                         }
 
-                        if observe_recovery
-                            && child.availability == Availability::Available
-                            && self.entries.iter().any(|entry| {
-                                entry.node_id == node_id
-                                    && entry.availability == Availability::Inaccessible
-                                    && (entry.guid == child.guid || entry.path == child.path)
-                            })
+                        let existing = rows.get(&child.path);
+                        let prior = if existing.is_none()
+                            && child.kind != FsEntryKind::Directory
+                            && !child.guid.is_empty()
+                        {
+                            previous
+                                .get(&child.guid)
+                                .cloned()
+                                .or_else(|| {
+                                    self.try_lookup_guid(Some(ctx), &node_id, &child.guid)
+                                        .ok()
+                                        .flatten()
+                                })
+                                .filter(|e| {
+                                    e.kind != FsEntryKind::Directory
+                                        && !reported.contains(e.path.as_str())
+                                        && !displaced.contains_key(&e.path)
+                                })
+                        } else {
+                            None
+                        };
+                        if let Some(prior) = &prior
+                            && rows.remove(&prior.path).is_none()
+                            && !initial.contains_key(&prior.path)
+                        {
+                            displaced.insert(prior.path.clone(), None);
+                        }
+                        let existing = rows.get(&child.path);
+                        if child.availability == Availability::Available
+                            && existing
+                                .map(|r| &r.entry)
+                                .or(prior.as_ref())
+                                .is_some_and(|e| e.availability == Availability::Inaccessible)
                         {
                             node_recovered += 1;
                         }
-                        claimed.push(child.path.clone());
-                        self.upsert_entry_in(ctx, child);
+                        let path = child.path.clone();
+                        let row = self.make_row(child, existing, prior.as_ref());
+                        rows.insert(path, row);
                     }
                     recovered_count += node_recovered;
                     if node_recovered > 0 {
@@ -977,6 +1121,18 @@ impl MetadataCache {
                     }
                 }
             }
+        }
+        let mut patch = displaced;
+        for path in initial.keys().filter(|path| !rows.contains_key(*path)) {
+            patch.insert(path.clone(), None);
+        }
+        for (path, row) in rows {
+            if initial.get(&path) != Some(&row) {
+                patch.insert(path, Some(row));
+            }
+        }
+        if self.admission_error().is_none() {
+            self.apply(ctx, "reconcile", patch);
         }
 
         if answered_count == 0 && self.local_node.is_none() {
@@ -1013,8 +1169,6 @@ impl MetadataCache {
                 ("conflicts", serde_json::json!(conflicts.len())),
             ],
         );
-        self.max_entries = max_entries;
-        self.evict_excess();
         conflicts
     }
 
@@ -1036,6 +1190,26 @@ impl MetadataCache {
             })
             .collect()
     }
+}
+
+fn by_identity(same_path: Option<&CatalogRow>, previous: Option<&FsEntry>) -> Option<u64> {
+    same_path
+        .map(|row| row.entry.inode)
+        .or_else(|| previous.map(|entry| entry.inode))
+}
+
+fn add_owner(owners: &mut Vec<String>, owner: &str) {
+    if !owner.is_empty() && owners.iter().all(|id| id != owner) {
+        owners.push(owner.to_owned());
+    }
+}
+
+fn remove_owner(mut row: CatalogRow, owner: &str) -> Option<CatalogRow> {
+    row.directory_owners.retain(|id| id != owner);
+    if row.entry.node_id == owner {
+        row.entry.node_id = row.directory_owners.first()?.clone();
+    }
+    Some(row)
 }
 
 #[cfg(test)]

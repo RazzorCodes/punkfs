@@ -20,7 +20,7 @@ use fuser::TimeOrNow;
 use super::error::{OpError, OpResult};
 use super::helpers;
 use crate::core::types::FsEntryKind;
-use crate::core::punkfs::Fs;
+use crate::filesystem::filesystem::Fs;
 use crate::store::{StatFs, StoreApi};
 
 /// Apply the requested attribute changes to `ino`; returns the new attrs.
@@ -130,7 +130,7 @@ pub(crate) fn rmdir_decision(store: &dyn StoreApi, parent: u64, name: &OsStr) ->
     let parent_path = helpers::path_of(store, parent)?;
     let path = helpers::child_path(&parent_path, name)?;
 
-    if store.get_inode(&path).is_some() && !store.get_children(&path).is_empty() {
+    if store.catalog_path(&path)?.is_some() && !store.list(&path)?.is_empty() {
         return Err(OpError::NotEmpty);
     }
     Ok(store.rmdir(&path)?)
@@ -167,8 +167,7 @@ pub(crate) fn rename_decision(
     // A file keeps the node that holds its bytes; moving it elsewhere would
     // mean copying, which is not a rename. Directories are exempt: their
     // handling is unchanged from before multi-node support.
-    let inode = store.get_inode(&old_path).ok_or(OpError::NotFound)?;
-    let source = store.get_entry(inode).ok_or(OpError::NotFound)?;
+    let source = store.catalog_path(&old_path)?.ok_or(OpError::NotFound)?;
 
     if source.kind != FsEntryKind::Directory || flags.contains(RenameFlags::RENAME_EXCHANGE) {
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
@@ -179,8 +178,8 @@ pub(crate) fn rename_decision(
         } else {
             let _ = store.ensure_listed(&new_parent);
         }
-        let owner = store.owner_of(&old_path).ok_or(OpError::NotFound)?;
-        match store.owner_of(&new_path) {
+        let owner = source.node_id;
+        match store.catalog_path(&new_path)?.map(|entry| entry.node_id) {
             // Renaming in place on the same node.
             Some(dest_owner) if dest_owner == owner => {}
             // The destination is new: it is created on the source's node.

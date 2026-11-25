@@ -721,6 +721,34 @@ fn blackbox_minimal_cache_allows_creating_local_file() {
 }
 
 #[test]
+fn blackbox_tiny_cache_listing_keeps_new_names_and_hides_deleted_names() {
+    if !require_fuse() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("cold"), b"cold data").unwrap();
+    std::fs::write(root.path().join("gone"), b"old data").unwrap();
+    let node = Node::start_with_cache("a", root, addresses(1)[0], &[], Some((1, 1)));
+    let gone = node.path().join("gone");
+    let new = node.path().join("new");
+    let old_inode = std::fs::metadata(&gone).unwrap().ino();
+    std::fs::remove_file(&gone).unwrap();
+    std::fs::write(&new, b"new data").unwrap();
+    let names = std::fs::read_dir(node.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["cold", "new"]);
+    assert_eq!(
+        std::fs::metadata(&gone).unwrap_err().raw_os_error(),
+        Some(libc::ENOENT)
+    );
+    std::fs::write(&gone, b"recreated").unwrap();
+    assert_ne!(std::fs::metadata(&gone).unwrap().ino(), old_inode);
+}
+
+#[test]
 fn blackbox_peer_rename_after_cache_eviction_preserves_inode_and_removes_old_name() {
     if !require_fuse() {
         return;

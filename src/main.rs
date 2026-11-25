@@ -114,11 +114,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     let node = FsNode { node_id: local };
-    let _session = if route_console {
-        PunkFs::mount_with_local_console(&nodes, &mountpoint, node)?
-    } else {
-        PunkFs::mount_with_local(&nodes, &mountpoint, node)?
-    };
+    let store = std::sync::Arc::new(punkfs::Store::new_local(&nodes, node, &mountpoint)?);
+    let _session = PunkFs::mount(
+        &mountpoint,
+        punkfs::MountOptions {
+            store,
+            route_console,
+        },
+    )?;
     println!("mounted {}", mountpoint.display());
     loop {
         std::thread::park();

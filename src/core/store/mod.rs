@@ -1,21 +1,20 @@
-//! The client-side store: the only way the filesystem layer reaches the
-//! catalog.
-//!
-//! It owns the local snapshot of the server's tree ([`MetadataCache`]), the grpc
-//! client, and the tokio runtime used to drive async calls from the
-//! synchronous FUSE callbacks.
+//! Coordinates filesystem operations: resolve catalog entries, then use the
+//! pinned local backing or the owner's gRPC client. FUSE callbacks wait for
+//! backing operations; the metadata cache queues catalog commits separately.
 //!
 //! Identity note: entries are identified by `guid` (the punkfs identity,
 //! assigned by the server) and addressed locally by `inode` (allocated
 //! here). The store is the layer that maps between the two.
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::RenameFlags;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
+use crate::core::backing::Backing;
 use crate::core::cache::metadata::{FsNode, ListingOutcome, MetadataCache};
 use crate::core::metadata::{Availability, FsEntry};
 use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
@@ -27,8 +26,11 @@ use crate::punk_fs::{
 };
 use crate::telemetry::OperationContext;
 pub(crate) mod contextual;
+mod local;
+use local::Local;
 
 #[cfg(test)]
+#[path = "../../../tests/mocks/store.rs"]
 pub(crate) mod mock;
 
 /// Everything the filesystem layer can get back from a store call.
@@ -111,6 +113,15 @@ pub struct StatFs {
     pub fragment_size: u32,
 }
 
+/// A new namespace entry on the local backing.
+#[derive(Debug)]
+pub enum CreateEntry {
+    File { mode: u32 },
+    Directory { mode: u32 },
+    Special { mode: u32, rdev: u32 },
+    Symlink { target: PathBuf },
+}
+
 /// The filesystem's only view of the catalog.
 ///
 /// The op modules (`crate::filesystem::*`) take this as a trait object so
@@ -134,6 +145,36 @@ pub trait StoreApi: Send + Sync {
     fn get_entry(&self, inode: u64) -> Option<FsEntry>;
     /// Which backing node holds `path`, if the catalog knows it.
     fn owner_of(&self, path: &str) -> Option<String>;
+
+    /// Fallible catalog reads for request handling. An unavailable on-disk
+    /// catalog is not equivalent to an unknown path or inode.
+    fn catalog_path(&self, path: &str) -> Result<Option<FsEntry>, StoreError> {
+        self.catalog_path_in(&OperationContext::new(), path)
+    }
+    fn catalog_inode(&self, inode: u64) -> Result<Option<FsEntry>, StoreError> {
+        self.catalog_inode_in(&OperationContext::new(), inode)
+    }
+    fn catalog_path_in(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+    ) -> Result<Option<FsEntry>, StoreError> {
+        Ok(self.get_inode(path).and_then(|inode| self.get_entry(inode)))
+    }
+    fn catalog_inode_in(
+        &self,
+        _ctx: &OperationContext,
+        inode: u64,
+    ) -> Result<Option<FsEntry>, StoreError> {
+        Ok(self.get_entry(inode))
+    }
+    fn list(&self, path: &str) -> Result<Vec<StoreChild>, StoreError> {
+        self.list_in(&OperationContext::new(), path)
+    }
+    fn list_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<StoreChild>, StoreError> {
+        Ok(self.get_children_in(ctx, path))
+    }
+
     /// Fetch and reconcile `dir` from the server.
     fn ensure_listed(&self, dir: &str) -> Result<(), StoreError>;
     /// Children of `path`, using whatever listing is cached.
@@ -147,8 +188,8 @@ pub trait StoreApi: Send + Sync {
         false
     }
     /// The local configuration can mount with no remote backends.
-    fn has_remote_nodes(&self) -> bool {
-        true
+    fn has_local_backing(&self) -> bool {
+        false
     }
 
     // --- content -------------------------------------------------------
@@ -219,8 +260,24 @@ pub trait StoreApi: Send + Sync {
     fn statfs(&self) -> Result<StatFs, StoreError>;
 
     // --- namespace mutation --------------------------------------------
-    // Local creation is handled by the passthrough layer; the remote API
-    // has no creation RPC.
+    /// Create on the local backing. Client-only stores have no creation RPC.
+    fn create_in(
+        &self,
+        _ctx: &OperationContext,
+        _path: &str,
+        entry: CreateEntry,
+    ) -> Result<u64, StoreError> {
+        Err(match entry {
+            CreateEntry::File { .. } | CreateEntry::Directory { .. } => {
+                StoreError::Local(libc::ENOSYS)
+            }
+            _ => StoreError::NotPermitted,
+        })
+    }
+
+    fn create_entry(&self, path: &str, entry: CreateEntry) -> Result<u64, StoreError> {
+        self.create_in(&OperationContext::new(), path, entry)
+    }
     /// Remove the file at `path`.
     fn unlink(&self, path: &str) -> Result<(), StoreError>;
     /// Remove the *empty* directory at `path`.
@@ -294,44 +351,11 @@ pub trait StoreApi: Send + Sync {
     ) -> Result<(), StoreError> {
         self.rename(old, new, flags)
     }
-
-    /// Reconcile local directory entries without contacting a server.
-    fn reconcile_local_in(
-        &self,
-        _ctx: &OperationContext,
-        _dir: &str,
-        _entries: Vec<FsEntry>,
-    ) -> Result<(), StoreError> {
-        Err(StoreError::Unsupported("local catalog unavailable".into()))
-    }
-    /// Cache one newly created or refreshed local entry, returning its inode.
-    fn upsert_local_in(&self, _ctx: &OperationContext, _entry: FsEntry) -> Result<u64, StoreError> {
-        Err(StoreError::Unsupported("local catalog unavailable".into()))
-    }
-    fn remove_local_in(&self, _ctx: &OperationContext, _path: &str) -> Result<(), StoreError> {
-        Err(StoreError::Unsupported("local catalog unavailable".into()))
-    }
-    fn exchange_local_in(
-        &self,
-        _ctx: &OperationContext,
-        _old: &str,
-        _new: &str,
-    ) -> Result<(), StoreError> {
-        Err(StoreError::Unsupported("local catalog unavailable".into()))
-    }
-    fn rename_local_in(
-        &self,
-        _ctx: &OperationContext,
-        _old: &str,
-        _new: &str,
-    ) -> Result<(), StoreError> {
-        Err(StoreError::Unsupported("local catalog unavailable".into()))
-    }
 }
 
 pub struct Store {
     metadata_cache: Mutex<MetadataCache>,
-    // Prevent an older in-flight listing from erasing a newer peer notice.
+    // Fence in-flight listings against catalog changes applied since they started.
     peer_generation: Mutex<HashMap<String, u64>>,
     listed: Mutex<HashSet<String>>, // directories already fetched from the server
     rt: Runtime,
@@ -341,6 +365,7 @@ pub struct Store {
     /// Paths contributed by more than one node in the last listing.
     conflicts: Mutex<HashSet<String>>,
     local_node_enabled: bool,
+    local: Option<Arc<Local>>,
 }
 
 /// A reachable backing node: its identity, its live connection, and when
@@ -385,7 +410,7 @@ impl Store {
         Self::new_nodes_mode(nodes, local, false)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new_with_local(
         nodes: &[(String, String)],
         local: FsNode,
@@ -393,14 +418,66 @@ impl Store {
         Self::new_nodes_mode(nodes, local, true)
     }
 
-    pub(crate) fn new_with_local_persistence(
+    /// Pin the local backing directory before it is covered by a FUSE mount.
+    pub fn new_local(
         nodes: &[(String, String)],
-        local: FsNode,
-        db_path: Option<&std::path::Path>,
+        node: FsNode,
+        backing_path: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let backing = Arc::new(Backing::open(backing_path, &node.node_id)?);
+        backing.reject_fuse_mount()?;
+        Self::new_with_backing(nodes, backing, None, None, None)
+    }
+
+    pub(crate) fn new_with_backing(
+        nodes: &[(String, String)],
+        backing: Arc<Backing>,
+        db_path: Option<&Path>,
         cache_ttl: Option<Duration>,
         cache_max_entries: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_nodes_configured(nodes, local, true, db_path, cache_ttl, cache_max_entries)
+        let node_id = backing.node_id().to_owned();
+        let mut seen = HashSet::new();
+        if node_id.is_empty()
+            || nodes.iter().any(|(id, url)| {
+                id.is_empty() || url.is_empty() || id == &node_id || !seen.insert(id)
+            })
+        {
+            return Err("peer IDs must be nonempty, unique, and different from the local ID; URLs must not be empty".into());
+        }
+        let mut store = Self::new_nodes_configured(
+            nodes,
+            FsNode { node_id },
+            true,
+            db_path,
+            cache_ttl,
+            cache_max_entries,
+        )?;
+        store.local = Some(Local::from_backing(backing));
+        Ok(store)
+    }
+
+    pub(crate) fn set_local_publisher(&self, publisher: crate::grpc::peer::Publisher) {
+        self.local
+            .as_ref()
+            .expect("local backing is configured")
+            .set_publisher(publisher);
+    }
+
+    fn check_conflict(&self, path: &str) -> Result<(), StoreError> {
+        if self.has_conflict(path) {
+            Err(StoreError::Local(libc::EIO))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn local_for(&self, ctx: &OperationContext, path: &str) -> Result<Option<&Local>, StoreError> {
+        self.check_conflict(path)?;
+        let Some(local) = self.local.as_deref() else {
+            return Ok(None);
+        };
+        Ok((self.node_of(ctx, path)? == self.node.node_id).then_some(local))
     }
 
     fn new_nodes_mode(
@@ -486,7 +563,49 @@ impl Store {
             node: local,
             conflicts: Mutex::new(HashSet::new()),
             local_node_enabled,
+            local: None,
         })
+    }
+
+    pub(crate) fn validate_owner_rename_in(
+        &self,
+        ctx: &OperationContext,
+        old: &str,
+        new: &str,
+        owner: &str,
+    ) -> Result<(), StoreError> {
+        Self::check_rename_owner(
+            &mut self.metadata_cache.lock().unwrap(),
+            ctx,
+            old,
+            new,
+            owner,
+        )
+    }
+
+    fn check_rename_owner(
+        cache: &mut MetadataCache,
+        ctx: &OperationContext,
+        old: &str,
+        new: &str,
+        owner: &str,
+    ) -> Result<(), StoreError> {
+        if cache
+            .owner_rename_allowed(ctx, old, new, owner)
+            .map_err(StoreError::Io)?
+        {
+            Ok(())
+        } else {
+            Err(StoreError::Local(libc::EXDEV))
+        }
+    }
+
+    pub(crate) fn flush_catalog(&self) -> Result<(), StoreError> {
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .flush()
+            .map_err(StoreError::Io)
     }
 
     fn check_persistence(cache: &MetadataCache) -> Result<(), StoreError> {
@@ -496,6 +615,14 @@ impl Store {
             ))),
             None => Ok(()),
         }
+    }
+
+    fn check_admission(cache: &MetadataCache) -> Result<(), StoreError> {
+        cache.admission_error().map_or(Ok(()), |error| {
+            Err(StoreError::Io(format!(
+                "persistent metadata unavailable: {error}"
+            )))
+        })
     }
 
     /// Reconcile a full owner snapshot into `redb` + memory (startup local scan
@@ -514,32 +641,15 @@ impl Store {
         *generation = generation.wrapping_add(1);
         let mut cache = self.metadata_cache.lock().unwrap();
         Self::check_persistence(&cache)?;
-        if let Some(db) = cache.db().cloned() {
-            let (stored, conflicts) =
-                db.reconcile_owner_snapshot(owner_id, &snapshot)
-                    .map_err(|e| {
-                        if let Some(logger) = crate::telemetry::global() {
-                            let mut event = crate::telemetry::Event::new(
-                                crate::telemetry::Severity::Error,
-                                "metadata_cache",
-                                "metadata snapshot transaction failed",
-                            );
-                            event.operation = Some("reconcile_snapshot".into());
-                            event
-                                .fields
-                                .insert("error".into(), serde_json::json!(e.to_string()));
-                            logger.emit_in(ctx, event);
-                        }
-                        StoreError::Io(format!("metadata snapshot transaction failed: {e}"))
-                    })?;
-            // The transaction may have removed or reassigned entries, including
-            // ones evicted from memory. Reload lazily from the committed view.
-            cache.clear_memory();
+        if cache.is_persistent() {
+            let (count, conflicts) = cache
+                .reconcile_persistent_snapshot(ctx, owner_id, snapshot)
+                .map_err(StoreError::Io)?;
             drop(cache);
             if !conflicts.is_empty() {
                 self.conflicts.lock().unwrap().extend(conflicts);
             }
-            return Ok(stored.len());
+            return Ok(count);
         }
         let mut conflicts = Vec::new();
         let mut accepted = 0usize;
@@ -611,7 +721,7 @@ impl Store {
                 continue;
             }
             cache.upsert_entry_in(ctx, entry);
-            Self::check_persistence(&cache)?;
+            Self::check_admission(&cache)?;
             accepted += 1;
         }
         if !conflicts.is_empty() {
@@ -651,12 +761,8 @@ impl Store {
     }
 
     /// Which node owns `path`.
-    fn node_of(&self, path: &str) -> Result<String, StoreError> {
-        let mut tree = self.metadata_cache.lock().unwrap();
-        Self::check_persistence(&tree)?;
-        let entry = tree.lookup_entry_by_path(path);
-        Self::check_persistence(&tree)?;
-        if let Some(entry) = entry {
+    fn node_of(&self, ctx: &OperationContext, path: &str) -> Result<String, StoreError> {
+        if let Some(entry) = self.catalog_path_in(ctx, path)? {
             return Ok(entry.node_id);
         }
         // Legacy remote-only clients historically probed their first server
@@ -671,8 +777,12 @@ impl Store {
     }
 
     /// The connection that should serve `path`.
-    fn client_for(&self, path: &str) -> Result<(String, PunkFsClient<Channel>), StoreError> {
-        let node_id = self.node_of(path)?;
+    fn client_for(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+    ) -> Result<(String, PunkFsClient<Channel>), StoreError> {
+        let node_id = self.node_of(ctx, path)?;
         let conn = self.conn_for(&node_id)?;
         Ok((node_id.clone(), conn.client.clone()))
     }
@@ -748,15 +858,21 @@ impl Store {
         if outcomes.is_empty() && self.local_node_enabled {
             return Ok(());
         }
-        let generations = self.peer_generation.lock().unwrap();
+        let mut generations = self.peer_generation.lock().unwrap();
         outcomes.retain(|(node, _)| {
             generations.get(node).copied().unwrap_or(0)
                 == observed_generations.get(node).copied().unwrap_or(0)
         });
         let mut cache = self.metadata_cache.lock().unwrap();
         Self::check_persistence(&cache)?;
+        for (node, outcome) in &outcomes {
+            if matches!(outcome, ListingOutcome::Answered(_)) {
+                let generation = generations.entry(node.clone()).or_default();
+                *generation = generation.wrapping_add(1);
+            }
+        }
         let conflicts = cache.reconcile_from_in(ctx, dir, outcomes);
-        Self::check_persistence(&cache)?;
+        Self::check_admission(&cache)?;
         drop(cache);
         drop(generations);
         if !conflicts.is_empty() {
@@ -781,8 +897,12 @@ impl Store {
     }
 
     /// Fetch one entry's attributes from the node that owns it.
-    fn getattr(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
-        let (node_id, mut client) = self.client_for(path)?;
+    fn getattr(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+    ) -> Result<(String, FileAttrData), StoreError> {
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         let resp = self
             .rt
             .block_on(client.get_attr(ctx.request(GetAttrRequest {
@@ -790,7 +910,10 @@ impl Store {
             })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
-        Ok(attr_from_proto(resp.into_inner().attr.unwrap_or_default()))
+        Ok((
+            node_id,
+            attr_from_proto(resp.into_inner().attr.unwrap_or_default()),
+        ))
     }
 
     /// Store the attributes the server just reported for `path`.
@@ -801,28 +924,45 @@ impl Store {
         &self,
         ctx: &OperationContext,
         path: &str,
+        expected: Option<&FsEntry>,
+        owner: &str,
         attr: FileAttrData,
     ) -> Result<(), StoreError> {
         let mut tree = self.metadata_cache.lock().unwrap();
-        let existing = tree.lookup_entry_by_path(path);
-        Self::check_persistence(&tree)?;
-        let inode = existing.as_ref().map(|e| e.inode).unwrap_or(0);
-        let node_id = existing
-            .map(|e| e.node_id)
-            .unwrap_or_else(|| self.node.node_id.clone());
+        let existing = tree
+            .try_lookup_by_path(Some(ctx), path)
+            .map_err(StoreError::Io)?;
+        // A refresh is not an upsert of a new name. If deletion, rename or
+        // replacement won the race with this RPC, do not publish stale metadata.
+        let Some(existing) = existing.filter(|entry| {
+            entry.node_id == owner
+                && expected.is_some_and(|old| {
+                    old.inode == entry.inode && old.guid == entry.guid && old.node_id == owner
+                })
+        }) else {
+            return Ok(());
+        };
         tree.upsert_entry_in(
             ctx,
             FsEntry {
-                inode,
+                inode: existing.inode,
                 path: path.to_owned(),
                 guid: attr.guid.clone(),
                 kind: attr.kind,
-                node_id,
+                node_id: existing.node_id,
                 availability: Availability::Available,
                 attr,
             },
         );
-        Self::check_persistence(&tree)
+        Self::check_admission(&tree)
+    }
+}
+
+fn store_child(entry: FsEntry) -> StoreChild {
+    StoreChild {
+        inode: entry.inode,
+        name: entry.path.rsplit('/').next().unwrap_or("").to_owned(),
+        kind: entry.kind,
     }
 }
 
@@ -917,13 +1057,27 @@ pub(crate) fn entry_from_attr(
     }
 }
 
-impl StoreApi for Store {
-    fn reconcile_local_in(
+impl Store {
+    fn local_generation(&self) -> u64 {
+        self.peer_generation
+            .lock()
+            .unwrap()
+            .get(&self.node.node_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn reconcile_local_listing(
         &self,
         ctx: &OperationContext,
         dir: &str,
         entries: Vec<FsEntry>,
+        observed_generation: u64,
     ) -> Result<(), StoreError> {
+        let generations = self.peer_generation.lock().unwrap();
+        if generations.get(&self.node.node_id).copied().unwrap_or(0) != observed_generation {
+            return Ok(());
+        }
         let mut cache = self.metadata_cache.lock().unwrap();
         Self::check_persistence(&cache)?;
         let conflicts = cache.reconcile_from_in(
@@ -931,7 +1085,7 @@ impl StoreApi for Store {
             dir,
             vec![(self.node.node_id.clone(), ListingOutcome::Answered(entries))],
         );
-        Self::check_persistence(&cache)?;
+        Self::check_admission(&cache)?;
         drop(cache);
         if !conflicts.is_empty() {
             self.conflicts.lock().unwrap().extend(conflicts);
@@ -945,60 +1099,46 @@ impl StoreApi for Store {
         let mut cache = self.metadata_cache.lock().unwrap();
         Self::check_persistence(&cache)?;
         let path = entry.path.clone();
-        let existing = cache.lookup_entry_by_path(&path);
-        Self::check_persistence(&cache)?;
+        let existing = cache
+            .try_lookup_by_path(Some(ctx), &path)
+            .map_err(StoreError::Io)?;
         if existing.is_some_and(|existing| existing.node_id != self.node.node_id) {
             return Err(StoreError::Local(libc::EEXIST));
         }
         cache.upsert_entry_in(ctx, entry);
-        Self::check_persistence(&cache)?;
-        cache.lookup_inode(&path).ok_or(StoreError::NotFound)
+        Self::check_admission(&cache)?;
+        cache
+            .try_lookup_by_path(Some(ctx), &path)
+            .map_err(StoreError::Io)?
+            .map(|entry| entry.inode)
+            .ok_or(StoreError::NotFound)
     }
-    fn remove_local_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
-        let mut cache = self.metadata_cache.lock().unwrap();
-        Self::check_persistence(&cache)?;
-        cache.remove_owner_entry_in(ctx, path, &self.node.node_id);
-        Self::check_persistence(&cache)?;
-        drop(cache);
-        self.invalidate(&parent_of(path));
-        Ok(())
-    }
-    fn exchange_local_in(
+
+    pub(crate) fn remove_local_in(
         &self,
-        _ctx: &OperationContext,
-        old: &str,
-        new: &str,
+        ctx: &OperationContext,
+        path: &str,
     ) -> Result<(), StoreError> {
-        let mut cache = self.metadata_cache.lock().unwrap();
-        Self::check_persistence(&cache)?;
-        cache.exchange_entries(old, new);
-        Self::check_persistence(&cache)?;
-        drop(cache);
-        self.invalidate(&parent_of(old));
-        self.invalidate(&parent_of(new));
-        Ok(())
+        self.after_mutation(ctx, path, &self.node.node_id)
     }
-    fn rename_local_in(
+
+    pub(crate) fn update_local_rename_in(
         &self,
         ctx: &OperationContext,
         old: &str,
         new: &str,
+        flags: RenameFlags,
     ) -> Result<(), StoreError> {
-        let mut cache = self.metadata_cache.lock().unwrap();
-        Self::check_persistence(&cache)?;
-        // rename_subtree replaces the destination atomically in redb.
-        cache.rename_entry_in(ctx, old, new);
-        Self::check_persistence(&cache)?;
-        drop(cache);
-        self.invalidate(&parent_of(old));
-        self.invalidate(&parent_of(new));
-        Ok(())
+        self.after_rename(ctx, old, new, &self.node.node_id, flags)
     }
+}
+
+impl StoreApi for Store {
     fn has_conflict(&self, path: &str) -> bool {
         self.conflicts.lock().unwrap().contains(path)
     }
-    fn has_remote_nodes(&self) -> bool {
-        !self.nodes.is_empty()
+    fn has_local_backing(&self) -> bool {
+        self.local.is_some()
     }
     fn node_id(&self) -> &str {
         &self.node.node_id
@@ -1028,6 +1168,47 @@ impl StoreApi for Store {
             .filter(|id| !id.is_empty())
     }
 
+    fn catalog_path_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+    ) -> Result<Option<FsEntry>, StoreError> {
+        let mut cache = self.metadata_cache.lock().unwrap();
+        let entry = cache
+            .try_lookup_by_path(Some(ctx), path)
+            .map_err(StoreError::Io)?;
+        if entry.is_none() {
+            Self::check_persistence(&cache)?;
+        }
+        Ok(entry)
+    }
+
+    fn catalog_inode_in(
+        &self,
+        ctx: &OperationContext,
+        inode: u64,
+    ) -> Result<Option<FsEntry>, StoreError> {
+        let mut cache = self.metadata_cache.lock().unwrap();
+        let entry = cache
+            .try_lookup_by_inode(Some(ctx), inode)
+            .map_err(StoreError::Io)?;
+        if entry.is_none() {
+            Self::check_persistence(&cache)?;
+        }
+        Ok(entry)
+    }
+
+    fn list_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<StoreChild>, StoreError> {
+        // A backing may be offline; its last known namespace is still visible.
+        let _ = self.ensure_listed_in(ctx, path);
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .try_lookup_children(Some(ctx), path)
+            .map(|entries| entries.into_iter().map(store_child).collect())
+            .map_err(StoreError::Io)
+    }
+
     /// Fetch and reconcile `dir`.
     ///
     /// Always refetches rather than trusting a "we have listed this once"
@@ -1040,7 +1221,16 @@ impl StoreApi for Store {
     }
 
     fn ensure_listed_in(&self, ctx: &OperationContext, dir: &str) -> Result<(), StoreError> {
-        self.fetch_listing(ctx, dir, true)
+        let Some(local) = self.local.as_deref() else {
+            return self.fetch_listing(ctx, dir, true);
+        };
+        if !self.nodes.is_empty() {
+            let result = self.fetch_listing(ctx, dir, true);
+            if result.is_err() {
+                local.log(ctx, "remote_listing", &result);
+            }
+        }
+        local.list_into(self, ctx, dir)
     }
 
     /// Children as (inode, name, kind). A server error is reported to the
@@ -1050,8 +1240,7 @@ impl StoreApi for Store {
     }
 
     fn get_children_in(&self, ctx: &OperationContext, path: &str) -> Vec<StoreChild> {
-        let _ = self.fetch_listing(ctx, path, true);
-        self.cached_children(path)
+        self.list_in(ctx, path).unwrap_or_default()
     }
 
     fn cached_children(&self, path: &str) -> Vec<StoreChild> {
@@ -1060,12 +1249,33 @@ impl StoreApi for Store {
             .unwrap()
             .lookup_children_of(path)
             .into_iter()
-            .map(|e| StoreChild {
-                inode: e.inode,
-                name: e.path.rsplit('/').next().unwrap_or("").to_owned(),
-                kind: e.kind,
-            })
+            .map(store_child)
             .collect()
+    }
+
+    fn create_in(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        entry: CreateEntry,
+    ) -> Result<u64, StoreError> {
+        let Some(local) = self.local.as_deref() else {
+            return Err(match entry {
+                CreateEntry::File { .. } | CreateEntry::Directory { .. } => {
+                    StoreError::Local(libc::ENOSYS)
+                }
+                _ => StoreError::NotPermitted,
+            });
+        };
+        self.ensure_listed_in(ctx, &parent_of(path))?;
+        match entry {
+            CreateEntry::File { mode } => local.create(self, ctx, path, mode, false),
+            CreateEntry::Directory { mode } => local.create(self, ctx, path, mode, true),
+            CreateEntry::Special { mode, rdev } => {
+                local.create_special(self, ctx, path, mode, rdev)
+            }
+            CreateEntry::Symlink { target } => local.create_symlink(self, ctx, path, &target),
+        }
     }
 
     fn readlink(&self, path: &str) -> Result<Vec<u8>, StoreError> {
@@ -1073,8 +1283,11 @@ impl StoreApi for Store {
     }
 
     fn readlink_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.readlink(path, ctx);
+        }
         self.require_reachable(ctx, path)?;
-        let (node_id, mut client) = self.client_for(path)?;
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         let response = self
             .rt
             .block_on(client.read_link(ctx.request(ReadLinkRequest {
@@ -1104,8 +1317,11 @@ impl StoreApi for Store {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.read(ctx, path, offset, size);
+        }
         self.require_reachable(ctx, path)?;
-        let (node_id, mut client) = self.client_for(path)?;
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         let resp = self
             .rt
             .block_on(client.read_file(ctx.request(ReadFileRequest {
@@ -1129,8 +1345,11 @@ impl StoreApi for Store {
         offset: u64,
         data: &[u8],
     ) -> Result<u32, StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.write(ctx, path, offset, data);
+        }
         self.require_reachable(ctx, path)?;
-        let (node_id, mut client) = self.client_for(path)?;
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         let resp = self
             .rt
             .block_on(client.write_file(ctx.request(WriteFileRequest {
@@ -1153,8 +1372,11 @@ impl StoreApi for Store {
         path: &str,
         datasync: bool,
     ) -> Result<(), StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.fsync(ctx, path, datasync);
+        }
         self.require_reachable(ctx, path)?;
-        let (node_id, mut client) = self.client_for(path)?;
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         self.rt
             .block_on(client.fsync_file(ctx.request(FsyncFileRequest {
                 path: path.to_owned(),
@@ -1189,8 +1411,11 @@ impl StoreApi for Store {
         path: &str,
         name: &[u8],
     ) -> Result<Vec<u8>, StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.get_xattr(ctx, path, name);
+        }
         self.require_reachable(ctx, path)?;
-        let (node, mut client) = self.client_for(path)?;
+        let (node, mut client) = self.client_for(ctx, path)?;
         let request = punk_fs::XattrRequest {
             path: path.into(),
             name: name.into(),
@@ -1205,8 +1430,11 @@ impl StoreApi for Store {
         Ok(response.into_inner().value)
     }
     fn list_xattr_in(&self, ctx: &OperationContext, path: &str) -> Result<Vec<u8>, StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.list_xattr(ctx, path);
+        }
         self.require_reachable(ctx, path)?;
-        let (node, mut client) = self.client_for(path)?;
+        let (node, mut client) = self.client_for(ctx, path)?;
         let request = punk_fs::XattrRequest {
             path: path.into(),
             name: vec![],
@@ -1228,8 +1456,11 @@ impl StoreApi for Store {
         value: &[u8],
         flags: i32,
     ) -> Result<(), StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.set_xattr(ctx, path, name, value, flags);
+        }
         self.require_reachable(ctx, path)?;
-        let (node, mut client) = self.client_for(path)?;
+        let (node, mut client) = self.client_for(ctx, path)?;
         let request = punk_fs::XattrRequest {
             path: path.into(),
             name: name.into(),
@@ -1248,8 +1479,11 @@ impl StoreApi for Store {
         path: &str,
         name: &[u8],
     ) -> Result<(), StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.remove_xattr(ctx, path, name);
+        }
         self.require_reachable(ctx, path)?;
-        let (node, mut client) = self.client_for(path)?;
+        let (node, mut client) = self.client_for(ctx, path)?;
         let request = punk_fs::XattrRequest {
             path: path.into(),
             name: name.into(),
@@ -1273,8 +1507,12 @@ impl StoreApi for Store {
         path: &str,
         changes: SetattrChanges,
     ) -> Result<FileAttrData, StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.setattr(self, ctx, path, changes);
+        }
         self.require_reachable(ctx, path)?;
-        let (node_id, mut client) = self.client_for(path)?;
+        let expected = self.catalog_path_in(ctx, path)?;
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         let resp = self
             .rt
             .block_on(client.set_attr(ctx.request(SetAttrRequest {
@@ -1292,7 +1530,7 @@ impl StoreApi for Store {
         self.conn_for(&node_id)?.touch();
 
         let attr = attr_from_proto(resp.into_inner().attr.unwrap_or_default());
-        self.store_attr(ctx, path, attr.clone())?;
+        self.store_attr(ctx, path, expected.as_ref(), &node_id, attr.clone())?;
         Ok(attr)
     }
 
@@ -1301,8 +1539,12 @@ impl StoreApi for Store {
     }
 
     fn refresh_in(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
-        let attr = self.getattr(ctx, path)?;
-        self.store_attr(ctx, path, attr.clone())?;
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.refresh(self, ctx, path);
+        }
+        let expected = self.catalog_path_in(ctx, path)?;
+        let (node, attr) = self.getattr(ctx, path)?;
+        self.store_attr(ctx, path, expected.as_ref(), &node, attr.clone())?;
         Ok(attr)
     }
 
@@ -1311,6 +1553,9 @@ impl StoreApi for Store {
     }
 
     fn statfs_in(&self, ctx: &OperationContext) -> Result<StatFs, StoreError> {
+        if let Some(local) = self.local.as_deref() {
+            return local.statfs(ctx);
+        }
         // Capacity is reported by the first reachable node: an aggregate
         // would claim space no single node can actually serve.
         let mut resp = None;
@@ -1343,8 +1588,22 @@ impl StoreApi for Store {
     }
 
     fn unlink_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.unlink(self, ctx, path);
+        }
+        // Combined mounts do not support remote regular-file replacement yet.
+        if let Some(local) = &self.local
+            && !self
+                .get_inode(path)
+                .and_then(|ino| self.get_entry(ino))
+                .is_some_and(|entry| entry.kind == FsEntryKind::Link)
+        {
+            let error = Err(StoreError::NotPermitted);
+            local.log(ctx, "unlink", &error);
+            return error;
+        }
         self.require_reachable(ctx, path)?;
-        let (node_id, mut client) = self.client_for(path)?;
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         self.rt
             .block_on(client.remove_file(ctx.request(punk_fs::RemoveFileRequest {
                 path: path.to_owned(),
@@ -1360,8 +1619,11 @@ impl StoreApi for Store {
     }
 
     fn rmdir_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
+        if let Some(local) = self.local_for(ctx, path)? {
+            return local.rmdir(self, ctx, path);
+        }
         self.require_reachable(ctx, path)?;
-        let (node_id, mut client) = self.client_for(path)?;
+        let (node_id, mut client) = self.client_for(ctx, path)?;
         self.rt
             .block_on(client.remove_dir(ctx.request(punk_fs::RemoveDirRequest {
                 path: path.to_owned(),
@@ -1383,6 +1645,12 @@ impl StoreApi for Store {
         new: &str,
         flags: RenameFlags,
     ) -> Result<(), StoreError> {
+        self.check_conflict(new)?;
+        let local_source = self.local_for(ctx, old)?;
+        if let Some(local) = local_source {
+            self.validate_owner_rename_in(ctx, old, new, &self.node.node_id)?;
+            return local.rename(self, ctx, old, new, flags);
+        }
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
             let mut cache = self.metadata_cache.lock().unwrap();
             let source = cache
@@ -1400,7 +1668,8 @@ impl StoreApi for Store {
             }
         }
         self.require_reachable(ctx, old)?;
-        let (node_id, mut client) = self.client_for(old)?;
+        let (node_id, mut client) = self.client_for(ctx, old)?;
+        self.validate_owner_rename_in(ctx, old, new, &node_id)?;
         self.rt
             .block_on(client.rename(ctx.request(punk_fs::RenameRequest {
                 old_path: old.to_owned(),
@@ -1410,27 +1679,39 @@ impl StoreApi for Store {
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
 
-        // Rename within one node: the entry keeps its guid and its inode,
-        // so move it locally instead of dropping and re-adding it. A
-        // cross-node move is refused by the op layer, never reaching here.
-        {
-            let mut cache = self.metadata_cache.lock().unwrap();
-            Self::check_persistence(&cache)?;
-            if flags.contains(RenameFlags::RENAME_EXCHANGE) {
-                cache.exchange_entries(old, new);
-            } else {
-                cache.rename_entry_in(ctx, old, new);
-            }
-            Self::check_persistence(&cache)?;
-        }
-        self.invalidate(&parent_of(new));
-        let parent = parent_of(old);
-        self.invalidate(&parent);
-        Ok(())
+        self.after_rename(ctx, old, new, &node_id, flags)
     }
 }
 
 impl Store {
+    fn after_rename(
+        &self,
+        ctx: &OperationContext,
+        old: &str,
+        new: &str,
+        owner: &str,
+        flags: RenameFlags,
+    ) -> Result<(), StoreError> {
+        // Fence stale listings of either the local backing or a peer. A
+        // concurrent publication must not move another owner's entries.
+        {
+            let mut generations = self.peer_generation.lock().unwrap();
+            let generation = generations.entry(owner.to_owned()).or_default();
+            *generation = generation.wrapping_add(1);
+            let mut cache = self.metadata_cache.lock().unwrap();
+            Self::check_persistence(&cache)?;
+            Self::check_rename_owner(&mut cache, ctx, old, new, owner)?;
+            if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+                cache.exchange_entries_in(ctx, old, new);
+            } else {
+                cache.rename_entry_in(ctx, old, new);
+            }
+            Self::check_admission(&cache)?;
+        }
+        self.invalidate(&parent_of(old));
+        self.invalidate(&parent_of(new));
+        Ok(())
+    }
     /// Refuse an operation that needs bytes from a node we cannot reach.
     ///
     /// This is what makes "node down" cheap instead of pathological: we
@@ -1438,7 +1719,7 @@ impl Store {
     /// every `cat`. Browsing (`ls`, `stat`) deliberately does not call this
     /// — the namespace stays visible while the content is not.
     fn require_reachable(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
-        let node_id = self.node_of(path)?;
+        let node_id = self.node_of(ctx, path)?;
         let conn = self.conn_for(&node_id)?;
         if conn.reachable(Self::reachability_window()) {
             return Ok(());
@@ -1472,9 +1753,12 @@ impl Store {
     ) -> Result<(), StoreError> {
         let parent = parent_of(path);
         self.invalidate(&parent);
+        let mut generations = self.peer_generation.lock().unwrap();
+        let generation = generations.entry(owner.to_owned()).or_default();
+        *generation = generation.wrapping_add(1);
         let mut cache = self.metadata_cache.lock().unwrap();
         Self::check_persistence(&cache)?;
         cache.remove_owner_entry_in(ctx, path, owner);
-        Self::check_persistence(&cache)
+        Self::check_admission(&cache)
     }
 }

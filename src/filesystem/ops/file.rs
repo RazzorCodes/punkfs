@@ -25,7 +25,7 @@ use fuser::WriteFlags;
 
 use super::error::{OpError, OpResult};
 use super::helpers;
-use crate::core::punkfs::Fs;
+use crate::filesystem::filesystem::Fs;
 use crate::store::StoreApi;
 
 /// Open file `ino`; returns the handle later ops must present.
@@ -231,9 +231,6 @@ mod tests {
         let store = seeded();
         flush_decision(&store, 2).unwrap();
         release_decision(&store, 2).unwrap();
-        assert_eq!(
-            flush_decision(&store, 99).unwrap_err(),
-            OpError::NotFound
-        );
+        assert_eq!(flush_decision(&store, 99).unwrap_err(), OpError::NotFound);
     }
 }

@@ -1,7 +1,7 @@
 //! Obtain local metadata with the same GUID rules as the backing server.
 use super::Local;
-use crate::store::StoreError;
 use crate::core::metadata::{Availability, FsEntry};
+use crate::store::StoreError;
 
 pub(super) fn entry(local: &Local, path: &str) -> Result<FsEntry, StoreError> {
     let attr = local
@@ -13,7 +13,7 @@ pub(super) fn entry(local: &Local, path: &str) -> Result<FsEntry, StoreError> {
         path: path.into(),
         guid: attr.guid.clone(),
         kind: attr.kind,
-        node_id: local.node.clone(),
+        node_id: local.backing.node_id().to_owned(),
         availability: Availability::Available,
         attr,
     })

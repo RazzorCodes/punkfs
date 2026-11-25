@@ -20,6 +20,8 @@ use tonic::{Request, Response, Status};
 use crate::core::backing::{Backing, SafePath};
 #[cfg(test)]
 use crate::core::backing::{derived_guid, read_guid_xattr, write_guid_xattr};
+use crate::core::types::misc::xattr;
+use crate::core::types::{FileAttrData, FsEntryKind};
 use crate::punk_fs::punk_fs_server::PunkFs;
 use crate::punk_fs::{
     Access as PbAccess, DirEntry, FileAttr, FileKind, FileTimes as PbFileTimes, FsyncFileRequest,
@@ -29,9 +31,7 @@ use crate::punk_fs::{
     RenameResponse, SetAttrRequest, SetAttrResponse, Stat as PbStat, StatFsRequest, StatFsResponse,
     StatFsResponse as PbStatFs, WriteFileRequest, WriteFileResponse,
 };
-use crate::core::types::{FileAttrData, FsEntryKind};
-use crate::core::types::misc::xattr;
-use crate::store::{Store, StoreApi};
+use crate::store::Store;
 
 /// Upper bound on a single `ReadFile` answer. The FUSE layer asks for
 /// whatever the kernel wants (commonly 128 KiB); this keeps one malicious
@@ -470,8 +470,7 @@ impl PunkFs for PunkFsService {
             .entry_path(&req.path)
             .map_err(io_status)
             .and_then(|path| {
-                xattr::set(&path, &req.name, &req.value, req.flags)
-                    .map_err(xattr_status)
+                xattr::set(&path, &req.name, &req.value, req.flags).map_err(xattr_status)
             });
         self.log_io(&ctx, "setxattr", &result);
         result?;
@@ -567,6 +566,23 @@ impl PunkFs for PunkFsService {
         let context = crate::telemetry::OperationContext::from_request(&request)?;
         let req = request.into_inner();
         let result = (|| {
+            if let Some(store) = &self.catalog {
+                store
+                    .validate_owner_rename_in(
+                        &context,
+                        &req.old_path,
+                        &req.new_path,
+                        self.backing.node_id(),
+                    )
+                    .map_err(|error| match error {
+                        crate::StoreError::Local(errno) => {
+                            io_status(io::Error::from_raw_os_error(errno))
+                        }
+                        other => {
+                            Status::internal(format!("catalog rename validation failed: {other:?}"))
+                        }
+                    })?;
+            }
             let from = self.backing.entry_path(&req.old_path).map_err(io_status)?;
             let to = self.backing.entry_path(&req.new_path).map_err(io_status)?;
             let from = std::ffi::CString::new(from.as_os_str().as_encoded_bytes())
@@ -586,14 +602,16 @@ impl PunkFs for PunkFsService {
                 return Err(io_status(io::Error::last_os_error()));
             }
             if let Some(store) = &self.catalog {
-                let update = if req.flags & libc::RENAME_EXCHANGE != 0 {
-                    store.exchange_local_in(&context, &req.old_path, &req.new_path)
-                } else {
-                    store.rename_local_in(&context, &req.old_path, &req.new_path)
-                };
-                update.map_err(|e| {
-                    Status::internal(format!("catalog update after rename failed: {e:?}"))
-                })?;
+                store
+                    .update_local_rename_in(
+                        &context,
+                        &req.old_path,
+                        &req.new_path,
+                        fuser::RenameFlags::from_bits_retain(req.flags),
+                    )
+                    .map_err(|e| {
+                        Status::internal(format!("catalog update after rename failed: {e:?}"))
+                    })?;
             }
             Ok::<_, Status>(RenameResponse {})
         })();

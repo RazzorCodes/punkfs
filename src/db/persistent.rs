@@ -6,15 +6,15 @@
 //! - `inode_to_path`: constant local `u64` FUSE inode -> normalized path
 //! - `meta`: `"next_inode"` -> monotonic `u64` counter (never reused after unlink)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use crate::core::metadata::{Availability, FsEntry};
+use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 
 const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
 const PATH_TO_INODE_TABLE: TableDefinition<&str, u64> = TableDefinition::new("path_to_inode");
@@ -221,6 +221,42 @@ impl PersistedEntry {
     }
 }
 
+/// One logical catalog record. A directory may represent several backings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogRow {
+    pub entry: FsEntry,
+    pub directory_owners: Vec<String>,
+}
+
+impl From<PersistedEntry> for CatalogRow {
+    fn from(record: PersistedEntry) -> Self {
+        let mut directory_owners = record.dir_owners.clone();
+        if record.kind == PersistedKind::Directory
+            && !record.node_id.is_empty()
+            && !directory_owners.contains(&record.node_id)
+        {
+            directory_owners.push(record.node_id.clone());
+        }
+        Self {
+            entry: record.into_entry(),
+            directory_owners,
+        }
+    }
+}
+
+/// Changes to the path and inode indexes committed as a single transaction.
+/// A `None` row is a deletion; new rows already have cache-assigned inodes.
+pub(crate) type CatalogPatch = BTreeMap<String, Option<CatalogRow>>;
+
+fn decode_row(bytes: &[u8]) -> Result<CatalogRow, redb::Error> {
+    let record: PersistedEntry = serde_json::from_slice(bytes).map_err(storage_error)?;
+    Ok(record.into())
+}
+
+fn storage_error(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> redb::StorageError {
+    redb::StorageError::Io(std::io::Error::other(error))
+}
+
 pub struct PersistentDb {
     db: Database,
 }
@@ -246,6 +282,82 @@ impl PersistentDb {
         }
         write_txn.commit()?;
         Ok(Self { db })
+    }
+
+    pub(crate) fn get_row(&self, path: &str) -> Result<Option<CatalogRow>, redb::Error> {
+        let rel = normalize_rel_path(path);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(ENTRIES_TABLE)?;
+        table
+            .get(rel.as_str())?
+            .map(|g| decode_row(g.value()))
+            .transpose()
+    }
+
+    pub(crate) fn rows_under(
+        &self,
+        path: &str,
+        children_only: bool,
+    ) -> Result<Vec<CatalogRow>, redb::Error> {
+        let rel = normalize_rel_path(path);
+        let prefix = if rel.is_empty() {
+            String::new()
+        } else {
+            format!("{rel}/")
+        };
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(ENTRIES_TABLE)?;
+        let mut rows = Vec::new();
+        if !children_only && let Some(row) = table.get(rel.as_str())? {
+            rows.push(decode_row(row.value())?);
+        }
+        for item in table.range(prefix.as_str()..)? {
+            let (key, value) = item?;
+            let Some(suffix) = key.value().strip_prefix(&prefix) else {
+                break;
+            };
+            if !suffix.is_empty() && (!children_only || !suffix.contains('/')) {
+                rows.push(decode_row(value.value())?);
+            }
+        }
+        Ok(rows)
+    }
+
+    pub(crate) fn apply_patch(&self, patch: &CatalogPatch) -> Result<(), redb::Error> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut entries = txn.open_table(ENTRIES_TABLE)?;
+            let mut p2i = txn.open_table(PATH_TO_INODE_TABLE)?;
+            let mut i2p = txn.open_table(INODE_TO_PATH_TABLE)?;
+            let mut meta = txn.open_table(META_TABLE)?;
+            let mut next = meta.get(NEXT_INODE_KEY)?.map_or(2, |value| value.value());
+            // Retire all previous bindings before inserting any new ones;
+            // rename/exchange can move an existing inode to another patch key.
+            for path in patch.keys() {
+                let rel = normalize_rel_path(path);
+                if let Some(inode) = p2i.remove(rel.as_str())? {
+                    i2p.remove(inode.value())?;
+                }
+                entries.remove(rel.as_str())?;
+            }
+            for (path, row) in patch {
+                let Some(row) = row else { continue };
+                let rel = normalize_rel_path(path);
+                let inode = row.entry.inode;
+                if inode == 0 || i2p.get(inode)?.is_some() {
+                    return Err(storage_error("duplicate or invalid inode in catalog patch").into());
+                }
+                let record = PersistedEntry::from_entry(&row.entry, row.directory_owners.clone());
+                let bytes = serde_json::to_vec(&record).map_err(storage_error)?;
+                entries.insert(rel.as_str(), bytes.as_slice())?;
+                p2i.insert(rel.as_str(), inode)?;
+                i2p.insert(inode, rel.as_str())?;
+                next = next.max(inode + 1);
+            }
+            meta.insert(NEXT_INODE_KEY, next)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     pub fn next_inode(&self) -> Result<u64, redb::Error> {
@@ -833,5 +945,122 @@ impl PersistentDb {
         }
         write_txn.commit()?;
         Ok((stored_entries, conflicts))
+    }
+}
+
+#[cfg(test)]
+mod queued_catalog_tests {
+    // The redb write transaction is private. Holding it open is how this
+    // test proves that foreground operations finish before a commit, without
+    // exposing a production pause hook or relying on scheduling and sleeps.
+    use super::*;
+    use crate::core::cache::metadata::MetadataCache;
+
+    fn file(path: &str, guid: &str, size: u64) -> FsEntry {
+        FsEntry {
+            inode: 0,
+            path: path.into(),
+            guid: guid.into(),
+            kind: FsEntryKind::File,
+            node_id: "owner".into(),
+            availability: Availability::Available,
+            attr: FileAttrData {
+                guid: guid.into(),
+                kind: FsEntryKind::File,
+                stat: Stat {
+                    size,
+                    ..Stat::default()
+                },
+                ..FileAttrData::default()
+            },
+        }
+    }
+
+    #[test]
+    fn corrupt_catalog_row_is_not_a_cache_miss() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(PersistentDb::open(&dir.path().join("catalog.redb")).unwrap());
+        let mut cache = MetadataCache::new();
+        cache.attach_db(db.clone(), None, Some(1)).unwrap();
+        let txn = db.db.begin_write().unwrap();
+        txn.open_table(ENTRIES_TABLE)
+            .unwrap()
+            .insert("broken", b"bad row".as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(cache.try_lookup_by_path(None, "/absent").unwrap(), None);
+        assert!(cache.try_lookup_by_path(None, "/broken").is_err());
+        assert!(cache.try_lookup_children(None, "/").is_err());
+    }
+
+    #[test]
+    fn pending_changes_override_redb_until_ordered_commit() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.redb");
+        let db = Arc::new(PersistentDb::open(&path).unwrap());
+        let removed = db.upsert_entry(&file("/removed", "old-guid", 1)).unwrap();
+        let updated = db
+            .upsert_entry(&file("/updated", "update-guid", 1))
+            .unwrap();
+        db.upsert_entry(&file("/cold", "cold-guid", 1)).unwrap();
+        let mut cache = MetadataCache::new();
+        cache
+            .attach_db(db.clone(), Some(Duration::ZERO), Some(1))
+            .unwrap();
+        let hold = db.db.begin_write().unwrap();
+        cache.insert_root("/", "/", FsEntryKind::Directory);
+        cache.upsert_entry(file("/updated", "update-guid", 12));
+        cache.upsert_entry(file("/pending", "new-guid", 6));
+        cache.remove_entry("/removed");
+        assert_eq!(
+            db.get_by_path("/updated").unwrap().unwrap().attr.stat.size,
+            1
+        );
+        assert!(db.get_by_path("/pending").unwrap().is_none());
+        assert!(db.get_by_path("/removed").unwrap().is_some());
+        assert_eq!(cache.lookup_inode("/removed"), None);
+        assert_eq!(cache.lookup_path(removed.inode), None);
+        assert!(cache.lookup_entry_by_guid("owner", "old-guid").is_none());
+        assert!(cache.entries.len() <= 1);
+        assert_eq!(
+            cache
+                .lookup_children_of("/")
+                .into_iter()
+                .map(|e| (e.path, e.attr.stat.size))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/cold".into(), 1),
+                ("/pending".into(), 6),
+                ("/updated".into(), 12)
+            ]
+        );
+
+        cache.upsert_entry(file("/removed", "old-guid", 4));
+        let recreated = cache.lookup_inode("/removed").unwrap();
+        assert_ne!(recreated, removed.inode);
+        assert!(cache.rename_entry("/pending", "/renamed"));
+        let renamed = cache.lookup_inode("/renamed").unwrap();
+        assert_eq!(cache.lookup_inode("/pending"), None);
+        assert_eq!(cache.lookup_path(renamed).as_deref(), Some("/renamed"));
+        drop(hold);
+        drop(cache); // clean shutdown drains the ordered queue
+        drop(db);
+
+        let db = PersistentDb::open(&path).unwrap();
+        assert_eq!(db.get_inode("/removed").unwrap(), Some(recreated));
+        assert_eq!(db.get_path(removed.inode).unwrap(), None);
+        assert_eq!(db.get_inode("/renamed").unwrap(), Some(renamed));
+        assert_eq!(db.get_inode("/pending").unwrap(), None);
+        assert_eq!(
+            db.get_by_inode(updated.inode)
+                .unwrap()
+                .unwrap()
+                .attr
+                .stat
+                .size,
+            12
+        );
     }
 }

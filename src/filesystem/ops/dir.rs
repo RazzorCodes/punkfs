@@ -16,7 +16,7 @@ use fuser::Request;
 
 use super::error::OpResult;
 use super::helpers;
-use crate::core::punkfs::Fs;
+use crate::filesystem::filesystem::Fs;
 use crate::store::StoreApi;
 
 /// One row of a directory listing, in the shape `reply.add` wants.
@@ -60,16 +60,11 @@ pub(crate) fn readdir_decision(
             name: "..".into(),
         },
     ];
-    entries.extend(
-        store
-            .get_children(&dir_path)
-            .into_iter()
-            .map(|child| DirItem {
-                inode: child.inode,
-                kind: helpers::file_type(child.kind),
-                name: OsString::from(child.name),
-            }),
-    );
+    entries.extend(store.list(&dir_path)?.into_iter().map(|child| DirItem {
+        inode: child.inode,
+        kind: helpers::file_type(child.kind),
+        name: OsString::from(child.name),
+    }));
 
     Ok(entries.into_iter().skip(offset as usize).collect())
 }
@@ -148,10 +143,7 @@ mod tests {
         let store = seeded();
         let items = readdir_decision(&store, 2, 0).unwrap();
         let mut names = names(&items);
-        assert_eq!(
-            names.drain(..2).collect::<Vec<_>>(),
-            vec![".", ".."]
-        );
+        assert_eq!(names.drain(..2).collect::<Vec<_>>(), vec![".", ".."]);
         names.sort();
         assert_eq!(names, vec!["a.txt", "link", "sub"]);
 
