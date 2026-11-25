@@ -13,10 +13,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use punkfs::store::db::attributes::{FileAttrData, FsEntryKind};
-pub use punkfs::store::db::metadata_cache::{
-    Availability, FsEntry, ListingOutcome, MetadataCache,
-};
+pub use punkfs::core::cache::metadata::{ListingOutcome, MetadataCache};
+pub use punkfs::core::metadata::{Availability, FsEntry};
+use punkfs::core::types::{FileAttrData, FsEntryKind};
 
 /// Build a catalog entry owned by `node`.
 fn entry(node: &str, path: &str, guid: &str, kind: FsEntryKind) -> FsEntry {
@@ -163,7 +162,11 @@ fn functional_two_files_with_one_name_are_a_conflict_not_a_merge() {
         ],
     );
 
-    assert_eq!(conflicts, vec!["/dup.txt"], "the collision must be reported");
+    assert_eq!(
+        conflicts,
+        vec!["/dup.txt"],
+        "the collision must be reported"
+    );
     assert_eq!(
         cache.get_entry_by_path("/dup.txt").unwrap().node_id,
         "node-a",
@@ -184,7 +187,10 @@ fn functional_outage_keeps_entries_and_recovery_restores_them() {
             ListingOutcome::Answered(vec![file("node-a", "/gone.txt", "guid-g")]),
         )],
     );
-    assert_eq!(cache.get_entry_by_path("/gone.txt").unwrap().availability, Availability::Available);
+    assert_eq!(
+        cache.get_entry_by_path("/gone.txt").unwrap().availability,
+        Availability::Available
+    );
 
     // The owning node itself goes quiet: its entry stays listed but is
     // marked unreadable rather than deleted.
@@ -218,11 +224,14 @@ fn functional_a_change_on_one_node_is_visible_in_the_merged_view() {
     let mut cache = catalog();
     cache.reconcile_from(
         "/",
-        vec![("node-a".to_owned(), ListingOutcome::Answered(vec![{ 
-            let mut e = file("node-a", "/grow.txt", "guid-g");
-            e.attr.stat.size = 3;
-            e
-        }]))],
+        vec![(
+            "node-a".to_owned(),
+            ListingOutcome::Answered(vec![{
+                let mut e = file("node-a", "/grow.txt", "guid-g");
+                e.attr.stat.size = 3;
+                e
+            }]),
+        )],
     );
     let inode = cache.get_inode("/grow.txt").unwrap();
     assert_eq!(cache.get_entry(inode).unwrap().attr.stat.size, 3);
@@ -231,11 +240,14 @@ fn functional_a_change_on_one_node_is_visible_in_the_merged_view() {
     // report the new size for the *same* inode.
     cache.reconcile_from(
         "/",
-        vec![("node-a".to_owned(), ListingOutcome::Answered(vec![{ 
-            let mut e = file("node-a", "/grow.txt", "guid-g");
-            e.attr.stat.size = 9;
-            e
-        }]))],
+        vec![(
+            "node-a".to_owned(),
+            ListingOutcome::Answered(vec![{
+                let mut e = file("node-a", "/grow.txt", "guid-g");
+                e.attr.stat.size = 9;
+                e
+            }]),
+        )],
     );
     assert_eq!(
         cache.get_inode("/grow.txt"),
@@ -307,9 +319,12 @@ fn functional_create_sees_one_entry_per_path() {
 /// after it answers and only within the window.
 #[test]
 fn functional_node_liveness_tracks_recent_answers() {
-    let mut status = punkfs::store::db::metadata_cache::NodeStatus::new("node-a");
+    let mut status = punkfs::core::cache::metadata::NodeStatus::new("node-a");
     let now = SystemTime::now();
-    assert!(!status.is_reachable(now, Duration::from_secs(5)), "never seen");
+    assert!(
+        !status.is_reachable(now, Duration::from_secs(5)),
+        "never seen"
+    );
 
     status.mark_seen(now);
     assert!(status.is_reachable(now, Duration::from_secs(5)));

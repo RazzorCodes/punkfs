@@ -52,12 +52,33 @@ impl Node {
         addr: SocketAddr,
         peers: &[(String, SocketAddr)],
     ) -> Self {
+        Self::start_with_cache(id, root, addr, peers, None)
+    }
+
+    fn start_with_cache(
+        id: &str,
+        root: tempfile::TempDir,
+        addr: SocketAddr,
+        peers: &[(String, SocketAddr)],
+        cache: Option<(u64, usize)>,
+    ) -> Self {
         let logs = tempfile::tempdir().expect("separate log directory");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_punkfs"));
+        if let Some((ttl_ms, max_entries)) = cache {
+            let cfg = logs.path().join("cache.toml");
+            std::fs::write(
+                &cfg,
+                format!("cache_ttl_ms = {ttl_ms}\ncache_max_entries = {max_entries}\n"),
+            )
+            .unwrap();
+            cmd.arg("--config").arg(cfg);
+        }
         cmd.arg(root.path())
             .arg(id)
             .arg("--listen")
             .arg(addr.to_string())
+            .arg("--db-path")
+            .arg(logs.path().join("catalog.redb"))
             .env("PUNKFS_LOG_DESTINATION", "file")
             .env("PUNKFS_LOG_LEVEL", "debug")
             .env("PUNKFS_LOG_FILE", logs.path().join("node.jsonl"))
@@ -209,6 +230,7 @@ posix_contracts! {
     blackbox_fifo_is_a_fifo => fifo;
     blackbox_fifo_transfers_bytes => fifo_exchange;
     blackbox_user_extended_attributes_round_trip => xattr;
+    blackbox_directory_extended_attributes_round_trip => directory_xattr;
     blackbox_xattr_flags_and_buffers_match_linux => xattr_flags_and_buffers;
     blackbox_list_extended_attributes => xattr_list;
     blackbox_posix_acl_round_trips => acl_roundtrip;
@@ -626,6 +648,226 @@ fn blackbox_mutations_on_remote_existing_files() {
 
     for node in nodes.iter_mut() {
         node.stop();
+    }
+}
+
+#[test]
+fn blackbox_startup_scans_more_than_one_peer_inventory_batch() {
+    if !require_fuse() {
+        return;
+    }
+    let addr = addresses(1)[0];
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..4097 {
+        std::fs::File::create(root.path().join(format!("file-{i}"))).unwrap();
+    }
+    // Do not enumerate the FUSE mount here: that exercises a separate, much
+    // more expensive directory-refresh path. Wait for the actual startup-scan
+    // event, then check its durable result after stopping the process.
+    let logs = tempfile::tempdir().unwrap();
+    let db_path = logs.path().join("catalog.redb");
+    let log_path = logs.path().join("node.jsonl");
+    let child = Command::new(env!("CARGO_BIN_EXE_punkfs"))
+        .arg(root.path())
+        .arg("large")
+        .arg("--listen")
+        .arg(addr.to_string())
+        .arg("--db-path")
+        .arg(&db_path)
+        .env("PUNKFS_LOG_DESTINATION", "file")
+        .env("PUNKFS_LOG_FILE", &log_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut node = Node {
+        child,
+        root,
+        _logs: logs,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            node.child.try_wait().unwrap().is_none(),
+            "node exited during startup"
+        );
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("startup local scan completed") && log.contains("node started") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "large startup scan did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    node.stop();
+    let db = punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap();
+    assert!(db.get_inode("/file-4096").unwrap().is_some());
+}
+
+#[test]
+fn blackbox_minimal_cache_allows_creating_local_file() {
+    if !require_fuse() {
+        return;
+    }
+    let addr = addresses(1)[0];
+    let root = tempfile::tempdir().unwrap();
+    let node = Node::start_with_cache("one", root, addr, &[], Some((25, 1)));
+    let path = node.path().join("created");
+    std::fs::write(&path, b"hello").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+}
+
+#[test]
+fn blackbox_peer_rename_after_cache_eviction_preserves_inode_and_removes_old_name() {
+    if !require_fuse() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let addrs = addresses(2);
+    let root_a = tempfile::tempdir().unwrap();
+    let root_b = tempfile::tempdir().unwrap();
+    std::fs::write(root_a.path().join("before"), b"payload").unwrap();
+    let a = Node::start("a", root_a, addrs[0], &[("b".into(), addrs[1])]);
+    let b = Node::start_with_cache(
+        "b",
+        root_b,
+        addrs[1],
+        &[("a".into(), addrs[0])],
+        Some((25, 1)),
+    );
+    let old = b.path().join("before");
+    let ino = std::fs::metadata(&old).unwrap().ino();
+    std::thread::sleep(Duration::from_millis(60));
+    std::fs::rename(a.path().join("before"), a.path().join("after")).unwrap();
+    let new = b.path().join("after");
+    assert_eq!(std::fs::metadata(&new).unwrap().ino(), ino);
+    assert_eq!(std::fs::read(&new).unwrap(), b"payload");
+    assert!(!old.exists());
+    let names: Vec<_> = std::fs::read_dir(b.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("after")]);
+}
+
+#[test]
+fn blackbox_toml_config_and_redb_persist_inodes_across_restart() {
+    if !require_fuse() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let addrs = addresses(2);
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    std::fs::write(dir_a.path().join("seed.txt"), b"seeded-before-start").unwrap();
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let db_a = cfg_dir.path().join("a.redb");
+    let db_b = cfg_dir.path().join("b.redb");
+    let toml_a = cfg_dir.path().join("a.toml");
+    let toml_b = cfg_dir.path().join("b.toml");
+
+    std::fs::write(
+        &toml_a,
+        format!(
+            "mountpoint = \"{}\"\nnode_id = \"a\"\nlisten = \"{}\"\ndb_path = \"{}\"\ncache_ttl_ms = 500\ncache_max_entries = 64\n\n[peers]\nb = \"{}\"\n",
+            dir_a.path().display(),
+            addrs[0],
+            db_a.display(),
+            url(addrs[1])
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &toml_b,
+        format!(
+            "mountpoint = \"{}\"\nnode_id = \"b\"\nlisten = \"{}\"\ndb_path = \"{}\"\ncache_ttl_ms = 500\ncache_max_entries = 64\n\n[peers]\na = \"{}\"\n",
+            dir_b.path().display(),
+            addrs[1],
+            db_b.display(),
+            url(addrs[0])
+        ),
+    )
+    .unwrap();
+
+    let spawn_from_toml = |cfg: &Path, mount: &Path| -> Child {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_punkfs"));
+        cmd.arg("--config")
+            .arg(cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("spawn punkfs from toml");
+        let target = std::fs::canonicalize(mount).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "node exited during startup"
+            );
+            let mounted = std::fs::read_to_string("/proc/self/mounts")
+                .unwrap_or_default()
+                .lines()
+                .any(|line| {
+                    let mut fields = line.split_whitespace();
+                    fields.nth(1).is_some_and(|p| p == target.to_string_lossy())
+                        && fields.next().is_some_and(|kind| kind.starts_with("fuse"))
+                });
+            if mounted {
+                return child;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("node never mounted at {}", target.display());
+    };
+
+    let mut child_a = spawn_from_toml(&toml_a, dir_a.path());
+    let mut child_b = spawn_from_toml(&toml_b, dir_b.path());
+
+    // Wait for handshake to make node a's startup-scanned file visible on node b.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(dir_b.path().join("seed.txt")).is_err() {
+        assert!(Instant::now() < deadline, "seed.txt not visible on peer b");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let ino_before = std::fs::metadata(dir_b.path().join("seed.txt"))
+        .unwrap()
+        .ino();
+    assert!(db_a.exists());
+    assert!(db_b.exists());
+
+    // Stop node b and restart it with the same config/db_path: its local FUSE inode
+    // for seed.txt must remain constant from redb.
+    let _ = Command::new("kill")
+        .args(["-TERM", &child_b.id().to_string()])
+        .status();
+    let _ = child_b.wait();
+    // Stop the owner as well: the observer cannot rediscover the entry by RPC,
+    // so an inode match here proves the persisted catalog supplied it.
+    let _ = Command::new("kill")
+        .args(["-TERM", &child_a.id().to_string()])
+        .status();
+    let _ = child_a.wait();
+
+    let mut child_b2 = spawn_from_toml(&toml_b, dir_b.path());
+    let ino_after = std::fs::metadata(dir_b.path().join("seed.txt"))
+        .unwrap()
+        .ino();
+    assert_eq!(ino_before, ino_after, "constant local inode across restart");
+
+    for (child, dir) in [(&mut child_b2, dir_b.path())] {
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+        let _ = child.wait();
+        let _ = Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 

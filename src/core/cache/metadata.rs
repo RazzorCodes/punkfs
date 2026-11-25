@@ -11,9 +11,13 @@
 //!
 //! Entries are therefore looked up by `guid` when we reconcile a listing,
 //! and by `inode`/`path` when the kernel asks about something.
-use std::time::{Duration, SystemTime};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
-use super::attributes::{FileAttrData, FsEntryKind};
+use crate::core::db::persistent::PersistentDb;
+use crate::core::metadata::{Availability, FsEntry};
+use crate::core::types::{FileAttrData, FsEntryKind};
 use crate::telemetry::{self, Event, Logger, OperationContext, Severity};
 
 pub struct FsNode {
@@ -23,36 +27,6 @@ pub struct FsNode {
 pub struct FsNodeMetadata {
     pub parent_node: String,
     pub guid: String,
-}
-
-/// Whether the node that owns an entry is currently reachable.
-///
-/// An entry is deliberately **kept** in the catalog when its node goes
-/// away: the namespace stays browsable (`ls`, `stat`) and only the
-/// operations that need the bytes fail. Dropping the entry instead would
-/// make a transient outage look like a mass deletion.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Availability {
-    #[default]
-    Available,
-    /// Owning node has not answered recently; content ops will fail.
-    Inaccessible,
-}
-
-/// One entry in the local catalog.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FsEntry {
-    /// Locally allocated FUSE inode. Meaningless off this machine.
-    pub inode: u64,
-    pub path: String,
-    /// punkfs identity, from the server.
-    pub guid: String,
-    pub kind: FsEntryKind,
-    /// Where the authoritative bytes live.
-    pub node_id: String,
-    /// Whether that node is currently answering.
-    pub availability: Availability,
-    pub attr: FileAttrData,
 }
 
 /// One node in the cluster, as the catalog remembers it.
@@ -105,6 +79,12 @@ pub struct MetadataCache {
     next_inode: u64,
     logger: Option<Logger>,
     local_node: Option<String>,
+    db: Option<Arc<PersistentDb>>,
+    ttl: Option<Duration>,
+    max_entries: Option<usize>,
+    cached_at: HashMap<String, Instant>,
+    last_used: HashMap<String, Instant>,
+    persistence_error: Option<String>,
 }
 
 impl Default for MetadataCache {
@@ -130,6 +110,12 @@ impl MetadataCache {
             next_inode: 1,
             logger,
             local_node: None,
+            db: None,
+            ttl: None,
+            max_entries: None,
+            cached_at: HashMap::new(),
+            last_used: HashMap::new(),
+            persistence_error: None,
         };
         cache.emit(
             None,
@@ -139,6 +125,251 @@ impl MetadataCache {
             &[],
         );
         cache
+    }
+
+    /// Attach a `redb` persistence backend and bounded in-memory cache policy.
+    /// Existing entries from the DB are hydrated into memory up to `max_entries`.
+    pub fn attach_db(
+        &mut self,
+        db: Arc<PersistentDb>,
+        ttl: Option<Duration>,
+        max_entries: Option<usize>,
+    ) -> Result<(), redb::Error> {
+        let (loaded, next_inode) = db.load_limit(max_entries)?;
+        self.next_inode = self.next_inode.max(next_inode);
+        self.db = Some(db);
+        self.ttl = ttl;
+        self.max_entries = max_entries;
+        let now = Instant::now();
+        for entry in loaded {
+            if self.entries.iter().all(|e| e.path != entry.path) {
+                self.cached_at.insert(entry.path.clone(), now);
+                self.last_used.insert(entry.path.clone(), now);
+                self.entries.push(entry);
+            }
+        }
+        self.evict_excess();
+        Ok(())
+    }
+
+    /// A failed catalog write makes the process's view unreliable. Keep the
+    /// error until restart rather than reporting later operations as durable.
+    pub(crate) fn persistence_error(&self) -> Option<&str> {
+        self.persistence_error.as_deref()
+    }
+
+    fn record_db_error(
+        &mut self,
+        ctx: Option<&OperationContext>,
+        operation: &str,
+        error: impl std::fmt::Display,
+    ) {
+        let message = error.to_string();
+        self.emit(
+            ctx,
+            Severity::Error,
+            operation,
+            "persistent metadata operation failed",
+            &[("error", serde_json::json!(&message))],
+        );
+        if self.persistence_error.is_none() {
+            self.persistence_error = Some(message);
+        }
+    }
+
+    pub(crate) fn clear_memory(&mut self) {
+        self.entries.clear();
+        self.cached_at.clear();
+        self.last_used.clear();
+    }
+
+    pub(crate) fn db(&self) -> Option<&Arc<PersistentDb>> {
+        self.db.as_ref()
+    }
+
+    /// Drop expired or over-capacity entries from the *in-memory* cache.
+    /// Entries remain in `redb` so `get_inode`/`get_path` still resolve
+    /// constant local inodes on cache misses.
+    pub fn prune_expired(&mut self) {
+        if let Some(ttl) = self.ttl {
+            let now = Instant::now();
+            let expired: Vec<String> = self
+                .entries
+                .iter()
+                .filter(|e| e.path != "/")
+                .filter(|e| {
+                    self.cached_at
+                        .get(&e.path)
+                        .is_some_and(|at| now.saturating_duration_since(*at) > ttl)
+                })
+                .map(|e| e.path.clone())
+                .collect();
+            if !expired.is_empty() {
+                self.entries
+                    .retain(|e| !expired.iter().any(|p| p == &e.path));
+                for path in expired {
+                    self.cached_at.remove(&path);
+                    self.last_used.remove(&path);
+                }
+            }
+        }
+        self.evict_excess();
+    }
+
+    fn evict_excess(&mut self) {
+        let Some(max) = self.max_entries else {
+            return;
+        };
+        while self.entries.len() > max {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .filter(|e| e.path != "/")
+                .min_by_key(|e| {
+                    self.last_used
+                        .get(&e.path)
+                        .copied()
+                        .unwrap_or_else(Instant::now)
+                })
+                .map(|e| e.path.clone())
+            else {
+                break;
+            };
+            self.entries.retain(|e| e.path != victim);
+            self.cached_at.remove(&victim);
+            self.last_used.remove(&victim);
+        }
+    }
+
+    fn touch_mem(&mut self, path: &str) {
+        let now = Instant::now();
+        self.cached_at.entry(path.to_owned()).or_insert(now);
+        self.last_used.insert(path.to_owned(), now);
+    }
+
+    /// Look up by path, falling back to `redb` on in-memory cache miss
+    /// (and warming the in-memory cache).
+    pub fn lookup_entry_by_path(&mut self, path: &str) -> Option<FsEntry> {
+        self.prune_expired();
+        if let Some(entry) = self.entries.iter().find(|e| e.path == path).cloned() {
+            self.touch_mem(path);
+            return Some(entry);
+        }
+        let db = self.db.as_ref()?.clone();
+        let entry = match db.get_by_path(path) {
+            Ok(entry) => entry?,
+            Err(err) => {
+                self.record_db_error(None, "lookup_path", err);
+                return None;
+            }
+        };
+        self.next_inode = self.next_inode.max(entry.inode + 1);
+        self.touch_mem(&entry.path);
+        self.entries.push(entry.clone());
+        self.evict_excess();
+        Some(entry)
+    }
+
+    /// Find a stable identity regardless of in-memory eviction.
+    pub fn lookup_entry_by_guid(&mut self, owner: &str, guid: &str) -> Option<FsEntry> {
+        self.prune_expired();
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.node_id == owner && e.guid == guid)
+            .cloned()
+        {
+            self.touch_mem(&entry.path);
+            return Some(entry);
+        }
+        let db = self.db.as_ref()?.clone();
+        match db.get_by_guid(owner, guid) {
+            Ok(entry) => entry,
+            Err(err) => {
+                self.record_db_error(None, "lookup_guid", err);
+                None
+            }
+        }
+    }
+
+    /// Resolve a constant local inode by path, hitting `redb` on cache miss.
+    pub fn lookup_inode(&mut self, path: &str) -> Option<u64> {
+        self.prune_expired();
+        if let Some(inode) = self
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.inode)
+        {
+            self.touch_mem(path);
+            return Some(inode);
+        }
+        let db = self.db.as_ref()?.clone();
+        match db.get_inode(path) {
+            Ok(inode) => inode,
+            Err(err) => {
+                self.record_db_error(None, "lookup_inode", err);
+                None
+            }
+        }
+    }
+
+    /// Resolve a path by constant local inode, hitting `redb` on cache miss.
+    pub fn lookup_path(&mut self, inode: u64) -> Option<String> {
+        self.prune_expired();
+        if let Some(path) = self
+            .entries
+            .iter()
+            .find(|e| e.inode == inode)
+            .map(|e| e.path.clone())
+        {
+            self.touch_mem(&path);
+            return Some(path);
+        }
+        let db = self.db.as_ref()?.clone();
+        match db.get_path(inode) {
+            Ok(path) => path,
+            Err(err) => {
+                self.record_db_error(None, "lookup_inode_path", err);
+                None
+            }
+        }
+    }
+
+    /// Resolve an entry by constant local inode, hitting `redb` on cache miss.
+    pub fn lookup_entry_by_inode(&mut self, inode: u64) -> Option<FsEntry> {
+        self.prune_expired();
+        if let Some(entry) = self.entries.iter().find(|e| e.inode == inode).cloned() {
+            self.touch_mem(&entry.path);
+            return Some(entry);
+        }
+        let db = self.db.as_ref()?.clone();
+        let entry = match db.get_by_inode(inode) {
+            Ok(entry) => entry?,
+            Err(err) => {
+                self.record_db_error(None, "lookup_entry", err);
+                return None;
+            }
+        };
+        self.next_inode = self.next_inode.max(entry.inode + 1);
+        self.touch_mem(&entry.path);
+        self.entries.push(entry.clone());
+        self.evict_excess();
+        Some(entry)
+    }
+
+    /// Direct children of `path`, falling back to `redb` when a DB is attached.
+    pub fn lookup_children_of(&mut self, path: &str) -> Vec<FsEntry> {
+        if let Some(db) = self.db.as_ref().cloned() {
+            return match db.get_children_of(path) {
+                Ok(children) => children,
+                Err(err) => {
+                    self.record_db_error(None, "lookup_children", err);
+                    Vec::new()
+                }
+            };
+        }
+        self.get_children_of(path).into_iter().cloned().collect()
     }
 
     /// Mark a node as locally accessible even during remote-only reconciliation.
@@ -233,32 +464,62 @@ impl MetadataCache {
         if entry.inode == 0 {
             // Reuse the inode of the entry this one is replacing, matched
             // by guid (a rename) or by path (the same file with a new
-            // server-assigned guid). Only a genuinely new entry gets a
-            // fresh inode.
+            // server-assigned guid), or persisted in redb. Only a genuinely
+            // new entry gets a fresh inode.
             let known = self
                 .entries
                 .iter()
-                .find(|e| e.guid == entry.guid || e.path == entry.path)
+                .find(|e| {
+                    (e.node_id == entry.node_id && e.guid == entry.guid) || e.path == entry.path
+                })
                 .map(|e| e.inode);
             entry.inode = known.unwrap_or_else(|| self.alloc_inode());
         } else {
             self.next_inode = self.next_inode.max(entry.inode + 1);
         }
 
-        let existing = self
-            .entries
-            .iter()
-            .position(|e| e.guid == entry.guid || e.path == entry.path);
+        // A full listing often repeats unchanged attributes. Avoid a durable
+        // transaction per child when the committed, resident entry is identical.
+        if let Some(old) = self.entries.iter().find(|e| **e == entry).cloned() {
+            self.touch_mem(&entry.path);
+            return Some(old);
+        }
+
+        if let Some(db) = self.db.as_ref().cloned() {
+            match db.upsert_entry(&entry) {
+                Ok(persisted) => {
+                    entry.inode = persisted.inode;
+                    self.next_inode = self.next_inode.max(entry.inode + 1);
+                }
+                Err(err) => {
+                    self.record_db_error(Some(ctx), "upsert", err);
+                    return None;
+                }
+            }
+        }
+
+        let path = entry.path.clone();
+        self.touch_mem(&path);
+
+        let existing = self.entries.iter().position(|e| {
+            (e.node_id == entry.node_id && e.guid == entry.guid)
+                || e.path == entry.path
+                || e.inode == entry.inode
+        });
 
         let old = match existing {
             Some(idx) => {
                 let old = std::mem::replace(&mut self.entries[idx], entry);
-                // A rename can leave a duplicate row for the old path.
-                self.entries.dedup_by(|a, b| a.inode == b.inode);
+                if old.path != path {
+                    self.cached_at.remove(&old.path);
+                    self.last_used.remove(&old.path);
+                }
+                self.evict_excess();
                 Some(old)
             }
             None => {
                 self.entries.push(entry);
+                self.evict_excess();
                 None
             }
         };
@@ -313,16 +574,30 @@ impl MetadataCache {
 
     /// Remove an entry as part of an existing operation.
     pub fn remove_entry_in(&mut self, ctx: &OperationContext, path: &str) -> Option<FsEntry> {
+        let db_removed = if let Some(db) = self.db.as_ref().cloned() {
+            match db.remove_subtree(path) {
+                Ok(count) => count,
+                Err(err) => {
+                    self.record_db_error(Some(ctx), "remove", err);
+                    return None;
+                }
+            }
+        } else {
+            0
+        };
         let before = self.entries.len();
         let removed = self
             .entries
             .iter()
             .position(|e| e.path == path)
             .map(|idx| self.entries.remove(idx));
-        if removed.is_some() {
-            let prefix = format!("{}/", path.trim_end_matches('/'));
-            self.entries.retain(|e| !e.path.starts_with(&prefix));
-        }
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        self.entries.retain(|e| !e.path.starts_with(&prefix));
+        self.cached_at
+            .retain(|k, _| k != path && !k.starts_with(&prefix));
+        self.last_used
+            .retain(|k, _| k != path && !k.starts_with(&prefix));
+        let total_removed = (before - self.entries.len()).max(db_removed);
         self.emit(
             Some(ctx),
             Severity::Debug,
@@ -331,19 +606,34 @@ impl MetadataCache {
             &[
                 (
                     "outcome",
-                    serde_json::json!(if removed.is_some() {
+                    serde_json::json!(if removed.is_some() || db_removed > 0 {
                         "removed"
                     } else {
                         "not_cached"
                     }),
                 ),
-                (
-                    "entries_removed",
-                    serde_json::json!(before - self.entries.len()),
-                ),
+                ("entries_removed", serde_json::json!(total_removed)),
             ],
         );
         removed
+    }
+
+    /// Remove only this owner's contribution to a path. Other contributors
+    /// and their descendants must survive a removal of a merged directory.
+    pub(crate) fn remove_owner_entry_in(
+        &mut self,
+        ctx: &OperationContext,
+        path: &str,
+        owner: &str,
+    ) {
+        if let Some(db) = self.db.as_ref().cloned() {
+            match db.remove_owner_entry(path, owner) {
+                Ok(()) => self.clear_memory(),
+                Err(err) => self.record_db_error(Some(ctx), "remove_owner", err),
+            }
+        } else {
+            self.remove_entry_in(ctx, path);
+        }
     }
 
     /// Move `old` (and its subtree) to `new`, keeping inodes and guids.
@@ -356,9 +646,29 @@ impl MetadataCache {
 
     /// Rename cached entries as part of an existing operation.
     pub fn rename_entry_in(&mut self, ctx: &OperationContext, old: &str, new: &str) -> bool {
+        let db_moved = if let Some(db) = self.db.as_ref().cloned() {
+            match db.rename_subtree(old, new) {
+                Ok(moved) => moved,
+                Err(err) => {
+                    self.record_db_error(Some(ctx), "rename", err);
+                    return false;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let mut moved = false;
         let mut moved_entries = 0;
         let old_prefix = format!("{}/", old.trim_end_matches('/'));
+        if old != new {
+            let new_prefix = format!("{}/", new.trim_end_matches('/'));
+            self.entries
+                .retain(|e| e.path != new && !e.path.starts_with(&new_prefix));
+            self.cached_at
+                .retain(|p, _| p != new && !p.starts_with(&new_prefix));
+            self.last_used
+                .retain(|p, _| p != new && !p.starts_with(&new_prefix));
+        }
 
         for entry in &mut self.entries {
             if entry.path == old {
@@ -370,6 +680,17 @@ impl MetadataCache {
                 moved = true;
                 moved_entries += 1;
             }
+        }
+        if !db_moved.is_empty() {
+            moved = true;
+            moved_entries = moved_entries.max(db_moved.len());
+            for entry in db_moved {
+                self.touch_mem(&entry.path);
+                if self.entries.iter().all(|e| e.path != entry.path) {
+                    self.entries.push(entry);
+                }
+            }
+            self.evict_excess();
         }
         self.emit(
             Some(ctx),
@@ -389,6 +710,12 @@ impl MetadataCache {
 
     /// Exchange two cached subtrees without changing their inode identities.
     pub fn exchange_entries(&mut self, old: &str, new: &str) {
+        if let Some(db) = self.db.as_ref().cloned()
+            && let Err(err) = db.exchange_subtrees(old, new)
+        {
+            self.record_db_error(None, "exchange", err);
+            return;
+        }
         let old_prefix = format!("{}/", old.trim_end_matches('/'));
         let new_prefix = format!("{}/", new.trim_end_matches('/'));
         for entry in &mut self.entries {
@@ -460,6 +787,23 @@ impl MetadataCache {
         dir: &str,
         outcomes: Vec<(String, ListingOutcome)>,
     ) -> Vec<String> {
+        // Reconciliation is authoritative over all direct children, not just
+        // the subset currently resident in the bounded cache. Temporarily
+        // pin them until every owner's answer has been processed.
+        self.prune_expired();
+        let max_entries = self.max_entries.take();
+        if let Some(db) = self.db.as_ref() {
+            match db.get_children_of(dir) {
+                Ok(children) => {
+                    for entry in children {
+                        if self.entries.iter().all(|e| e.path != entry.path) {
+                            self.entries.push(entry);
+                        }
+                    }
+                }
+                Err(err) => self.record_db_error(Some(ctx), "reconcile", err),
+            }
+        }
         let node_count = outcomes.len();
         let mut answered_count = 0usize;
         let mut unreachable_count = 0usize;
@@ -558,6 +902,21 @@ impl MetadataCache {
                     self.entries
                         .retain(|e| !(e.node_id == node_id && stale.iter().any(|s| s == &e.path)));
                     removed_count += before - self.entries.len();
+                    if let Some(db) = self.db.as_ref().cloned() {
+                        for stale_path in &stale {
+                            if let Err(err) = db.remove_owner_entry(stale_path, &node_id) {
+                                self.record_db_error(Some(ctx), "reconcile", err);
+                            }
+                            match db.get_by_path(stale_path) {
+                                Ok(Some(survivor)) => self.entries.push(survivor),
+                                Ok(None) => {
+                                    self.cached_at.remove(stale_path);
+                                    self.last_used.remove(stale_path);
+                                }
+                                Err(err) => self.record_db_error(Some(ctx), "reconcile", err),
+                            }
+                        }
+                    }
 
                     for child in children {
                         let also = self
@@ -577,6 +936,11 @@ impl MetadataCache {
                                     e.path == child.path && e.kind == FsEntryKind::Directory
                                 })
                             {
+                                if let Some(db) = self.db.as_ref()
+                                    && let Err(err) = db.add_directory_owner(&child.path, &node_id)
+                                {
+                                    self.record_db_error(Some(ctx), "reconcile", err);
+                                }
                                 continue;
                             }
                             if !conflicts.contains(&child.path) {
@@ -649,6 +1013,8 @@ impl MetadataCache {
                 ("conflicts", serde_json::json!(conflicts.len())),
             ],
         );
+        self.max_entries = max_entries;
+        self.evict_excess();
         conflicts
     }
 

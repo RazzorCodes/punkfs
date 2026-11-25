@@ -16,8 +16,10 @@ use fuser::RenameFlags;
 use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
-use self::db::attributes::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
-use self::db::metadata_cache::{Availability, FsEntry, FsNode, ListingOutcome, MetadataCache};
+use crate::core::cache::metadata::{FsNode, ListingOutcome, MetadataCache};
+use crate::core::db::persistent::PersistentDb;
+use crate::core::metadata::{Availability, FsEntry};
+use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
     self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, ReadLinkRequest,
@@ -25,7 +27,6 @@ use crate::punk_fs::{
 };
 use crate::telemetry::OperationContext;
 pub(crate) mod contextual;
-pub mod db;
 
 #[cfg(test)]
 pub(crate) mod mock;
@@ -384,6 +385,7 @@ impl Store {
         Self::new_nodes_mode(nodes, local, false)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_with_local(
         nodes: &[(String, String)],
         local: FsNode,
@@ -391,10 +393,31 @@ impl Store {
         Self::new_nodes_mode(nodes, local, true)
     }
 
+    pub(crate) fn new_with_local_persistence(
+        nodes: &[(String, String)],
+        local: FsNode,
+        db_path: Option<&std::path::Path>,
+        cache_ttl: Option<Duration>,
+        cache_max_entries: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_nodes_configured(nodes, local, true, db_path, cache_ttl, cache_max_entries)
+    }
+
     fn new_nodes_mode(
         nodes: &[(String, String)],
         local: FsNode,
         local_node_enabled: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_nodes_configured(nodes, local, local_node_enabled, None, None, None)
+    }
+
+    fn new_nodes_configured(
+        nodes: &[(String, String)],
+        local: FsNode,
+        local_node_enabled: bool,
+        db_path: Option<&std::path::Path>,
+        cache_ttl: Option<Duration>,
+        cache_max_entries: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -422,10 +445,34 @@ impl Store {
         };
 
         let mut metadata_cache = MetadataCache::new();
+        if let Some(db_path) = db_path {
+            let db = std::sync::Arc::new(PersistentDb::open(db_path)?);
+            metadata_cache.attach_db(db, cache_ttl, cache_max_entries)?;
+        }
         // The root is synthetic: every node answers "/" with a different
         // guid, but a mount has exactly one root. Its children resolve per
         // node normally.
-        metadata_cache.insert_root("/", "/", FsEntryKind::Directory);
+        if metadata_cache.lookup_entry_by_path("/").is_none() {
+            metadata_cache.upsert_entry(FsEntry {
+                inode: 1,
+                path: "/".to_owned(),
+                guid: "/".to_owned(),
+                kind: FsEntryKind::Directory,
+                node_id: String::new(),
+                availability: Availability::Available,
+                attr: FileAttrData {
+                    guid: "/".to_owned(),
+                    kind: FsEntryKind::Directory,
+                    ..FileAttrData::default()
+                },
+            });
+        }
+        if let Some(error) = metadata_cache.persistence_error() {
+            return Err(std::io::Error::other(format!(
+                "persistent metadata initialization failed: {error}"
+            ))
+            .into());
+        }
         if local_node_enabled {
             metadata_cache.set_local_node(local.node_id.clone());
         }
@@ -442,6 +489,90 @@ impl Store {
         })
     }
 
+    fn check_persistence(cache: &MetadataCache) -> Result<(), StoreError> {
+        match cache.persistence_error() {
+            Some(error) => Err(StoreError::Io(format!(
+                "persistent metadata unavailable: {error}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Reconcile a full owner snapshot into `redb` + memory (startup local scan
+    /// and peer handshake). Removes any non-directory entries owned by `owner_id`
+    /// that are absent from `snapshot`.
+    pub(crate) fn reconcile_owner_snapshot_in(
+        &self,
+        ctx: &OperationContext,
+        owner_id: &str,
+        snapshot: Vec<FsEntry>,
+    ) -> Result<usize, StoreError> {
+        // A listing started before this snapshot must not overwrite it after
+        // the snapshot is applied. Match the lock order used by publications.
+        let mut generations = self.peer_generation.lock().unwrap();
+        let generation = generations.entry(owner_id.to_owned()).or_default();
+        *generation = generation.wrapping_add(1);
+        let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
+        if let Some(db) = cache.db().cloned() {
+            let (stored, conflicts) =
+                db.reconcile_owner_snapshot(owner_id, &snapshot)
+                    .map_err(|e| {
+                        if let Some(logger) = crate::telemetry::global() {
+                            let mut event = crate::telemetry::Event::new(
+                                crate::telemetry::Severity::Error,
+                                "metadata_cache",
+                                "metadata snapshot transaction failed",
+                            );
+                            event.operation = Some("reconcile_snapshot".into());
+                            event
+                                .fields
+                                .insert("error".into(), serde_json::json!(e.to_string()));
+                            logger.emit_in(ctx, event);
+                        }
+                        StoreError::Io(format!("metadata snapshot transaction failed: {e}"))
+                    })?;
+            // The transaction may have removed or reassigned entries, including
+            // ones evicted from memory. Reload lazily from the committed view.
+            cache.clear_memory();
+            drop(cache);
+            if !conflicts.is_empty() {
+                self.conflicts.lock().unwrap().extend(conflicts);
+            }
+            return Ok(stored.len());
+        }
+        let mut conflicts = Vec::new();
+        let mut accepted = 0usize;
+        let entries_to_apply = snapshot;
+
+        let present: HashSet<String> = entries_to_apply.iter().map(|e| e.path.clone()).collect();
+        cache.entries.retain(|e| {
+            !(e.node_id == owner_id
+                && e.kind != FsEntryKind::Directory
+                && !present.contains(&e.path))
+        });
+
+        for entry in entries_to_apply {
+            if let Some(known) = cache.lookup_entry_by_path(&entry.path)
+                && known.node_id != owner_id
+            {
+                if known.kind == FsEntryKind::Directory && entry.kind == FsEntryKind::Directory {
+                    continue;
+                }
+                conflicts.push(entry.path.clone());
+                continue;
+            }
+            cache.upsert_entry_in(ctx, entry);
+            Self::check_persistence(&cache)?;
+            accepted += 1;
+        }
+        drop(cache);
+        if !conflicts.is_empty() {
+            self.conflicts.lock().unwrap().extend(conflicts);
+        }
+        Ok(accepted)
+    }
+
     /// Merge unsolicited metadata without treating missing entries as deletion.
     /// Conflicting contributions remain inaccessible rather than replacing a
     /// previously known owner. Caller validates the peer and all wire data.
@@ -450,15 +581,16 @@ impl Store {
         ctx: &OperationContext,
         peer: &str,
         entries: Vec<FsEntry>,
-    ) -> usize {
+    ) -> Result<usize, StoreError> {
         let mut generations = self.peer_generation.lock().unwrap();
         let generation = generations.entry(peer.to_owned()).or_default();
         *generation = generation.wrapping_add(1);
         let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
         let mut conflicts = Vec::new();
         let mut accepted = 0;
         for entry in entries {
-            if let Some(known) = cache.get_entry_by_path(&entry.path) {
+            if let Some(known) = cache.lookup_entry_by_path(&entry.path) {
                 if known.node_id != peer {
                     if known.kind == FsEntryKind::Directory && entry.kind == FsEntryKind::Directory
                     {
@@ -473,12 +605,13 @@ impl Store {
                 }
                 continue;
             }
-            if let Some(known) = cache.get_entry_by_guid(&entry.guid) {
+            if let Some(known) = cache.lookup_entry_by_guid(peer, &entry.guid) {
                 conflicts.push(entry.path.clone());
                 conflicts.push(known.path.clone());
                 continue;
             }
             cache.upsert_entry_in(ctx, entry);
+            Self::check_persistence(&cache)?;
             accepted += 1;
         }
         if !conflicts.is_empty() {
@@ -486,7 +619,7 @@ impl Store {
         }
         drop(cache);
         drop(generations);
-        accepted
+        Ok(accepted)
     }
 
     /// How long a node may stay silent before its entries are treated as
@@ -519,9 +652,12 @@ impl Store {
 
     /// Which node owns `path`.
     fn node_of(&self, path: &str) -> Result<String, StoreError> {
-        let tree = self.metadata_cache.lock().unwrap();
-        if let Some(entry) = tree.get_entry_by_path(path) {
-            return Ok(entry.node_id.clone());
+        let mut tree = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&tree)?;
+        let entry = tree.lookup_entry_by_path(path);
+        Self::check_persistence(&tree)?;
+        if let Some(entry) = entry {
+            return Ok(entry.node_id);
         }
         // Legacy remote-only clients historically probed their first server
         // for unknown paths. A combined node must never guess an owner.
@@ -617,11 +753,11 @@ impl Store {
             generations.get(node).copied().unwrap_or(0)
                 == observed_generations.get(node).copied().unwrap_or(0)
         });
-        let conflicts = self
-            .metadata_cache
-            .lock()
-            .unwrap()
-            .reconcile_from_in(ctx, dir, outcomes);
+        let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
+        let conflicts = cache.reconcile_from_in(ctx, dir, outcomes);
+        Self::check_persistence(&cache)?;
+        drop(cache);
         drop(generations);
         if !conflicts.is_empty() {
             for path in &conflicts {
@@ -661,9 +797,15 @@ impl Store {
     ///
     /// Ownership is preserved from the existing entry when we know it,
     /// so a refresh cannot silently re-home a file onto the local node.
-    fn store_attr(&self, ctx: &OperationContext, path: &str, attr: FileAttrData) {
+    fn store_attr(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        attr: FileAttrData,
+    ) -> Result<(), StoreError> {
         let mut tree = self.metadata_cache.lock().unwrap();
-        let existing = tree.get_entry_by_path(path).cloned();
+        let existing = tree.lookup_entry_by_path(path);
+        Self::check_persistence(&tree)?;
         let inode = existing.as_ref().map(|e| e.inode).unwrap_or(0);
         let node_id = existing
             .map(|e| e.node_id)
@@ -680,6 +822,7 @@ impl Store {
                 attr,
             },
         );
+        Self::check_persistence(&tree)
     }
 }
 
@@ -781,11 +924,15 @@ impl StoreApi for Store {
         dir: &str,
         entries: Vec<FsEntry>,
     ) -> Result<(), StoreError> {
-        let conflicts = self.metadata_cache.lock().unwrap().reconcile_from_in(
+        let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
+        let conflicts = cache.reconcile_from_in(
             ctx,
             dir,
             vec![(self.node.node_id.clone(), ListingOutcome::Answered(entries))],
         );
+        Self::check_persistence(&cache)?;
+        drop(cache);
         if !conflicts.is_empty() {
             self.conflicts.lock().unwrap().extend(conflicts);
         }
@@ -796,21 +943,23 @@ impl StoreApi for Store {
             return Err(StoreError::NotPermitted);
         }
         let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
         let path = entry.path.clone();
-        if cache
-            .get_entry_by_path(&path)
-            .is_some_and(|existing| existing.node_id != self.node.node_id)
-        {
+        let existing = cache.lookup_entry_by_path(&path);
+        Self::check_persistence(&cache)?;
+        if existing.is_some_and(|existing| existing.node_id != self.node.node_id) {
             return Err(StoreError::Local(libc::EEXIST));
         }
         cache.upsert_entry_in(ctx, entry);
-        cache.get_inode(&path).ok_or(StoreError::NotFound)
+        Self::check_persistence(&cache)?;
+        cache.lookup_inode(&path).ok_or(StoreError::NotFound)
     }
     fn remove_local_in(&self, ctx: &OperationContext, path: &str) -> Result<(), StoreError> {
-        self.metadata_cache
-            .lock()
-            .unwrap()
-            .remove_entry_in(ctx, path);
+        let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
+        cache.remove_owner_entry_in(ctx, path, &self.node.node_id);
+        Self::check_persistence(&cache)?;
+        drop(cache);
         self.invalidate(&parent_of(path));
         Ok(())
     }
@@ -820,10 +969,11 @@ impl StoreApi for Store {
         old: &str,
         new: &str,
     ) -> Result<(), StoreError> {
-        self.metadata_cache
-            .lock()
-            .unwrap()
-            .exchange_entries(old, new);
+        let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
+        cache.exchange_entries(old, new);
+        Self::check_persistence(&cache)?;
+        drop(cache);
         self.invalidate(&parent_of(old));
         self.invalidate(&parent_of(new));
         Ok(())
@@ -835,10 +985,10 @@ impl StoreApi for Store {
         new: &str,
     ) -> Result<(), StoreError> {
         let mut cache = self.metadata_cache.lock().unwrap();
-        if old != new {
-            cache.remove_entry_in(ctx, new);
-        }
+        Self::check_persistence(&cache)?;
+        // rename_subtree replaces the destination atomically in redb.
         cache.rename_entry_in(ctx, old, new);
+        Self::check_persistence(&cache)?;
         drop(cache);
         self.invalidate(&parent_of(old));
         self.invalidate(&parent_of(new));
@@ -855,31 +1005,26 @@ impl StoreApi for Store {
     }
 
     fn get_inode(&self, path: &str) -> Option<u64> {
-        self.metadata_cache.lock().unwrap().get_inode(path)
+        self.metadata_cache.lock().unwrap().lookup_inode(path)
     }
 
     fn get_path(&self, inode: u64) -> Option<String> {
-        self.metadata_cache
-            .lock()
-            .unwrap()
-            .get_path(inode)
-            .map(str::to_owned)
+        self.metadata_cache.lock().unwrap().lookup_path(inode)
     }
 
     fn get_entry(&self, inode: u64) -> Option<FsEntry> {
         self.metadata_cache
             .lock()
             .unwrap()
-            .get_entry(inode)
-            .cloned()
+            .lookup_entry_by_inode(inode)
     }
 
     fn owner_of(&self, path: &str) -> Option<String> {
         self.metadata_cache
             .lock()
             .unwrap()
-            .get_entry_by_path(path)
-            .map(|e| e.node_id.clone())
+            .lookup_entry_by_path(path)
+            .map(|e| e.node_id)
             .filter(|id| !id.is_empty())
     }
 
@@ -913,7 +1058,7 @@ impl StoreApi for Store {
         self.metadata_cache
             .lock()
             .unwrap()
-            .get_children_of(path)
+            .lookup_children_of(path)
             .into_iter()
             .map(|e| StoreChild {
                 inode: e.inode,
@@ -1147,7 +1292,7 @@ impl StoreApi for Store {
         self.conn_for(&node_id)?.touch();
 
         let attr = attr_from_proto(resp.into_inner().attr.unwrap_or_default());
-        self.store_attr(ctx, path, attr.clone());
+        self.store_attr(ctx, path, attr.clone())?;
         Ok(attr)
     }
 
@@ -1157,7 +1302,7 @@ impl StoreApi for Store {
 
     fn refresh_in(&self, ctx: &OperationContext, path: &str) -> Result<FileAttrData, StoreError> {
         let attr = self.getattr(ctx, path)?;
-        self.store_attr(ctx, path, attr.clone());
+        self.store_attr(ctx, path, attr.clone())?;
         Ok(attr)
     }
 
@@ -1206,7 +1351,7 @@ impl StoreApi for Store {
             })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
-        self.after_mutation(ctx, path);
+        self.after_mutation(ctx, path, &node_id)?;
         Ok(())
     }
 
@@ -1223,7 +1368,7 @@ impl StoreApi for Store {
             })))
             .map_err(StoreError::from)?;
         self.conn_for(&node_id)?.touch();
-        self.after_mutation(ctx, path);
+        self.after_mutation(ctx, path, &node_id)?;
         Ok(())
     }
 
@@ -1239,9 +1384,13 @@ impl StoreApi for Store {
         flags: RenameFlags,
     ) -> Result<(), StoreError> {
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
-            let cache = self.metadata_cache.lock().unwrap();
-            let source = cache.get_entry_by_path(old).ok_or(StoreError::NotFound)?;
-            let destination = cache.get_entry_by_path(new).ok_or(StoreError::NotFound)?;
+            let mut cache = self.metadata_cache.lock().unwrap();
+            let source = cache
+                .lookup_entry_by_path(old)
+                .ok_or(StoreError::NotFound)?;
+            let destination = cache
+                .lookup_entry_by_path(new)
+                .ok_or(StoreError::NotFound)?;
             if source.node_id != destination.node_id {
                 return Err(StoreError::Local(libc::EXDEV));
             }
@@ -1264,19 +1413,17 @@ impl StoreApi for Store {
         // Rename within one node: the entry keeps its guid and its inode,
         // so move it locally instead of dropping and re-adding it. A
         // cross-node move is refused by the op layer, never reaching here.
-        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
-            self.metadata_cache
-                .lock()
-                .unwrap()
-                .exchange_entries(old, new);
-            self.invalidate(&parent_of(new));
-        } else {
-            self.after_mutation(ctx, new);
-            self.metadata_cache
-                .lock()
-                .unwrap()
-                .rename_entry_in(ctx, old, new);
+        {
+            let mut cache = self.metadata_cache.lock().unwrap();
+            Self::check_persistence(&cache)?;
+            if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+                cache.exchange_entries(old, new);
+            } else {
+                cache.rename_entry_in(ctx, old, new);
+            }
+            Self::check_persistence(&cache)?;
         }
+        self.invalidate(&parent_of(new));
         let parent = parent_of(old);
         self.invalidate(&parent);
         Ok(())
@@ -1317,12 +1464,17 @@ impl Store {
     ///
     /// The entry is dropped (or, for a directory, its children are) and the
     /// containing directory is invalidated so the next listing refetches.
-    fn after_mutation(&self, ctx: &OperationContext, path: &str) {
+    fn after_mutation(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        owner: &str,
+    ) -> Result<(), StoreError> {
         let parent = parent_of(path);
         self.invalidate(&parent);
-        self.metadata_cache
-            .lock()
-            .unwrap()
-            .remove_entry_in(ctx, path);
+        let mut cache = self.metadata_cache.lock().unwrap();
+        Self::check_persistence(&cache)?;
+        cache.remove_owner_entry_in(ctx, path, owner);
+        Self::check_persistence(&cache)
     }
 }

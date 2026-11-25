@@ -1,8 +1,9 @@
 //! Exercise the public cache and attributes shared across entry kinds.
 use std::time::{Duration, UNIX_EPOCH};
 
-use punkfs::store::db::attributes::misc::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
-use punkfs::store::db::metadata_cache::{Availability, FsEntry, ListingOutcome, MetadataCache};
+use punkfs::core::cache::metadata::{ListingOutcome, MetadataCache};
+use punkfs::core::metadata::{Availability, FsEntry};
+use punkfs::core::types::misc::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use punkfs::telemetry::{self, Config, Destination, OperationContext, Severity};
 
 #[test]
@@ -276,6 +277,97 @@ fn cache_outcomes_do_not_depend_on_a_failing_log_sink() {
     assert!(logger.flush(Duration::from_secs(2)));
     assert!(logger.stats().sink_failures > 0);
     let _ = guard.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn cache_ttl_and_max_size_evict_memory_but_keep_redb_inodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("cache.redb");
+    let db =
+        std::sync::Arc::new(punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap());
+    let mut cache = MetadataCache::new();
+    cache
+        .attach_db(db, Some(Duration::from_millis(40)), Some(2))
+        .unwrap();
+    cache.insert_root("/", "/", FsEntryKind::Directory);
+    for (path, guid) in [("/one", "g1"), ("/two", "g2"), ("/three", "g3")] {
+        cache.upsert_entry(FsEntry {
+            inode: 0,
+            path: path.into(),
+            guid: guid.into(),
+            kind: FsEntryKind::File,
+            node_id: "node-a".into(),
+            availability: Availability::Available,
+            attr: FileAttrData {
+                guid: guid.into(),
+                kind: FsEntryKind::File,
+                ..Default::default()
+            },
+        });
+    }
+    assert!(cache.entries.len() <= 2);
+    let ino_one = cache.lookup_inode("/one").unwrap();
+
+    std::thread::sleep(Duration::from_millis(60));
+    cache.prune_expired();
+    assert!(
+        cache.entries.iter().all(|e| e.path == "/"),
+        "expired entries should be evicted from memory"
+    );
+    assert_eq!(cache.lookup_inode("/one"), Some(ino_one));
+    assert_eq!(cache.lookup_path(ino_one).as_deref(), Some("/one"));
+
+    // Rename preserves the constant inode; remove retires it and allocates a new one on recreate.
+    assert!(cache.rename_entry("/one", "/one-renamed"));
+    assert_eq!(cache.lookup_inode("/one-renamed"), Some(ino_one));
+    cache.remove_entry("/one-renamed");
+    cache.upsert_entry(FsEntry {
+        inode: 0,
+        path: "/one-renamed".into(),
+        guid: "g1-new".into(),
+        kind: FsEntryKind::File,
+        node_id: "node-a".into(),
+        availability: Availability::Available,
+        attr: FileAttrData {
+            guid: "g1-new".into(),
+            kind: FsEntryKind::File,
+            ..Default::default()
+        },
+    });
+    assert_ne!(cache.lookup_inode("/one-renamed"), Some(ino_one));
+}
+
+#[test]
+fn persisted_listing_reconciles_after_eviction_without_deleting_other_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        punkfs::core::db::persistent::PersistentDb::open(&dir.path().join("cache.redb")).unwrap(),
+    );
+    let mut cache = MetadataCache::new();
+    cache
+        .attach_db(db, Some(Duration::from_millis(1)), Some(1))
+        .unwrap();
+    cache.insert_root("/", "/", FsEntryKind::Directory);
+    let old = event_test_entry("/old", "stable-guid", "node-a");
+    let other = event_test_entry("/other", "other-guid", "node-b");
+    cache.upsert_entry(old.clone());
+    cache.upsert_entry(other);
+    let inode = cache.lookup_inode("/old").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let mut renamed = old;
+    renamed.path = "/new".into();
+    assert!(
+        cache
+            .reconcile_from(
+                "/",
+                vec![("node-a".into(), ListingOutcome::Answered(vec![renamed]))]
+            )
+            .is_empty()
+    );
+    assert_eq!(cache.lookup_inode("/new"), Some(inode));
+    assert_eq!(cache.lookup_inode("/old"), None);
+    assert!(cache.lookup_inode("/other").is_some());
+    assert!(cache.entries.len() <= 1);
 }
 
 #[test]

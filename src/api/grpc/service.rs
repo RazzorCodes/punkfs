@@ -29,7 +29,9 @@ use crate::punk_fs::{
     RenameResponse, SetAttrRequest, SetAttrResponse, Stat as PbStat, StatFsRequest, StatFsResponse,
     StatFsResponse as PbStatFs, WriteFileRequest, WriteFileResponse,
 };
-use crate::store::db::attributes::{FileAttrData, FsEntryKind};
+use crate::core::types::{FileAttrData, FsEntryKind};
+use crate::core::types::misc::xattr;
+use crate::store::{Store, StoreApi};
 
 /// Upper bound on a single `ReadFile` answer. The FUSE layer asks for
 /// whatever the kernel wants (commonly 128 KiB); this keeps one malicious
@@ -40,6 +42,7 @@ pub const MAX_READ: u32 = 1024 * 1024;
 pub struct PunkFsService {
     backing: Arc<Backing>,
     allow_shutdown: bool,
+    catalog: Option<Arc<Store>>,
     /// Set by the `Shutdown` rpc (only served with `dev-shutdown`).
     shutdown: Arc<Notify>,
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
@@ -61,9 +64,18 @@ impl PunkFsService {
     }
 
     pub(crate) fn from_backing(backing: Arc<Backing>, allow_shutdown: bool) -> Arc<Self> {
+        Self::from_backing_with_catalog(backing, allow_shutdown, None)
+    }
+
+    pub(crate) fn from_backing_with_catalog(
+        backing: Arc<Backing>,
+        allow_shutdown: bool,
+        catalog: Option<Arc<Store>>,
+    ) -> Arc<Self> {
         Arc::new(PunkFsService {
             backing,
             allow_shutdown,
+            catalog,
             shutdown: Arc::new(Notify::new()),
             shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -429,7 +441,7 @@ impl PunkFs for PunkFsService {
             .backing
             .entry_path(&req.path)
             .map_err(io_status)
-            .and_then(|path| crate::core::xattr::get(&path, &req.name).map_err(xattr_status));
+            .and_then(|path| xattr::get(&path, &req.name).map_err(xattr_status));
         self.log_io(&ctx, "getxattr", &result);
         Ok(ctx.response(crate::punk_fs::XattrResponse { value: result? }))
     }
@@ -443,7 +455,7 @@ impl PunkFs for PunkFsService {
             .backing
             .entry_path(&req.path)
             .map_err(io_status)
-            .and_then(|path| crate::core::xattr::list(&path).map_err(xattr_status));
+            .and_then(|path| xattr::list(&path).map_err(xattr_status));
         self.log_io(&ctx, "listxattr", &result);
         Ok(ctx.response(crate::punk_fs::XattrResponse { value: result? }))
     }
@@ -458,7 +470,7 @@ impl PunkFs for PunkFsService {
             .entry_path(&req.path)
             .map_err(io_status)
             .and_then(|path| {
-                crate::core::xattr::set(&path, &req.name, &req.value, req.flags)
+                xattr::set(&path, &req.name, &req.value, req.flags)
                     .map_err(xattr_status)
             });
         self.log_io(&ctx, "setxattr", &result);
@@ -475,7 +487,7 @@ impl PunkFs for PunkFsService {
             .backing
             .entry_path(&req.path)
             .map_err(io_status)
-            .and_then(|path| crate::core::xattr::remove(&path, &req.name).map_err(xattr_status));
+            .and_then(|path| xattr::remove(&path, &req.name).map_err(xattr_status));
         self.log_io(&ctx, "removexattr", &result);
         result?;
         Ok(ctx.response(crate::punk_fs::XattrResponse { value: vec![] }))
@@ -519,6 +531,13 @@ impl PunkFs for PunkFsService {
             .entry_path(&request.get_ref().path)
             .map_err(io_status)?;
         tokio::fs::remove_file(&real).await.map_err(io_status)?;
+        if let Some(store) = &self.catalog {
+            store
+                .remove_local_in(&context, &request.get_ref().path)
+                .map_err(|e| {
+                    Status::internal(format!("catalog update after remove failed: {e:?}"))
+                })?;
+        }
         Ok(context.response(RemoveFileResponse {}))
     }
 
@@ -531,6 +550,13 @@ impl PunkFs for PunkFsService {
         // std/tokio refuse a non-empty directory, which is the behaviour
         // `rmdir` needs; the message is what the client turns into ENOTEMPTY.
         tokio::fs::remove_dir(&real).await.map_err(io_status)?;
+        if let Some(store) = &self.catalog {
+            store
+                .remove_local_in(&context, &request.get_ref().path)
+                .map_err(|e| {
+                    Status::internal(format!("catalog update after rmdir failed: {e:?}"))
+                })?;
+        }
         Ok(context.response(RemoveDirResponse {}))
     }
 
@@ -558,6 +584,16 @@ impl PunkFs for PunkFsService {
             } != 0
             {
                 return Err(io_status(io::Error::last_os_error()));
+            }
+            if let Some(store) = &self.catalog {
+                let update = if req.flags & libc::RENAME_EXCHANGE != 0 {
+                    store.exchange_local_in(&context, &req.old_path, &req.new_path)
+                } else {
+                    store.rename_local_in(&context, &req.old_path, &req.new_path)
+                };
+                update.map_err(|e| {
+                    Status::internal(format!("catalog update after rename failed: {e:?}"))
+                })?;
             }
             Ok::<_, Status>(RenameResponse {})
         })();

@@ -474,6 +474,65 @@ pub fn xattr(root: &Path) {
     }
 }
 
+pub fn directory_xattr(root: &Path) {
+    let probe = tempfile::tempdir().unwrap();
+    if let Err(error) = set_xattr(probe.path(), b"probe") {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::EPERM)
+        ) {
+            eprintln!("skipping directory xattr contract: local filesystem unsupported ({error})");
+            return;
+        }
+        panic!("directory xattr capability probe failed: {error}");
+    }
+    let path = root.join("xattr-directory");
+    fs::create_dir(&path).unwrap();
+    set_xattr(&path, b"directory-value").expect("set directory xattr");
+    let path = cpath(&path);
+    let mut buf = [0u8; 64];
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"user.punkfs_test".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if size < 0 {
+        last_error("get directory xattr");
+    }
+    assert_eq!(&buf[..size as usize], b"directory-value");
+    let size = unsafe { libc::listxattr(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if size < 0 {
+        last_error("list directory xattrs");
+    }
+    assert!(
+        buf[..size as usize]
+            .split(|b| *b == 0)
+            .any(|name| name == b"user.punkfs_test")
+    );
+    assert_eq!(
+        unsafe { libc::removexattr(path.as_ptr(), c"user.punkfs_test".as_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                c"user.punkfs_test".as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENODATA)
+    );
+}
+
 pub fn xattr_flags_and_buffers(root: &Path) {
     let probe = tempfile::tempdir().unwrap();
     let p = probe.path().join("file");

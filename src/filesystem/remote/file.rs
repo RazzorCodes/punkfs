@@ -183,7 +183,7 @@ pub(crate) fn fsync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::db::attributes::FsEntryKind;
+    use crate::core::types::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {

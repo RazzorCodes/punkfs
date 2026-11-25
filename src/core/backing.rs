@@ -2,7 +2,7 @@
 //!
 //! The descriptor is shared by the local filesystem and the inbound server;
 //! neither adapter resolves the root through the merged mountpoint.
-use crate::store::db::attributes::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
+use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};

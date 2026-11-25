@@ -13,8 +13,8 @@ use std::sync::Mutex;
 
 use fuser::RenameFlags;
 
-use crate::store::db::attributes::{FileAttrData, FsEntryKind};
-use crate::store::db::metadata_cache::{Availability, FsEntry};
+use crate::core::types::{FileAttrData, FsEntryKind};
+use crate::core::metadata::{Availability, FsEntry};
 use crate::store::{SetattrChanges, StatFs, StoreApi, StoreChild, StoreError};
 
 /// One recorded call per trait method, in order.

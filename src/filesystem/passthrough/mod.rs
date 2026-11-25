@@ -10,7 +10,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::core::backing::{Backing, SafePath};
-use crate::store::db::metadata_cache::FsEntry;
+use crate::core::metadata::FsEntry;
+use crate::core::types::misc::xattr;
 use crate::store::{SetattrChanges, StoreApi, StoreChild, StoreError};
 use crate::telemetry::{self, Event, OperationContext, Severity};
 
@@ -396,7 +397,7 @@ impl StoreApi for RoutedStore {
             .backing
             .entry_path(p)
             .map_err(error)
-            .and_then(|path| crate::core::xattr::get(&path, n).map_err(error));
+            .and_then(|path| xattr::get(&path, n).map_err(error));
         self.result("getxattr", result)
     }
     fn list_xattr(&self, p: &str) -> Result<Vec<u8>, StoreError> {
@@ -409,7 +410,7 @@ impl StoreApi for RoutedStore {
             .backing
             .entry_path(p)
             .map_err(error)
-            .and_then(|path| crate::core::xattr::list(&path).map_err(error));
+            .and_then(|path| xattr::list(&path).map_err(error));
         self.result("listxattr", result)
     }
     fn set_xattr(&self, p: &str, n: &[u8], v: &[u8], f: i32) -> Result<(), StoreError> {
@@ -422,7 +423,7 @@ impl StoreApi for RoutedStore {
             .backing
             .entry_path(p)
             .map_err(error)
-            .and_then(|path| crate::core::xattr::set(&path, n, v, f).map_err(error));
+            .and_then(|path| xattr::set(&path, n, v, f).map_err(error));
         self.result("setxattr", result)
     }
     fn remove_xattr(&self, p: &str, n: &[u8]) -> Result<(), StoreError> {
@@ -435,14 +436,14 @@ impl StoreApi for RoutedStore {
             .backing
             .entry_path(p)
             .map_err(error)
-            .and_then(|path| crate::core::xattr::remove(&path, n).map_err(error));
+            .and_then(|path| xattr::remove(&path, n).map_err(error));
         self.result("removexattr", result)
     }
     fn setattr(
         &self,
         p: &str,
         c: SetattrChanges,
-    ) -> Result<crate::store::db::attributes::FileAttrData, StoreError> {
+    ) -> Result<crate::core::types::FileAttrData, StoreError> {
         self.check_conflict(p)?;
         if !self.local(p) {
             return self.inner.setattr_in(&self.ctx, p, c);
@@ -457,7 +458,7 @@ impl StoreApi for RoutedStore {
         })();
         self.result("setattr", result)
     }
-    fn refresh(&self, p: &str) -> Result<crate::store::db::attributes::FileAttrData, StoreError> {
+    fn refresh(&self, p: &str) -> Result<crate::core::types::FileAttrData, StoreError> {
         self.check_conflict(p)?;
         if !self.local(p) {
             return self.inner.refresh_in(&self.ctx, p);
@@ -482,7 +483,7 @@ impl StoreApi for RoutedStore {
                 .inner
                 .get_inode(p)
                 .and_then(|ino| self.inner.get_entry(ino))
-                .is_some_and(|entry| entry.kind == crate::store::db::attributes::FsEntryKind::Link);
+                .is_some_and(|entry| entry.kind == crate::core::types::FsEntryKind::Link);
             if symlink {
                 return self.inner.unlink_in(&self.ctx, p);
             }

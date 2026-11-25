@@ -120,7 +120,7 @@ pub(crate) fn getattr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::db::attributes::FsEntryKind;
+    use crate::core::types::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {
@@ -188,7 +188,7 @@ mod tests {
     /// freshly refreshed metadata (size/mode/owner) when it succeeds.
     #[test]
     fn getattr_refreshes_or_falls_back_to_the_cache() {
-        use crate::store::db::attributes::{Access, FileAttrData, Stat};
+        use crate::core::types::{Access, FileAttrData, Stat};
 
         let offline = seeded();
         offline.fail_refresh();

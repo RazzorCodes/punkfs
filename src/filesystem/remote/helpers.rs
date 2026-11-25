@@ -9,7 +9,7 @@ use fuser::INodeNo;
 
 use super::error::{OpError, OpResult};
 use crate::store::StoreApi;
-use crate::store::db::attributes::{FileAttrData, FsEntryKind};
+use crate::core::types::{FileAttrData, FsEntryKind};
 
 /// Convert catalog kind to the `FileType` the kernel is told.
 ///
@@ -114,7 +114,7 @@ pub(crate) fn child_path(parent: &str, name: &OsStr) -> OpResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::db::attributes::{Access, FileTimes, Stat};
+    use crate::core::types::{Access, FileTimes, Stat};
     use std::time::{Duration, UNIX_EPOCH};
 
     fn attr_data(kind: FsEntryKind) -> FileAttrData {

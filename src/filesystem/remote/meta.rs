@@ -19,8 +19,8 @@ use fuser::TimeOrNow;
 
 use super::error::{OpError, OpResult};
 use super::helpers;
+use crate::core::types::FsEntryKind;
 use crate::core::punkfs::Fs;
-use crate::store::db::attributes::FsEntryKind;
 use crate::store::{StatFs, StoreApi};
 
 /// Apply the requested attribute changes to `ino`; returns the new attrs.
@@ -295,8 +295,8 @@ pub(crate) fn statfs(fs: &Fs, _req: &Request, _ino: INodeNo, reply: ReplyStatfs)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::FsEntryKind;
     use crate::store::StoreError;
-    use crate::store::db::attributes::FsEntryKind;
     use crate::store::mock::MockStore;
 
     fn seeded() -> MockStore {

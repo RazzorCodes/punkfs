@@ -11,13 +11,14 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 use crate::core::backing::Backing;
+use crate::core::cache::metadata::FsNode;
 use crate::core::punkfs::Fs;
 use crate::filesystem::passthrough::Local;
 use crate::grpc::peer;
 use crate::grpc::service::PunkFsService;
 use crate::punk_fs::peer_metadata_server::PeerMetadataServer;
 use crate::punk_fs::punk_fs_server::PunkFsServer;
-use crate::store::db::metadata_cache::FsNode;
+use crate::store::Store;
 use crate::telemetry::{self, Event, Severity};
 
 /// Configuration for one mounted and served backing directory.
@@ -27,6 +28,9 @@ pub struct NodeConfig {
     pub listen: SocketAddr,
     pub peers: Vec<(String, String)>,
     pub route_console: bool,
+    pub db_path: Option<PathBuf>,
+    pub cache_ttl: Option<Duration>,
+    pub cache_max_entries: Option<usize>,
 }
 
 fn lifecycle(severity: Severity, message: &str, node: &str) {
@@ -76,14 +80,39 @@ fn run_inner(config: NodeConfig) -> Result<(), Box<dyn Error>> {
     let local = Local::from_backing(backing.clone());
     let (publisher, publications) = peer::publisher(backing.clone());
     local.set_publisher(publisher);
-    let (session, store) = Fs::mount_with_backing(
+    let store = Arc::new(Store::new_with_local_persistence(
         &config.peers,
-        &config.mountpoint,
         FsNode {
             node_id: config.node_id.clone(),
         },
+        config.db_path.as_deref(),
+        config.cache_ttl,
+        config.cache_max_entries,
+    )?);
+
+    // Scan before exposing the FUSE mount: otherwise a lookup can race the
+    // initial snapshot and block it while reconciling the whole backing tree.
+    let scan_ctx = crate::telemetry::OperationContext::new();
+    let scanned = peer::scan_local_startup(&backing, &store, &scan_ctx)?;
+    if let Some(logger) = telemetry::global() {
+        let mut event = Event::new(
+            Severity::Info,
+            "node.lifecycle",
+            "startup local scan completed",
+        );
+        event
+            .fields
+            .insert("node_id".into(), serde_json::json!(&config.node_id));
+        event
+            .fields
+            .insert("entries".into(), serde_json::json!(scanned));
+        logger.emit_in(&scan_ctx, event);
+    }
+    let session = Fs::mount_with_store(
+        &config.mountpoint,
         config.route_console,
         local,
+        store.clone(),
     )?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -95,7 +124,7 @@ fn run_inner(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         config.peers.clone(),
         publications,
     );
-    let service = PunkFsService::from_backing(backing, false);
+    let service = PunkFsService::from_backing_with_catalog(backing, false, Some(store.clone()));
     let mut server = runtime.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
         Server::builder()

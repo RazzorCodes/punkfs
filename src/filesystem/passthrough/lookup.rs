@@ -1,7 +1,7 @@
 //! Obtain local metadata with the same GUID rules as the backing server.
 use super::Local;
 use crate::store::StoreError;
-use crate::store::db::metadata_cache::{Availability, FsEntry};
+use crate::core::metadata::{Availability, FsEntry};
 
 pub(super) fn entry(local: &Local, path: &str) -> Result<FsEntry, StoreError> {
     let attr = local

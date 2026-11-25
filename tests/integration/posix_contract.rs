@@ -337,6 +337,7 @@ contracts! {
     fifo_is_a_fifo => fifo;
     fifo_transfers_bytes => fifo_exchange;
     user_extended_attributes_round_trip => xattr;
+    directory_extended_attributes_round_trip => directory_xattr;
     xattr_flags_and_buffers_match_linux => xattr_flags_and_buffers;
     list_extended_attributes => xattr_list;
     posix_acl_round_trips => acl_roundtrip;

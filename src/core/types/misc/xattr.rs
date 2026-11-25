@@ -1,4 +1,5 @@
-//! User-visible xattr operations. punkfs reserves its identity attribute.
+//! Shared xattr operations for filesystem entries. Linux `user.*` xattrs
+//! apply to regular files and directories; punkfs reserves its identity attribute.
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;

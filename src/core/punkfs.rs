@@ -31,9 +31,9 @@ use fuser::MountOption;
 use fuser::ReplyAttr;
 use fuser::Request;
 
+use crate::core::cache::metadata::FsNode;
 use crate::store::Store;
 use crate::store::StoreApi;
-use crate::store::db::metadata_cache::FsNode;
 
 /// The `fs` itself: implements the fuser `Filesystem` trait below.
 ///
@@ -95,7 +95,7 @@ impl Fs {
             return;
         }
         let conflict = self.store.has_conflict(&entry.path);
-        let directory = entry.kind == crate::store::db::attributes::FsEntryKind::Directory;
+        let directory = entry.kind == crate::core::types::FsEntryKind::Directory;
         let (owner, location) = if conflict {
             ("unresolved", "conflict")
         } else if directory || entry.node_id.is_empty() {
@@ -288,16 +288,54 @@ impl Fs {
         route_console: bool,
         local: Arc<Local>,
     ) -> Result<(fuser::BackgroundSession, Arc<Store>), Box<dyn std::error::Error>> {
-        let store = Arc::new(Store::new_with_local(nodes, node)?);
-        let session = Self::spawn(
+        Self::mount_with_backing_persistence(
+            nodes,
+            mountpoint,
+            node,
+            route_console,
+            local,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mount_with_backing_persistence(
+        nodes: &[(String, String)],
+        mountpoint: &Path,
+        node: FsNode,
+        route_console: bool,
+        local: Arc<Local>,
+        db_path: Option<&Path>,
+        cache_ttl: Option<std::time::Duration>,
+        cache_max_entries: Option<usize>,
+    ) -> Result<(fuser::BackgroundSession, Arc<Store>), Box<dyn std::error::Error>> {
+        let store = Arc::new(Store::new_with_local_persistence(
+            nodes,
+            node,
+            db_path,
+            cache_ttl,
+            cache_max_entries,
+        )?);
+        let session = Self::mount_with_store(mountpoint, route_console, local, store.clone())?;
+        Ok((session, store))
+    }
+
+    pub(crate) fn mount_with_store(
+        mountpoint: &Path,
+        route_console: bool,
+        local: Arc<Local>,
+        store: Arc<Store>,
+    ) -> Result<fuser::BackgroundSession, Box<dyn std::error::Error>> {
+        Self::spawn(
             Fs {
-                store: store.clone(),
+                store,
                 local: Some(local),
                 route_console,
             },
             mountpoint,
-        )?;
-        Ok((session, store))
+        )
     }
 
     /// Spawn the FUSE session for an already-constructed fs.
@@ -879,7 +917,7 @@ mod helpers_for_create {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::db::attributes::FsEntryKind;
+    use crate::core::types::FsEntryKind;
     use crate::store::mock::MockStore;
 
     /// The DI seam works end-to-end: an `Fs` over a fake store serves

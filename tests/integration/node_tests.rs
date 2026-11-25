@@ -45,6 +45,8 @@ impl Node {
             .arg(id)
             .arg("--listen")
             .arg(addr.to_string())
+            .arg("--db-path")
+            .arg(logs.path().join("catalog.redb"))
             .env("PUNKFS_LOG_DESTINATION", "file")
             .env("PUNKFS_LOG_LEVEL", level)
             .env("PUNKFS_LOG_FILE", logs.path().join("node.jsonl"))
@@ -89,6 +91,46 @@ impl Node {
         }
         node
     }
+    fn restart(&mut self, id: &str, peers: &[(&str, SocketAddr)]) {
+        assert!(
+            self.child.try_wait().unwrap().is_some(),
+            "node must be stopped before restart"
+        );
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_punkfs"));
+        cmd.arg(self.root.path())
+            .arg(id)
+            .arg("--listen")
+            .arg(self.addr.to_string())
+            .arg("--db-path")
+            .arg(self.logs.path().join("catalog.redb"))
+            .env("PUNKFS_LOG_DESTINATION", "file")
+            .env("PUNKFS_LOG_FILE", self.logs.path().join("restart.jsonl"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (peer, addr) in peers {
+            cmd.arg(format!("{peer}=http://{addr}"));
+        }
+        self.child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        loop {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "node exited during restart"
+            );
+            if rt
+                .block_on(PunkFsClient::connect(format!("http://{}", self.addr)))
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node service did not become ready after restart"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
     fn path(&self) -> &Path {
         self.root.path()
     }
@@ -122,6 +164,42 @@ impl Drop for Node {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+#[test]
+fn startup_scan_removes_directory_deleted_while_stopped() {
+    if !require_fuse() {
+        return;
+    }
+    let addrs = addresses(1);
+    let mut node = Node::start("a", addrs[0], &[], "seed");
+    fs::create_dir(node.path().join("offline-delete")).unwrap();
+    assert!(node.stop().success());
+    fs::remove_dir(node.raw("offline-delete")).unwrap();
+    node.restart("a", &[]);
+    assert!(!node.path().join("offline-delete").exists());
+    assert!(
+        !fs::read_dir(node.path())
+            .unwrap()
+            .any(|e| e.unwrap().file_name() == "offline-delete")
+    );
+}
+
+#[test]
+fn inbound_rename_keeps_owner_inode_after_restart() {
+    if !require_fuse() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let addrs = addresses(2);
+    let mut a = Node::start("a", addrs[0], &[("b", addrs[1])], "before");
+    let b = Node::start("b", addrs[1], &[("a", addrs[0])], "b-file");
+    let before = fs::metadata(a.path().join("before")).unwrap().ino();
+    fs::rename(b.path().join("before"), b.path().join("after")).unwrap();
+    assert!(a.stop().success());
+    a.restart("a", &[("b", addrs[1])]);
+    assert_eq!(fs::metadata(a.path().join("after")).unwrap().ino(), before);
+    assert!(!a.path().join("before").exists());
 }
 
 #[test]

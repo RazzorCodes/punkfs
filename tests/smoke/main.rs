@@ -9,10 +9,9 @@ mod posix_backing;
 
 use std::time::{Duration, SystemTime};
 
-use punkfs::store::db::attributes::{FileAttrData, FileTimes, FsEntryKind, Stat};
-use punkfs::store::db::metadata_cache::{
-    Availability, FsEntry, FsNode, ListingOutcome, MetadataCache, NodeStatus,
-};
+use punkfs::core::cache::metadata::{FsNode, ListingOutcome, MetadataCache, NodeStatus};
+use punkfs::core::metadata::{Availability, FsEntry};
+use punkfs::core::types::{FileAttrData, FileTimes, FsEntryKind, Stat};
 
 // ---------------------------------------------------------------------------
 // Catalog identity primitives (public meat of the merge engine).
@@ -231,6 +230,111 @@ fn smoke_file_times_convert_from_seconds() {
         times.created,
         SystemTime::UNIX_EPOCH + Duration::from_secs(4)
     );
+}
+
+#[test]
+fn smoke_toml_config_parses_peers_and_cache_limits() {
+    let parsed = punkfs::core::config::NodeTomlConfig::parse_toml(
+        r#"
+mountpoint = "/tmp/mnt"
+node_id = "node-a"
+listen = "127.0.0.1:9100"
+db_path = "state/node-a.redb"
+cache_ttl_ms = 2500
+cache_max_entries = 128
+
+[peers]
+node-b = "http://127.0.0.1:9101"
+"#,
+        Some(std::path::Path::new("/etc/punkfs/node-a.toml")),
+    )
+    .unwrap();
+    assert_eq!(parsed.node_id.as_deref(), Some("node-a"));
+    assert_eq!(
+        parsed.db_path.as_deref(),
+        Some(std::path::Path::new("/etc/punkfs/state/node-a.redb"))
+    );
+    assert_eq!(parsed.cache_ttl, Duration::from_millis(2500));
+    assert_eq!(parsed.cache_max_entries, 128);
+    assert_eq!(
+        parsed.peers,
+        vec![("node-b".into(), "http://127.0.0.1:9101".into())]
+    );
+}
+
+#[test]
+fn smoke_redb_persists_constant_inodes_across_reopen_and_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("node.redb");
+    let db =
+        std::sync::Arc::new(punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap());
+    let mut cache = MetadataCache::new();
+    cache.attach_db(db, None, Some(2)).unwrap();
+    cache.insert_root("/", "/", FsEntryKind::Directory);
+    cache.upsert_entry(file("/a.txt", "ga"));
+    cache.upsert_entry(file("/b.txt", "gb"));
+    let ino_a = cache.lookup_inode("/a.txt").unwrap();
+    let ino_b = cache.lookup_inode("/b.txt").unwrap();
+    assert_ne!(ino_a, ino_b);
+
+    // Even if evicted from the bounded in-memory cache, lookup still hits redb.
+    assert!(cache.entries.len() <= 2);
+    assert_eq!(cache.lookup_inode("/a.txt"), Some(ino_a));
+    assert_eq!(cache.lookup_path(ino_a).as_deref(), Some("/a.txt"));
+
+    drop(cache);
+    let reopened =
+        std::sync::Arc::new(punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap());
+    let mut cache2 = MetadataCache::new();
+    cache2.attach_db(reopened, None, None).unwrap();
+    assert_eq!(cache2.lookup_inode("/a.txt"), Some(ino_a));
+    assert_eq!(cache2.lookup_inode("/b.txt"), Some(ino_b));
+}
+
+#[test]
+fn smoke_persisted_snapshot_preserves_renamed_inode_and_reconciles_directories() {
+    use punkfs::core::db::persistent::PersistentDb;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("metadata.redb");
+    let db = PersistentDb::open(&path).unwrap();
+    let before = file("/before", "stable");
+    let old_dir = dir("/gone", "dir-guid");
+    let (initial, _) = db
+        .reconcile_owner_snapshot("mock", &[before, old_dir])
+        .unwrap();
+    let inode = initial.iter().find(|e| e.path == "/before").unwrap().inode;
+    drop(db);
+    let db = PersistentDb::open(&path).unwrap();
+    db.reconcile_owner_snapshot("mock", &[file("/after", "stable")])
+        .unwrap();
+    assert_eq!(db.get_inode("/after").unwrap(), Some(inode));
+    assert_eq!(db.get_path(inode).unwrap().as_deref(), Some("/after"));
+    assert!(db.get_inode("/before").unwrap().is_none());
+    assert!(db.get_inode("/gone").unwrap().is_none());
+    db.reconcile_owner_snapshot("mock", &[file("/after", "replacement-guid")])
+        .unwrap();
+    assert_ne!(db.get_inode("/after").unwrap(), Some(inode));
+    assert_eq!(db.get_path(inode).unwrap(), None);
+}
+
+#[test]
+fn smoke_removing_one_directory_owner_preserves_other_contributions() {
+    use punkfs::core::db::persistent::PersistentDb;
+    let temp = tempfile::tempdir().unwrap();
+    let db = PersistentDb::open(&temp.path().join("metadata.redb")).unwrap();
+    let mut a_dir = dir("/shared", "dir-a");
+    a_dir.node_id = "a".into();
+    let mut b_dir = dir("/shared", "dir-b");
+    b_dir.node_id = "b".into();
+    let mut b_file = file("/shared/b", "file-b");
+    b_file.node_id = "b".into();
+    db.reconcile_owner_snapshot("a", &[a_dir]).unwrap();
+    let inode = db.get_inode("/shared").unwrap();
+    db.reconcile_owner_snapshot("b", &[b_dir, b_file]).unwrap();
+    db.reconcile_owner_snapshot("a", &[]).unwrap();
+    assert_eq!(db.get_inode("/shared").unwrap(), inode);
+    assert_eq!(db.get_by_path("/shared").unwrap().unwrap().node_id, "b");
+    assert_eq!(db.get_by_path("/shared/b").unwrap().unwrap().node_id, "b");
 }
 
 // Helpers -------------------------------------------------------------------

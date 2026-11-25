@@ -148,13 +148,39 @@ fn apply(
     ctx: &OperationContext,
     peer: &str,
     mut entries: Vec<PublishedEntry>,
-) -> usize {
+    full_snapshot: bool,
+) -> Result<usize, Status> {
     entries.sort_by_key(|entry| entry.path.len());
-    let entries = entries
+    let entries: Vec<_> = entries
         .into_iter()
         .map(|entry| entry_from_attr(0, &entry.path, entry.attr.expect("validated"), peer))
         .collect();
-    store.ingest_peer_entries(ctx, peer, entries)
+    if full_snapshot {
+        store
+            .reconcile_owner_snapshot_in(ctx, peer, entries)
+            .map_err(|e| Status::internal(format!("metadata reconciliation failed: {e:?}")))
+    } else {
+        store
+            .ingest_peer_entries(ctx, peer, entries)
+            .map_err(|e| Status::internal(format!("metadata publication failed: {e:?}")))
+    }
+}
+
+/// Scan the local backing folder at startup and populate `redb` + cache.
+pub(crate) fn scan_local_startup(
+    backing: &Backing,
+    store: &Store,
+    ctx: &OperationContext,
+) -> io::Result<usize> {
+    let entries = inventory(backing, ctx, false)?;
+    let node_id = backing.node_id().to_owned();
+    let converted: Vec<_> = entries
+        .into_iter()
+        .filter_map(|entry| Some(entry_from_attr(0, &entry.path, entry.attr?, &node_id)))
+        .collect();
+    store
+        .reconcile_owner_snapshot_in(ctx, &node_id, converted)
+        .map_err(|e| io::Error::other(format!("local metadata reconciliation failed: {e:?}")))
 }
 
 fn published(backing: &Backing, path: &str) -> io::Result<PublishedEntry> {
@@ -168,7 +194,11 @@ fn published(backing: &Backing, path: &str) -> io::Result<PublishedEntry> {
 
 /// Scan only the local backing descriptor. Failure means no complete inventory;
 /// callers must not translate it into an empty snapshot or a deletion.
-fn inventory(backing: &Backing, _ctx: &OperationContext) -> io::Result<Vec<PublishedEntry>> {
+fn inventory(
+    backing: &Backing,
+    _ctx: &OperationContext,
+    bounded: bool,
+) -> io::Result<Vec<PublishedEntry>> {
     let mut queue = VecDeque::from(["/".to_owned()]);
     let mut entries = Vec::new();
     let mut bytes = 0usize;
@@ -201,7 +231,7 @@ fn inventory(backing: &Backing, _ctx: &OperationContext) -> io::Result<Vec<Publi
             }
             bytes = bytes.saturating_add(entry.encoded_len());
             entries.push(entry);
-            if entries.len() > MAX_ENTRIES || bytes > MAX_BYTES {
+            if bounded && (entries.len() > MAX_ENTRIES || bytes > MAX_BYTES) {
                 return Err(io::Error::other("backing inventory exceeds metadata limit"));
             }
         }
@@ -344,10 +374,11 @@ impl PeerMetadata for Control {
         }
         let backing = self.backing.clone();
         let scan_context = ctx.clone();
-        let snapshot = tokio::task::spawn_blocking(move || inventory(&backing, &scan_context))
-            .await
-            .map_err(|_| Status::internal("inventory worker failed"))?
-            .map_err(|_| Status::unavailable("local inventory unavailable"));
+        let snapshot =
+            tokio::task::spawn_blocking(move || inventory(&backing, &scan_context, true))
+                .await
+                .map_err(|_| Status::internal("inventory worker failed"))?
+                .map_err(|_| Status::unavailable("local inventory unavailable"));
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(err) => {
@@ -363,7 +394,7 @@ impl PeerMetadata for Control {
                 return Err(err);
             }
         };
-        let count = apply(&self.store, &ctx, &req.node_id, req.entries);
+        let count = apply(&self.store, &ctx, &req.node_id, req.entries, true)?;
         log(
             &ctx,
             Severity::Info,
@@ -399,7 +430,7 @@ impl PeerMetadata for Control {
             );
             return Err(err);
         }
-        let count = apply(&self.store, &ctx, &req.node_id, req.entries);
+        let count = apply(&self.store, &ctx, &req.node_id, req.entries, false)?;
         log(
             &ctx,
             Severity::Debug,
@@ -452,7 +483,7 @@ pub(crate) fn start(
                         .map_err(|_| Status::unavailable("peer unavailable"))?;
                     let mut client = PeerMetadataClient::new(channel);
                     let entries =
-                        tokio::task::spawn_blocking(move || inventory(&scan, &scan_context))
+                        tokio::task::spawn_blocking(move || inventory(&scan, &scan_context, true))
                             .await
                             .map_err(|_| Status::internal("inventory worker failed"))?
                             .map_err(|_| Status::unavailable("inventory unavailable"))?;
@@ -467,7 +498,7 @@ pub(crate) fn start(
                         return Err(Status::failed_precondition("peer identity mismatch"));
                     }
                     validate(&response.entries, false)?;
-                    Ok::<usize, Status>(apply(&store, &ctx, &peer, response.entries))
+                    apply(&store, &ctx, &peer, response.entries, true)
                 }
                 .await;
                 match result {
@@ -648,9 +679,12 @@ mod tests {
         .unwrap();
         let ctx = OperationContext::new();
         let a = file("/same");
-        assert_eq!(apply(&store, &ctx, "a", vec![a.clone()]), 1);
-        assert_eq!(apply(&store, &ctx, "a", vec![a]), 0);
-        assert_eq!(apply(&store, &ctx, "b", vec![file("/same")]), 0);
+        assert_eq!(apply(&store, &ctx, "a", vec![a.clone()], false).unwrap(), 1);
+        assert_eq!(apply(&store, &ctx, "a", vec![a], false).unwrap(), 0);
+        assert_eq!(
+            apply(&store, &ctx, "b", vec![file("/same")], false).unwrap(),
+            0
+        );
         assert!(store.has_conflict("/same"));
         assert_eq!(store.owner_of("/same").as_deref(), Some("a"));
     }

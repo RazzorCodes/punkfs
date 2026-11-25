@@ -144,6 +144,44 @@ fn functional_xattrs_round_trip_and_protect_punkfs_guid() {
 }
 
 #[test]
+fn functional_remote_directory_xattrs_round_trip() {
+    let server = TestServer::empty();
+    let directory = server.root().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    if let Err(err) = crate::shared_posix_contract::seed_xattr(&directory) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::EPERM)
+        ) {
+            eprintln!("skipping directory xattr: backing does not support it: {err}");
+            return;
+        }
+        panic!("probe directory xattr: {err}");
+    }
+    let store = store(&server);
+    store.ensure_listed("/").unwrap();
+    store
+        .set_xattr("/directory", b"user.example", b"value", libc::XATTR_CREATE)
+        .unwrap();
+    assert_eq!(
+        store.get_xattr("/directory", b"user.example").unwrap(),
+        b"value"
+    );
+    let names = store.list_xattr("/directory").unwrap();
+    assert!(names.split(|b| *b == 0).any(|name| name == b"user.example"));
+    assert!(
+        !names
+            .split(|b| *b == 0)
+            .any(|name| name == b"user.punkfs.guid")
+    );
+    store.remove_xattr("/directory", b"user.example").unwrap();
+    assert_eq!(
+        store.get_xattr("/directory", b"user.example"),
+        Err(punkfs::StoreError::Local(libc::ENODATA))
+    );
+}
+
+#[test]
 fn functional_setattr_truncates_the_owner_file() {
     let server = TestServer::empty();
     server.seed("data", b"abcdef");

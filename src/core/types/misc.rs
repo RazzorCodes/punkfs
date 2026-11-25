@@ -1,5 +1,7 @@
 //! Attributes shared by files, directories, and other entry kinds.
 
+pub(crate) mod xattr;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The four POSIX timestamps, each defaulting to the epoch.
