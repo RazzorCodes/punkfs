@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::core::db::persistent::PersistentDb;
 use crate::core::metadata::{Availability, FsEntry};
 use crate::core::types::{FileAttrData, FsEntryKind};
+use crate::db::persistent::PersistentDb;
 use crate::telemetry::{self, Event, Logger, OperationContext, Severity};
 
 pub struct FsNode {

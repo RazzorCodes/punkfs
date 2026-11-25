@@ -283,8 +283,7 @@ fn cache_outcomes_do_not_depend_on_a_failing_log_sink() {
 fn cache_ttl_and_max_size_evict_memory_but_keep_redb_inodes() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("cache.redb");
-    let db =
-        std::sync::Arc::new(punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap());
+    let db = std::sync::Arc::new(punkfs::db::persistent::PersistentDb::open(&db_path).unwrap());
     let mut cache = MetadataCache::new();
     cache
         .attach_db(db, Some(Duration::from_millis(40)), Some(2))
@@ -341,7 +340,7 @@ fn cache_ttl_and_max_size_evict_memory_but_keep_redb_inodes() {
 fn persisted_listing_reconciles_after_eviction_without_deleting_other_owner() {
     let dir = tempfile::tempdir().unwrap();
     let db = std::sync::Arc::new(
-        punkfs::core::db::persistent::PersistentDb::open(&dir.path().join("cache.redb")).unwrap(),
+        punkfs::db::persistent::PersistentDb::open(&dir.path().join("cache.redb")).unwrap(),
     );
     let mut cache = MetadataCache::new();
     cache

@@ -702,7 +702,7 @@ fn blackbox_startup_scans_more_than_one_peer_inventory_batch() {
         std::thread::sleep(Duration::from_millis(25));
     }
     node.stop();
-    let db = punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap();
+    let db = punkfs::db::persistent::PersistentDb::open(&db_path).unwrap();
     assert!(db.get_inode("/file-4096").unwrap().is_some());
 }
 

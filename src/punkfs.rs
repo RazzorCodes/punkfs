@@ -1,5 +1,6 @@
 //! punkfs: the amalgamation — fs (fuse), grpc, store.
 pub mod core;
+pub mod db;
 mod filesystem;
 pub use core::store;
 #[path = "api/grpc/mod.rs"]

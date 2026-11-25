@@ -17,9 +17,9 @@ use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::core::cache::metadata::{FsNode, ListingOutcome, MetadataCache};
-use crate::core::db::persistent::PersistentDb;
 use crate::core::metadata::{Availability, FsEntry};
 use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
+use crate::db::persistent::PersistentDb;
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
     self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, ReadLinkRequest,

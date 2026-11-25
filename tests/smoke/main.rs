@@ -266,8 +266,7 @@ node-b = "http://127.0.0.1:9101"
 fn smoke_redb_persists_constant_inodes_across_reopen_and_eviction() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("node.redb");
-    let db =
-        std::sync::Arc::new(punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap());
+    let db = std::sync::Arc::new(punkfs::db::persistent::PersistentDb::open(&db_path).unwrap());
     let mut cache = MetadataCache::new();
     cache.attach_db(db, None, Some(2)).unwrap();
     cache.insert_root("/", "/", FsEntryKind::Directory);
@@ -284,7 +283,7 @@ fn smoke_redb_persists_constant_inodes_across_reopen_and_eviction() {
 
     drop(cache);
     let reopened =
-        std::sync::Arc::new(punkfs::core::db::persistent::PersistentDb::open(&db_path).unwrap());
+        std::sync::Arc::new(punkfs::db::persistent::PersistentDb::open(&db_path).unwrap());
     let mut cache2 = MetadataCache::new();
     cache2.attach_db(reopened, None, None).unwrap();
     assert_eq!(cache2.lookup_inode("/a.txt"), Some(ino_a));
@@ -293,7 +292,7 @@ fn smoke_redb_persists_constant_inodes_across_reopen_and_eviction() {
 
 #[test]
 fn smoke_persisted_snapshot_preserves_renamed_inode_and_reconciles_directories() {
-    use punkfs::core::db::persistent::PersistentDb;
+    use punkfs::db::persistent::PersistentDb;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("metadata.redb");
     let db = PersistentDb::open(&path).unwrap();
@@ -319,7 +318,7 @@ fn smoke_persisted_snapshot_preserves_renamed_inode_and_reconciles_directories()
 
 #[test]
 fn smoke_removing_one_directory_owner_preserves_other_contributions() {
-    use punkfs::core::db::persistent::PersistentDb;
+    use punkfs::db::persistent::PersistentDb;
     let temp = tempfile::tempdir().unwrap();
     let db = PersistentDb::open(&temp.path().join("metadata.redb")).unwrap();
     let mut a_dir = dir("/shared", "dir-a");
