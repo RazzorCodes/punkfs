@@ -18,7 +18,6 @@ use crate::core::backing::Backing;
 use crate::core::cache::metadata::{FsNode, ListingOutcome, MetadataCache};
 use crate::core::types::{Access, FileAttrData, FileTimes, FsEntryKind, Stat};
 use crate::core::types::{Availability, FsEntry};
-use crate::db::persistent::PersistentDb;
 use crate::punk_fs::punk_fs_client::PunkFsClient;
 use crate::punk_fs::{
     self, FsyncFileRequest, GetAttrRequest, ListDirectoryRequest, ReadFileRequest, ReadLinkRequest,
@@ -430,7 +429,7 @@ impl Store {
 
         let mut metadata_cache = MetadataCache::new();
         if let Some(db_path) = db_path {
-            let db = std::sync::Arc::new(PersistentDb::open(db_path)?);
+            let db = crate::db::open(db_path)?;
             metadata_cache.attach_db(db, cache_ttl, cache_max_entries)?;
         }
         // The root is synthetic: every node answers "/" with a different

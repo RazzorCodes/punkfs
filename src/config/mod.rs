@@ -11,6 +11,71 @@ use std::time::Duration;
 
 use toml_edit::{DocumentMut, Item};
 
+pub mod parser;
+
+/// Initialized process configuration after CLI, TOML and environment precedence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub mountpoint: PathBuf,
+    pub node_id: String,
+    pub listen: Option<SocketAddr>,
+    pub db_path: PathBuf,
+    pub peers: Vec<(String, String)>,
+    pub cache_ttl: Duration,
+    pub cache_max_entries: usize,
+    pub route_console: bool,
+}
+
+/// Combine parsed command-line overrides with a TOML file and route settings.
+fn initialize(
+    cli: parser::CliOptions,
+    default_file: Option<&Path>,
+    route_console: Option<&str>,
+) -> Result<Config, Box<dyn Error>> {
+    let file = if let Some(path) = cli.config_path.as_deref() {
+        NodeTomlConfig::from_file(path)?
+    } else if let Some(path) = default_file.filter(|path| path.exists()) {
+        NodeTomlConfig::from_file(path)?
+    } else {
+        NodeTomlConfig::default()
+    };
+    let mountpoint = cli.positional.first().map(PathBuf::from).or(file.mountpoint)
+        .ok_or("usage: punkfs [--config <file.toml>] <mountpoint> <local-node-id> [--listen <address>] [--db-path <file.redb>] [<remote-node-id>=<url> ...]")?;
+    let node_id = cli
+        .positional
+        .get(1)
+        .cloned()
+        .or(file.node_id)
+        .ok_or("missing local node id")?;
+    if node_id.is_empty() {
+        return Err("local node id must not be empty".into());
+    }
+    let route_console = match route_console {
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        None => file.route_console.unwrap_or(false),
+        _ => return Err("PUNKFS_LOG_ROUTES must be 1, 0, true, or false".into()),
+    };
+    let db_path = cli
+        .db_path
+        .or(file.db_path)
+        .unwrap_or_else(|| NodeTomlConfig::default_db_path(&node_id));
+    Ok(Config {
+        mountpoint,
+        node_id,
+        listen: cli.listen.or(file.listen),
+        db_path,
+        peers: if cli.peers.is_empty() {
+            file.peers
+        } else {
+            cli.peers
+        },
+        cache_ttl: file.cache_ttl,
+        cache_max_entries: file.cache_max_entries,
+        route_console,
+    })
+}
+
 pub const DEFAULT_CACHE_TTL_MS: u64 = 30_000;
 pub const DEFAULT_CACHE_MAX_ENTRIES: usize = 4096;
 

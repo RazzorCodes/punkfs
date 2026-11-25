@@ -1,4 +1,5 @@
 //! punkfs: the amalgamation — fs (fuse), grpc, store.
+pub mod config;
 pub mod core;
 pub mod db;
 mod filesystem;

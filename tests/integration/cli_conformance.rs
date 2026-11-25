@@ -40,6 +40,17 @@ fn expect_fail(out: &Output, what: &str) {
     );
 }
 
+#[test]
+fn malformed_cli_is_rejected_before_mount() {
+    let output = Command::new(env!("CARGO_BIN_EXE_punkfs"))
+        .args(["--listen", "127.0.0.1:1", "--listen", "127.0.0.1:2"])
+        .env_remove("PUNKFS_LOG_ROUTES")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--listen may only be supplied once"));
+}
+
 // --- listing and metadata ------------------------------------------------
 
 #[test]

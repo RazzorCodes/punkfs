@@ -5,6 +5,5 @@
 //! without making the durable database depend on the cache.
 pub(crate) mod backing;
 pub mod cache;
-pub mod config;
 pub mod store;
 pub mod types;

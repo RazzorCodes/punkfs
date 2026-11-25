@@ -14,6 +14,7 @@ mod common;
 #[path = "../posix_contract/mod.rs"]
 mod shared_posix_contract;
 
+mod config;
 mod correlation;
 mod merge;
 mod metadata_cache;

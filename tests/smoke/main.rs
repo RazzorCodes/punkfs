@@ -233,8 +233,17 @@ fn smoke_file_times_convert_from_seconds() {
 }
 
 #[test]
+fn smoke_cli_parser_initializes_defaults() {
+    let cfg = punkfs::config::parser::parse_from(["/backing", "node"], None, None).unwrap();
+    assert_eq!(cfg.mountpoint, std::path::Path::new("/backing"));
+    assert_eq!(cfg.node_id, "node");
+    assert!(cfg.listen.is_none());
+    assert!(cfg.peers.is_empty());
+}
+
+#[test]
 fn smoke_toml_config_parses_peers_and_cache_limits() {
-    let parsed = punkfs::core::config::NodeTomlConfig::parse_toml(
+    let parsed = punkfs::config::NodeTomlConfig::parse_toml(
         r#"
 mountpoint = "/tmp/mnt"
 node_id = "node-a"
